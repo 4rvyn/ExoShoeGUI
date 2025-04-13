@@ -2,7 +2,7 @@
 import asyncio
 from bleak import BleakScanner, BleakClient, BleakError
 import logging
-from typing import Optional, Callable, Dict, List, Tuple, Set
+from typing import Optional, Callable, Dict, List, Tuple, Set, Any, Type
 import time
 from functools import partial
 from collections import deque # Keep for potential future optimization if lists grow huge
@@ -82,13 +82,12 @@ client: Optional[BleakClient] = None
 plotting_paused = False
 flowing_interval = 10.0  # Initial interval in seconds
 
-# --- Configuration classes (MODIFIED CharacteristicConfig) ---
+# --- Configuration classes ---
 class CharacteristicConfig:
     def __init__(self, uuid: str, handler: Callable[[bytearray], dict], produces_data_types: List[str]):
         self.uuid = uuid
         self.handler = handler
-        # *** ADDED ***: List of data keys this characteristic's handler produces
-        self.produces_data_types = produces_data_types
+        self.produces_data_types = produces_data_types # List of data keys this characteristic's handler produces
 
 class DeviceConfig:
     def __init__(self, name: str, service_uuid: str, characteristics: list[CharacteristicConfig],
@@ -98,6 +97,26 @@ class DeviceConfig:
         self.characteristics = characteristics
         self.find_timeout = find_timeout
         self.data_timeout = data_timeout
+        # Map data types back to their source UUIDs
+        self.data_type_to_uuid_map: Dict[str, str] = self._build_data_type_map()
+
+    def _build_data_type_map(self) -> Dict[str, str]:
+        """Builds the mapping from data_type keys to their source UUID."""
+        mapping = {}
+        for char_config in self.characteristics:
+            for data_type in char_config.produces_data_types:
+                if data_type in mapping:
+                    logger.warning(f"Data type '{data_type}' is produced by multiple UUIDs. Mapping to {char_config.uuid}.")
+                mapping[data_type] = char_config.uuid
+        # logger.debug(f"Built data_type -> UUID map: {mapping}")
+        return mapping
+
+    def update_name(self, name: str):
+        self.name = name
+        # Potentially update other device-specific settings here if needed in the future
+
+    def get_uuid_for_data_type(self, data_type: str) -> Optional[str]:
+        return self.data_type_to_uuid_map.get(data_type)
 
 
 #####################################################################################################################
@@ -107,9 +126,10 @@ class DeviceConfig:
 
 # 1. Data handlers for different characteristics
 # 2. Device configuration (add UUIDs AND `produces_data_types`)
-# 3. Plots configuration (tabs, titles, labels, datasets, plot sizes)
+# 3. Define GUI Component Classes (e.g., plots, indicators)
+# 4. Define Tab Layout Configuration using the components
 
-# --- Data Handlers (Unchanged) ---
+# --- Data Handlers ---
 def handle_orientation_data(data: bytearray) -> dict:
     try:
         if len(data) != 6: data_logger.error("Invalid data length for orientation"); return {}
@@ -166,7 +186,6 @@ def handle_gravity_data(data: bytearray) -> dict:
 
 # --- Device Configuration (Initial Device Name still set here) ---
 # This object's 'name' attribute will be updated by the dropdown menu
-# *** MODIFIED: Added produces_data_types to each CharacteristicConfig ***
 device_config = DeviceConfig(
     name="Nano33IoT", # Initial default name
     service_uuid="19B10000-E8F2-537E-4F6C-D104768A1214", # Assuming same service UUID for now
@@ -183,9 +202,6 @@ device_config = DeviceConfig(
                              produces_data_types=['accel_x', 'accel_y', 'accel_z']),
         CharacteristicConfig(uuid="19B10007-E8F2-537E-4F6C-D104768A1214", handler=handle_gravity_data,
                              produces_data_types=['gravity_x', 'gravity_y', 'gravity_z']),
-        # Example of a potentially missing UUID for testing:
-        # CharacteristicConfig(uuid="19B100FF-E8F2-537E-4F6C-D104768A1214", handler=lambda d: {'dummy': 0.0},
-        #                      produces_data_types=['dummy']),
     ],
     find_timeout=5.0,
     data_timeout=1.0
@@ -194,361 +210,489 @@ device_config = DeviceConfig(
 # List of available device names for the dropdown
 AVAILABLE_DEVICE_NAMES = ["Nano33IoT", "NanoESP32"]
 
-# --- Plot Configuration (Unchanged) ---
-# The top-level list now represents tabs. Each dictionary defines a tab.
-# Each plot configuration dictionary can optionally include 'plot_height' and 'plot_width'.
-plot_groups = [
+
+# --- Component Base Class ---
+class BaseGuiComponent(QWidget):
+    # Base class for modular GUI components.
+    def __init__(self, config: Dict[str, Any], data_buffers_ref: Dict[str, List[Tuple[float, float]]], device_config_ref: DeviceConfig, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.config = config
+        self.data_buffers_ref = data_buffers_ref
+        self.device_config_ref = device_config_ref
+        # Basic size policy, can be overridden by subclasses or config
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def get_widget(self) -> QWidget:
+        """Returns the primary widget this component manages."""
+        return self # Default: the component itself is the widget
+
+    def update_component(self, current_relative_time: float, is_flowing: bool):
+        """Update the component's visual representation based on current data and time."""
+        raise NotImplementedError("Subclasses must implement update_component")
+
+    def clear_component(self):
+        """Clear the component's display and internal state."""
+        raise NotImplementedError("Subclasses must implement clear_component")
+
+    def get_required_data_types(self) -> Set[str]:
+        """Returns a set of data_type keys this component requires."""
+        return set() # Default: no data required
+
+    def handle_missing_uuids(self, missing_uuids_for_component: Set[str]):
+        """
+        Called by the GuiManager when relevant UUIDs are found to be missing.
+        'missing_uuids_for_component' contains only the UUIDs relevant to this specific component.
+        """
+        pass # Default: do nothing
+
+
+# --- Specific Component Implementations ---
+
+class TimeSeriesPlotComponent(BaseGuiComponent):
+    """A GUI component that displays time-series data using pyqtgraph."""
+    def __init__(self, config: Dict[str, Any], data_buffers_ref: Dict[str, List[Tuple[float, float]]], device_config_ref: DeviceConfig, parent: Optional[QWidget] = None):
+        super().__init__(config, data_buffers_ref, device_config_ref, parent)
+
+        self.plot_widget = pg.PlotWidget()
+        self.plot_item: pg.PlotItem = self.plot_widget.getPlotItem()
+        self.lines: Dict[str, pg.PlotDataItem] = {} # data_type -> PlotDataItem
+        self.uuid_not_found_text: Optional[pg.TextItem] = None
+        self.required_data_types: Set[str] = set()
+        self.missing_relevant_uuids: Set[str] = set() # UUIDs this plot needs that are missing
+
+        self._setup_plot()
+
+        # Main layout for this component (contains just the plot widget)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.plot_widget)
+        self.setLayout(layout)
+
+    def get_widget(self) -> QWidget:
+        return self # The component itself holds the plot
+
+    def _setup_plot(self):
+        """Configures the plot based on the self.config dictionary."""
+        plot_height = self.config.get('plot_height')
+        plot_width = self.config.get('plot_width')
+        # Apply size constraints to the component itself, layout will handle the rest
+        if plot_height is not None: self.setFixedHeight(plot_height)
+        if plot_width is not None: self.setFixedWidth(plot_width)
+        # If only one dimension is set, allow expansion in the other
+        if plot_height is not None and plot_width is None:
+            self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        elif plot_width is not None and plot_height is None:
+            self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        elif plot_width is None and plot_height is None:
+             self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        else: # Both fixed
+             self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
+
+        self.plot_item.setTitle(self.config.get('title', 'Plot'), size='10pt')
+        self.plot_item.setLabel('bottom', self.config.get('xlabel', 'Time [s]'))
+        self.plot_item.setLabel('left', self.config.get('ylabel', 'Value'))
+        self.plot_item.showGrid(x=True, y=True, alpha=0.1)
+        self.plot_item.addLegend(offset=(10, 5))
+        self.plot_item.getViewBox().setDefaultPadding(0.01)
+        # Connect view change signal to reposition text
+        self.plot_item.getViewBox().sigRangeChanged.connect(self._position_text_item)
+
+        for dataset in self.config.get('datasets', []):
+            data_type = dataset['data_type']
+            self.required_data_types.add(data_type)
+            pen = pg.mkPen(color=dataset.get('color', 'k'), width=1.5)
+            line = self.plot_item.plot(pen=pen, name=dataset.get('label', data_type))
+            self.lines[data_type] = line
+
+        self.clear_component() # Initialize axes
+
+    def get_required_data_types(self) -> Set[str]:
+        return self.required_data_types
+
+    def handle_missing_uuids(self, missing_uuids_for_component: Set[str]):
+        """Shows or hides the 'UUID not found' message."""
+        self.missing_relevant_uuids = missing_uuids_for_component
+        first_missing_uuid = next(iter(missing_uuids_for_component), None)
+
+        if first_missing_uuid:
+            text_content = f"UUID:\n{first_missing_uuid}\nnot found!"
+            if self.uuid_not_found_text:
+                # logger.debug(f"Updating existing text for plot '{self.config.get('title')}'")
+                self.uuid_not_found_text.setText(text_content)
+            else:
+                # logger.debug(f"Creating new text for plot '{self.config.get('title')}'")
+                self.uuid_not_found_text = pg.TextItem(text_content, color=(150, 150, 150), anchor=(0.5, 0.5))
+                self.uuid_not_found_text.setZValue(100) # Ensure it's on top
+                self.plot_item.addItem(self.uuid_not_found_text)
+
+            # Position the text item (or reposition if it existed)
+            self._position_text_item()
+
+        else: # No missing UUIDs for this plot
+            if self.uuid_not_found_text:
+                # logger.debug(f"Removing text for plot '{self.config.get('title')}'")
+                try:
+                     self.plot_item.removeItem(self.uuid_not_found_text)
+                except Exception as e:
+                     logger.warning(f"Error removing text item from plot '{self.config.get('title')}': {e}")
+                self.uuid_not_found_text = None
+
+        # Trigger an update to clear lines if needed and adjust Y-axis ranging
+        QTimer.singleShot(0, self._request_gui_update_for_yrange)
+
+    def _request_gui_update_for_yrange(self):
+         # Find the main window instance to emit the signal
+         try:
+             mw = next(widget for widget in QApplication.topLevelWidgets() if isinstance(widget, MainWindow))
+             mw.request_plot_update_signal.emit() # Request general update which includes this plot
+         except StopIteration: logger.error("Could not find MainWindow instance to request plot update.")
+         except Exception as e: logger.error(f"Error requesting plot update: {e}")
+
+    def _position_text_item(self):
+        """Positions the text item in the center of the plot's current view."""
+        if not self.uuid_not_found_text: return
+
+        try:
+            view_box = self.plot_item.getViewBox()
+            if not view_box.autoRangeEnabled()[1]: # If Y is not auto-ranging, use default range
+                 y_range = self.plot_item.getAxis('left').range
+            else:
+                 y_range = view_box.viewRange()[1] # Use view range if auto-ranging
+            x_range = view_box.viewRange()[0]
+
+            if None in x_range or None in y_range or x_range[1] <= x_range[0] or y_range[1] <= y_range[0]:
+                center_x, center_y = 0.5, 0.5
+            else:
+                center_x = x_range[0] + (x_range[1] - x_range[0]) / 2
+                center_y = y_range[0] + (y_range[1] - y_range[0]) / 2
+
+            self.uuid_not_found_text.setPos(center_x, center_y)
+        except Exception as e:
+            logger.warning(f"Could not position text item for plot '{self.config.get('title')}': {e}")
+
+    def update_component(self, current_relative_time: float, is_flowing: bool):
+        """Updates the plot lines based on data in the shared buffer."""
+        if plotting_paused: return
+
+        # --- Determine Time Axis Range ---
+        min_time_axis = 0
+        max_time_axis = max(current_relative_time, flowing_interval)
+
+        if is_flowing:
+            min_time_axis = max(0, current_relative_time - flowing_interval)
+            max_time_axis = current_relative_time
+            self.plot_item.setXRange(min_time_axis, max_time_axis, padding=0.02)
+        else:
+            max_data_time = 0
+            # Only consider data types from non-missing UUIDs for axis range
+            for data_type in self.required_data_types:
+                 uuid = self.device_config_ref.get_uuid_for_data_type(data_type)
+                 if uuid and uuid not in self.missing_relevant_uuids and data_type in self.data_buffers_ref and self.data_buffers_ref[data_type]:
+                     try: max_data_time = max(max_data_time, self.data_buffers_ref[data_type][-1][0])
+                     except IndexError: pass
+
+            max_time_axis = max(max_data_time, flowing_interval)
+            self.plot_item.setXRange(0, max_time_axis, padding=0.02)
+
+        # --- Update Data for Lines ---
+        data_updated_in_plot = False
+        plot_has_missing_uuid_text = (self.uuid_not_found_text is not None)
+
+        for data_type, line in self.lines.items():
+            uuid = self.device_config_ref.get_uuid_for_data_type(data_type)
+
+            # Check if UUID is missing for *this specific plot*
+            if uuid and uuid in self.missing_relevant_uuids:
+                line.setData(x=[], y=[]) # Clear line if UUID is missing
+                # logger.debug(f"Cleared line for {data_type} (UUID {uuid} missing)")
+            elif data_type in self.data_buffers_ref:
+                data = self.data_buffers_ref[data_type]
+                plot_data_tuples = []
+                if is_flowing:
+                    # Find the starting index for the flowing window
+                    start_idx = bisect.bisect_left(data, min_time_axis, key=lambda x: x[0])
+                    plot_data_tuples = data[start_idx:]
+                else:
+                    plot_data_tuples = data # Use all data
+
+                if plot_data_tuples:
+                    try:
+                        times = np.array([item[0] for item in plot_data_tuples])
+                        values = np.array([item[1] for item in plot_data_tuples])
+                        line.setData(x=times, y=values)
+                        data_updated_in_plot = True
+                    except (ValueError, IndexError) as e:
+                        logger.warning(f"Could not convert/set data for {data_type} in plot '{self.config.get('title')}': {e}")
+                        line.setData(x=[], y=[])
+                else:
+                    line.setData(x=[], y=[]) # Clear line if no data in range
+
+            else:
+                line.setData(x=[], y=[]) # Clear line if data_type not found in buffers
+
+        # --- Y Auto-Ranging ---
+        if data_updated_in_plot and not plot_has_missing_uuid_text:
+            self.plot_item.enableAutoRange(axis='y', enable=True)
+        elif plot_has_missing_uuid_text:
+             # Disable auto-ranging and set a default range if text is shown
+             self.plot_item.enableAutoRange(axis='y', enable=False)
+             # Keep existing range or set a default? Let's try setting a simple default.
+             self.plot_item.setYRange(-1, 1, padding=0.1) # Example default range
+
+    def clear_component(self):
+        """Clears the plot lines and resets axes."""
+        for line in self.lines.values():
+            line.setData(x=[], y=[])
+
+        # Remove "UUID not found" text if present
+        if self.uuid_not_found_text:
+             try: self.plot_item.removeItem(self.uuid_not_found_text)
+             except Exception as e: logger.warning(f"Error removing text item during clear: {e}")
+             self.uuid_not_found_text = None
+        self.missing_relevant_uuids.clear()
+
+        # Reset view ranges
+        self.plot_item.setXRange(0, flowing_interval, padding=0.02)
+        self.plot_item.setYRange(-1, 1, padding=0.1) # Reset Y range to default
+        self.plot_item.enableAutoRange(axis='y', enable=True) # Re-enable Y auto-ranging
+
+
+# --- Add more component classes here in the future ---
+# Example:
+# class StatusIndicatorComponent(BaseGuiComponent):
+#     def __init__(self, config, data_buffers_ref, device_config_ref, parent=None):
+#         super().__init__(config, data_buffers_ref, device_config_ref, parent)
+#         self.label = QLabel("Status: --")
+#         # ... setup layout ...
+#         layout = QVBoxLayout(self)
+#         layout.addWidget(self.label)
+#         self.setLayout(layout)
+#     def update_component(self, current_relative_time, is_flowing):
+#         # Example: Update label based on latest value of a specific data_type
+#         dtype = self.config.get("data_type_to_monitor")
+#         if dtype and dtype in self.data_buffers_ref and self.data_buffers_ref[dtype]:
+#             latest_val = self.data_buffers_ref[dtype][-1][1]
+#             self.label.setText(f"{dtype}: {latest_val:.2f}")
+#     def clear_component(self):
+#         self.label.setText("Status: --")
+#     def get_required_data_types(self) -> Set[str]:
+#         dtype = self.config.get("data_type_to_monitor")
+#         return {dtype} if dtype else set()
+
+
+# --- Tab Layout Configuration ---
+# List of dictionaries, each defining a tab.
+# Each dictionary contains 'tab_title' and 'layout'.
+# 'layout' is a list of component definitions for that tab's grid.
+tab_configs = [
     {
-        'tab_title': 'IMU Basic', # Changed 'title' to 'tab_title' for clarity
-        'plots': [
-            {   'row': 0,'col': 0,'title': 'Orientation vs Time','xlabel': 'Time [s]','ylabel': 'Degrees',
-                'plot_height': 300, 'plot_width': 450, # Configurable plot size
-                'datasets': [{'data_type': 'orientation_x', 'label': 'X (Roll)', 'color': 'r'},
-                             {'data_type': 'orientation_y', 'label': 'Y (Pitch)', 'color': 'g'},
-                             {'data_type': 'orientation_z', 'label': 'Z (Yaw)', 'color': 'b'}]
+        'tab_title': 'IMU Basic',
+        'layout': [
+            {   'component_class': TimeSeriesPlotComponent,
+                'row': 0, 'col': 0, # 'colspan' and 'rowspan' can be used for larger components
+                'config': { # Configuration specific to this component instance
+                    'title': 'Orientation vs Time', 'xlabel': 'Time [s]', 'ylabel': 'Degrees',
+                    'plot_height': 300, 'plot_width': 450, # Size constraints applied to the component
+                    'datasets': [{'data_type': 'orientation_x', 'label': 'X (Roll)', 'color': 'r'},
+                                 {'data_type': 'orientation_y', 'label': 'Y (Pitch)', 'color': 'g'},
+                                 {'data_type': 'orientation_z', 'label': 'Z (Yaw)', 'color': 'b'}]
+                }
             },
-            {   'row': 0,'col': 1,'title': 'Angular Velocity vs Time','xlabel': 'Time [s]','ylabel': 'Degrees/s',
-                'plot_height': 300, 'plot_width': 600, # Configurable plot size
-                'datasets': [{'data_type': 'gyro_x', 'label': 'X', 'color': 'r'},
-                             {'data_type': 'gyro_y', 'label': 'Y', 'color': 'g'},
-                             {'data_type': 'gyro_z', 'label': 'Z', 'color': 'b'}]
+            {   'component_class': TimeSeriesPlotComponent,
+                'row': 0, 'col': 1,
+                'config': {
+                    'title': 'Angular Velocity vs Time','xlabel': 'Time [s]','ylabel': 'Degrees/s',
+                    'plot_height': 300, 'plot_width': 600,
+                    'datasets': [{'data_type': 'gyro_x', 'label': 'X', 'color': 'r'},
+                                 {'data_type': 'gyro_y', 'label': 'Y', 'color': 'g'},
+                                 {'data_type': 'gyro_z', 'label': 'Z', 'color': 'b'}]
+                }
             },
+            # Add other components (plots, labels, etc.) here for this tab
+            # Example: Add a placeholder label component if defined
+            # { 'component_class': StatusIndicatorComponent, 'row': 1, 'col': 0,
+            #   'config': {'data_type_to_monitor': 'gyro_x'} }
         ]
     },
     {
         'tab_title': 'IMU Acceleration',
-        'plots': [
-            {   'row': 0,'col': 0,'title': 'Linear Acceleration vs Time','xlabel': 'Time [s]','ylabel': 'm/s²',
-                # Missing size config: will use default/layout behavior
-                'datasets': [{'data_type': 'lin_accel_x', 'label': 'X', 'color': 'r'},
-                             {'data_type': 'lin_accel_y', 'label': 'Y', 'color': 'g'},
-                             {'data_type': 'lin_accel_z', 'label': 'Z', 'color': 'b'}]
+        'layout': [
+            {   'component_class': TimeSeriesPlotComponent,
+                'row': 0, 'col': 0,
+                'config': {
+                    'title': 'Linear Acceleration vs Time','xlabel': 'Time [s]','ylabel': 'm/s²',
+                    # No size constraints -> uses default Expanding policy
+                    'datasets': [{'data_type': 'lin_accel_x', 'label': 'X', 'color': 'r'},
+                                 {'data_type': 'lin_accel_y', 'label': 'Y', 'color': 'g'},
+                                 {'data_type': 'lin_accel_z', 'label': 'Z', 'color': 'b'}]
+                }
             },
-             {  'row': 1,'col': 0,'title': 'Raw Acceleration vs Time','xlabel': 'Time [s]','ylabel': 'm/s²',
-                'plot_height': 280, # Only height specified
-                'datasets': [{'data_type': 'accel_x', 'label': 'X', 'color': 'r'},
-                             {'data_type': 'accel_y', 'label': 'Y', 'color': 'g'},
-                             {'data_type': 'accel_z', 'label': 'Z', 'color': 'b'}]
+            {   'component_class': TimeSeriesPlotComponent,
+                'row': 1, 'col': 0,
+                'config': {
+                    'title': 'Raw Acceleration vs Time','xlabel': 'Time [s]','ylabel': 'm/s²',
+                    'plot_height': 280, # Height constraint
+                    'datasets': [{'data_type': 'accel_x', 'label': 'X', 'color': 'r'},
+                                 {'data_type': 'accel_y', 'label': 'Y', 'color': 'g'},
+                                 {'data_type': 'accel_z', 'label': 'Z', 'color': 'b'}]
+                }
             },
-             {  'row': 1,'col': 1,'title': 'Gravity vs Time','xlabel': 'Time [s]','ylabel': 'm/s²',
-                'plot_width': 400, # Only width specified
-                'datasets': [{'data_type': 'gravity_x', 'label': 'X', 'color': 'r'},
-                             {'data_type': 'gravity_y', 'label': 'Y', 'color': 'g'},
-                             {'data_type': 'gravity_z', 'label': 'Z', 'color': 'b'}]
+            {   'component_class': TimeSeriesPlotComponent,
+                'row': 1, 'col': 1,
+                'config': {
+                     'title': 'Gravity vs Time','xlabel': 'Time [s]','ylabel': 'm/s²',
+                     'plot_width': 400, # Width constraint
+                     'datasets': [{'data_type': 'gravity_x', 'label': 'X', 'color': 'r'},
+                                  {'data_type': 'gravity_y', 'label': 'Y', 'color': 'g'},
+                                  {'data_type': 'gravity_z', 'label': 'Z', 'color': 'b'}]
+                }
             }
         ]
     },
     {
         'tab_title': 'Other Sensors',
-        'plots': [
-             {  'row': 0,'col': 0,'title': 'Magnetic Field vs Time','xlabel': 'Time [s]','ylabel': 'µT',
-                 'plot_height': 350, 'plot_width': 600, # Larger plot
-                 'datasets': [{'data_type': 'mag_x', 'label': 'X', 'color': 'r'},
-                             {'data_type': 'mag_y', 'label': 'Y', 'color': 'g'},
-                             {'data_type': 'mag_z', 'label': 'Z', 'color': 'b'}]
+        'layout': [
+             {  'component_class': TimeSeriesPlotComponent,
+                 'row': 0, 'col': 0,
+                 'config': {
+                     'title': 'Magnetic Field vs Time','xlabel': 'Time [s]','ylabel': 'µT',
+                     'plot_height': 350, 'plot_width': 600, # Both constraints
+                     'datasets': [{'data_type': 'mag_x', 'label': 'X', 'color': 'r'},
+                                  {'data_type': 'mag_y', 'label': 'Y', 'color': 'g'},
+                                  {'data_type': 'mag_z', 'label': 'Z', 'color': 'b'}]
+                 }
              },
-             # Example Plot using the dummy UUID if it were added above
-             # {  'row': 1,'col': 0,'title': 'Dummy Data Plot','xlabel': 'Time [s]','ylabel': 'Value',
-             #    'datasets': [{'data_type': 'dummy', 'label': 'Dummy', 'color': 'm'}]
-             # },
+             # Example of a future component placement
+             # {  'component_class': SomeOtherComponent, 'row': 1, 'col': 0, 'config': {...} }
         ]
     }
 ]
+
 #####################################################################################################################
 # End of customizable section
 #####################################################################################################################
 
 
-# --- PyQtGraph Plot Manager (MODIFIED) ---
-class PlotManager:
-    # Manages plots distributed across multiple tabs
-    def __init__(self, tab_widget: QTabWidget, plot_groups_config: List[Dict], device_config_ref: DeviceConfig):
-        self.tab_widget = tab_widget # Parent is now the QTabWidget
-        self.plot_groups_config = plot_groups_config
-        self.device_config_ref = device_config_ref # Reference to build map
-        # Store references to plot widgets, plot items, and lines
-        self.plot_items: Dict[Tuple[int, int, int], pg.PlotItem] = {} # (tab_idx, row, col) -> PlotItem
-        self.lines: Dict[Tuple[int, int, int, str], pg.PlotDataItem] = {} # (tab_idx, row, col, data_type) -> PlotDataItem
-        self.plot_configs: Dict[Tuple[int, int, int], Dict] = {} # (tab_idx, row, col) -> plot_config dict
-        self.plot_widgets: Dict[Tuple[int, int, int], pg.PlotWidget] = {} # (tab_idx, row, col) -> PlotWidget
+# --- GUI Manager ---
+class GuiManager:
+    #Manages the creation, layout, and updating of GUI components across tabs.
+    def __init__(self, tab_widget: QTabWidget, tab_configs: List[Dict], data_buffers_ref: Dict[str, List[Tuple[float, float]]], device_config_ref: DeviceConfig):
+        self.tab_widget = tab_widget
+        self.tab_configs = tab_configs
+        self.data_buffers_ref = data_buffers_ref
+        self.device_config_ref = device_config_ref
+        self.all_components: List[BaseGuiComponent] = [] # Flat list of all instantiated components
+        self.active_missing_uuids: Set[str] = set() # Overall set of missing UUIDs
 
-        # *** ADDED ***: State for missing UUIDs and their display
-        self.missing_uuids: Set[str] = set()
-        self.uuid_not_found_texts: Dict[Tuple[int, int, int], pg.TextItem] = {} # (tab_idx, row, col) -> TextItem
-        self.data_type_to_uuid_map: Dict[str, str] = {} # data_type -> uuid
-        self._build_data_type_map()
+        self.create_gui_layout()
 
-        self.create_plots()
+    def create_gui_layout(self):
+        # Creates tabs and places components based on tab_configs.
+        for tab_index, tab_config in enumerate(self.tab_configs):
+            tab_title = tab_config.get('tab_title', f'Tab {tab_index + 1}')
+            component_layout_defs = tab_config.get('layout', [])
 
-    def _build_data_type_map(self):
-        """Builds the mapping from data_type keys to their source UUID."""
-        self.data_type_to_uuid_map = {}
-        for char_config in self.device_config_ref.characteristics:
-            for data_type in char_config.produces_data_types:
-                if data_type in self.data_type_to_uuid_map:
-                    logger.warning(f"Data type '{data_type}' is produced by multiple UUIDs. Mapping to {char_config.uuid}.")
-                self.data_type_to_uuid_map[data_type] = char_config.uuid
-        # logger.debug(f"Built data_type -> UUID map: {self.data_type_to_uuid_map}")
-
-    def create_plots(self):
-        # (Plot creation logic remains largely the same as before)
-        for tab_idx, tab_group_config in enumerate(self.plot_groups_config):
-            tab_title = tab_group_config.get('tab_title', f'Tab {tab_idx + 1}')
-            plots_config = tab_group_config.get('plots', [])
-
-            if not plots_config:
-                empty_tab_content = QWidget()
-                empty_tab_content.setLayout(QVBoxLayout())
-                empty_tab_content.layout().addWidget(QLabel(f"No plots configured for '{tab_title}'"))
-                self.tab_widget.addTab(empty_tab_content, tab_title)
-                continue
-
+            # Create the content widget and grid layout for the tab
             tab_content_widget = QWidget()
             grid_layout = QGridLayout(tab_content_widget)
 
-            for plot_config in plots_config:
-                row = plot_config['row']
-                col = plot_config['col']
-                key = (tab_idx, row, col)
-                self.plot_configs[key] = plot_config
+            if not component_layout_defs:
+                # Handle empty tab definition
+                empty_label = QLabel(f"No components configured for '{tab_title}'")
+                empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                grid_layout.addWidget(empty_label, 0, 0)
+            else:
+                # Instantiate and place components
+                for comp_def in component_layout_defs:
+                    comp_class: Type[BaseGuiComponent] = comp_def.get('component_class')
+                    config = comp_def.get('config', {})
+                    row = comp_def.get('row', 0)
+                    col = comp_def.get('col', 0)
+                    rowspan = comp_def.get('rowspan', 1)
+                    colspan = comp_def.get('colspan', 1)
 
-                plot_widget = pg.PlotWidget()
-                self.plot_widgets[key] = plot_widget
+                    if not comp_class or not issubclass(comp_class, BaseGuiComponent):
+                        logger.error(f"Invalid or missing 'component_class' in tab '{tab_title}', row {row}, col {col}. Skipping.")
+                        # Optionally add a placeholder error widget
+                        error_widget = QLabel(f"Error:\nInvalid Component\n(Row {row}, Col {col})")
+                        error_widget.setStyleSheet("QLabel { color: red; border: 1px solid red; }")
+                        grid_layout.addWidget(error_widget, row, col, rowspan, colspan)
+                        continue
 
-                plot_height = plot_config.get('plot_height')
-                plot_width = plot_config.get('plot_width')
-                if plot_height is not None: plot_widget.setFixedHeight(plot_height)
-                if plot_width is not None: plot_widget.setFixedWidth(plot_width)
+                    try:
+                        # Instantiate the component
+                        component_instance = comp_class(config, self.data_buffers_ref, self.device_config_ref)
+                        self.all_components.append(component_instance)
 
-                plot_item = plot_widget.getPlotItem()
-                self.plot_items[key] = plot_item
+                        # Add the component's widget to the grid
+                        widget_to_add = component_instance.get_widget()
+                        grid_layout.addWidget(widget_to_add, row, col, rowspan, colspan)
+                        logger.debug(f"Added component {comp_class.__name__} to tab '{tab_title}' at ({row}, {col})")
 
-                plot_item.setTitle(plot_config['title'], size='10pt')
-                plot_item.setLabel('bottom', plot_config['xlabel'])
-                plot_item.setLabel('left', plot_config['ylabel'])
-                plot_item.showGrid(x=True, y=True, alpha=0.1)
-                plot_item.addLegend(offset=(10, 5))
-                plot_item.getViewBox().setDefaultPadding(0.01)
-                # *** ADDED ***: Connect view change signal to reposition text
-                plot_item.getViewBox().sigRangeChanged.connect(partial(self.position_text_item_for_plot, key))
+                    except Exception as e:
+                        logger.error(f"Failed to instantiate/add component {comp_class.__name__} in tab '{tab_title}': {e}", exc_info=True)
+                        # Add a placeholder error widget
+                        error_widget = QLabel(f"Error:\n{comp_class.__name__}\nFailed to load\n(Row {row}, Col {col})")
+                        error_widget.setStyleSheet("QLabel { color: red; border: 1px solid red; }")
+                        grid_layout.addWidget(error_widget, row, col, rowspan, colspan)
 
 
-                for dataset in plot_config['datasets']:
-                    data_type = dataset['data_type']
-                    pen = pg.mkPen(color=dataset['color'], width=1.5)
-                    line = plot_item.plot(pen=pen, name=dataset['label'])
-                    self.lines[(tab_idx, row, col, data_type)] = line
+            # Make the grid layout the layout for the content widget
+            tab_content_widget.setLayout(grid_layout)
 
-                grid_layout.addWidget(plot_widget, row, col)
-
+            # Add the content widget (potentially within a scroll area) to the tab widget
+            # Decide if scroll area is needed (e.g., based on total component size hint?) - simple approach: always use scroll area
             scroll_area = QScrollArea()
             scroll_area.setWidgetResizable(True)
             scroll_area.setWidget(tab_content_widget)
             self.tab_widget.addTab(scroll_area, tab_title)
 
-    def update_missing_uuids(self, missing_uuids_set: set):
-        """Slot to receive the set of missing UUIDs from the BLE task."""
-        logger.info(f"PlotManager received missing UUIDs: {missing_uuids_set if missing_uuids_set else 'None'}")
-        self.missing_uuids = missing_uuids_set
-        self.refresh_missing_uuid_texts()
-        # Trigger a plot update to clear lines if needed
-        QTimer.singleShot(0, self._request_gui_update) # Request update in next cycle
 
-    def _request_gui_update(self):
-        # Find the main window instance to emit the signal
-        # This assumes the PlotManager is owned by MainWindow or can access it
-        # A more robust way would be to pass the signal emitter or main window ref
-        try:
-            # Try to find the MainWindow instance
-            mw = next(widget for widget in QApplication.topLevelWidgets() if isinstance(widget, MainWindow))
-            mw.request_plot_update_signal.emit()
-        except StopIteration:
-            logger.error("Could not find MainWindow instance to request plot update.")
-        except Exception as e:
-             logger.error(f"Error requesting plot update: {e}")
-
-
-    def refresh_missing_uuid_texts(self):
-        """Adds or removes 'UUID not found' messages based on self.missing_uuids."""
-        logger.debug("Refreshing 'UUID not found' text items in plots...")
-        for key, plot_config in self.plot_configs.items(): # key = (tab_idx, row, col)
-            plot_item = self.plot_items.get(key)
-            if not plot_item: continue
-
-            required_uuids_for_plot = set()
-            for dataset in plot_config.get('datasets', []):
-                data_type = dataset['data_type']
-                uuid = self.data_type_to_uuid_map.get(data_type)
-                if uuid:
-                    required_uuids_for_plot.add(uuid)
-                else:
-                    logger.warning(f"Plot '{plot_config.get('title', key)}' requires data_type '{data_type}' which has no UUID mapping.")
-
-            missing_uuids_for_this_plot = required_uuids_for_plot.intersection(self.missing_uuids)
-
-            if missing_uuids_for_this_plot:
-                first_missing_uuid = next(iter(missing_uuids_for_this_plot)) # Get one missing UUID
-                text_content = f"UUID:\n{first_missing_uuid}\nnot found!"
-                text_item = self.uuid_not_found_texts.get(key)
-
-                if text_item:
-                    logger.debug(f"Updating existing text for plot {key}")
-                    text_item.setText(text_content)
-                else:
-                    logger.debug(f"Creating new text for plot {key}")
-                    text_item = pg.TextItem(text_content, color=(150, 150, 150), anchor=(0.5, 0.5))
-                    text_item.setZValue(100) # Ensure it's on top
-                    plot_item.addItem(text_item)
-                    self.uuid_not_found_texts[key] = text_item
-
-                # Position the text item (or reposition if it existed)
-                self.position_text_item(key, text_item)
-
-            else: # No missing UUIDs for this plot
-                if key in self.uuid_not_found_texts:
-                    logger.debug(f"Removing text for plot {key}")
-                    text_item = self.uuid_not_found_texts[key]
-                    plot_item.removeItem(text_item)
-                    del self.uuid_not_found_texts[key]
-
-    def position_text_item(self, key, text_item):
-        """Positions the text item in the center of the plot's current view."""
-        plot_item = self.plot_items.get(key)
-        if not plot_item or not text_item: return
-
-        try:
-            view_box = plot_item.getViewBox()
-            if not view_box.autoRangeEnabled()[1]: # If Y is not auto-ranging, use default range
-                 y_range = plot_item.getAxis('left').range
-            else:
-                 y_range = view_box.viewRange()[1] # Use view range if auto-ranging
-            x_range = view_box.viewRange()[0]
-
-            # Handle potential invalid ranges during initialization or reset
-            if None in x_range or None in y_range or x_range[1] <= x_range[0] or y_range[1] <= y_range[0]:
-                # Fallback to a default position if range is invalid
-                center_x = 0.5
-                center_y = 0.5
-                logger.debug(f"Using fallback position for text in plot {key} due to invalid range ({x_range}, {y_range})")
-            else:
-                center_x = x_range[0] + (x_range[1] - x_range[0]) / 2
-                center_y = y_range[0] + (y_range[1] - y_range[0]) / 2
-
-            text_item.setPos(center_x, center_y)
-            # logger.debug(f"Positioned text for {key} at ({center_x:.2f}, {center_y:.2f})")
-        except Exception as e:
-            logger.warning(f"Could not position text item for plot {key}: {e}")
-
-    def position_text_item_for_plot(self, key):
-        """Slot connected to sigRangeChanged to reposition the text item."""
-        if key in self.uuid_not_found_texts:
-            self.position_text_item(key, self.uuid_not_found_texts[key])
-
-
-    def update_plots(self, is_flowing: bool, current_relative_time: float):
-        if plotting_paused or start_time is None:
+    def update_all_components(self, current_relative_time: float, is_flowing: bool):
+        # Calls the update method on all managed components.
+        if plotting_paused or start_time is None: # Check global pause state here
             return
+        for component in self.all_components:
+            try:
+                component.update_component(current_relative_time, is_flowing)
+            except Exception as e:
+                logger.error(f"Error updating component {type(component).__name__}: {e}", exc_info=True)
+                # Optionally disable the component or show an error state visually
 
-        for key, plot_item in self.plot_items.items(): # key = (tab_idx, row, col)
-            config = self.plot_configs.get(key)
-            if not config: continue
+    def clear_all_components(self):
+        # Calls the clear method on all managed components.
+        logger.info("GuiManager clearing all components.")
+        self.active_missing_uuids.clear() # Clear overall missing UUID state
+        for component in self.all_components:
+            try:
+                component.clear_component()
+                # Also reset any missing UUID state within the component itself
+                component.handle_missing_uuids(set())
+            except Exception as e:
+                logger.error(f"Error clearing component {type(component).__name__}: {e}", exc_info=True)
 
-            # --- Determine Time Axis Range ---
-            min_time_axis = 0
-            max_time_axis = max(current_relative_time, flowing_interval)
+    def notify_missing_uuids(self, missing_uuids_set: Set[str]):
+        # Receives the set of all missing UUIDs and notifies relevant components.
+        logger.info(f"GuiManager received missing UUIDs: {missing_uuids_set if missing_uuids_set else 'None'}")
+        self.active_missing_uuids = missing_uuids_set
 
-            if is_flowing:
-                min_time_axis = max(0, current_relative_time - flowing_interval)
-                max_time_axis = current_relative_time
-                plot_item.setXRange(min_time_axis, max_time_axis, padding=0.02)
-            else:
-                max_data_time = 0
-                for dataset in config['datasets']:
-                    data_type = dataset['data_type']
-                    # Only consider data types from non-missing UUIDs for axis range
-                    uuid = self.data_type_to_uuid_map.get(data_type)
-                    if uuid and uuid not in self.missing_uuids and data_type in data_buffers and data_buffers[data_type]:
-                        try:
-                            max_data_time = max(max_data_time, data_buffers[data_type][-1][0])
-                        except IndexError: pass
+        for component in self.all_components:
+            required_types = component.get_required_data_types()
+            if not required_types:
+                continue # Component doesn't need data, skip UUID check
 
-                max_time_axis = max(max_data_time, flowing_interval)
-                plot_item.setXRange(0, max_time_axis, padding=0.02)
+            relevant_missing_uuids_for_comp = set()
+            for data_type in required_types:
+                uuid = self.device_config_ref.get_uuid_for_data_type(data_type)
+                if uuid and uuid in self.active_missing_uuids:
+                    relevant_missing_uuids_for_comp.add(uuid)
 
-            # --- Update Data for Lines in this Plot ---
-            data_updated_in_plot = False
-            plot_has_missing_uuid_text = (key in self.uuid_not_found_texts)
-
-            for dataset in config['datasets']:
-                data_type = dataset['data_type']
-                line_key = key + (data_type,)
-                line = self.lines.get(line_key)
-                uuid = self.data_type_to_uuid_map.get(data_type)
-
-                # Check if UUID is missing
-                if line and uuid and uuid in self.missing_uuids:
-                    line.setData(x=[], y=[]) # Clear line if UUID is missing
-                    # logger.debug(f"Cleared line for {data_type} (UUID {uuid} missing)")
-                elif line and data_type in data_buffers:
-                    data = data_buffers[data_type]
-                    plot_data_tuples = []
-                    if is_flowing:
-                        start_idx = bisect.bisect_left(data, min_time_axis, key=lambda x: x[0])
-                        plot_data_tuples = data[start_idx:]
-                    else:
-                        plot_data_tuples = data
-
-                    if plot_data_tuples:
-                        try:
-                            times = np.array([item[0] for item in plot_data_tuples])
-                            values = np.array([item[1] for item in plot_data_tuples])
-                            line.setData(x=times, y=values)
-                            data_updated_in_plot = True
-                        except (ValueError, IndexError) as e:
-                            logger.warning(f"Could not convert/set data for {data_type}: {e}")
-                            line.setData(x=[], y=[])
-                    else:
-                        line.setData(x=[], y=[])
-
-                elif line:
-                    line.setData(x=[], y=[]) # Clear line if data_type not found in buffers
-
-            # --- Y Auto-Ranging ---
-            # Only auto-range Y if data was updated AND no "UUID not found" text is shown
-            if data_updated_in_plot and not plot_has_missing_uuid_text:
-                plot_item.enableAutoRange(axis='y', enable=True)
-            elif plot_has_missing_uuid_text:
-                 # Disable auto-ranging and set a default range if text is shown
-                 plot_item.enableAutoRange(axis='y', enable=False)
-                 # Keep existing range or set a default? Let's try setting a simple default.
-                 plot_item.setYRange(0, 1, padding=0.1) # Example default range
-
-
-    def clear_plots(self):
-        # Clear data from all lines
-        for line in self.lines.values():
-            line.setData(x=[], y=[])
-
-        # Clear "UUID not found" text items
-        keys_to_remove = list(self.uuid_not_found_texts.keys())
-        for key in keys_to_remove:
-             plot_item = self.plot_items.get(key)
-             text_item = self.uuid_not_found_texts.get(key)
-             if plot_item and text_item:
-                 try:
-                     plot_item.removeItem(text_item)
-                 except Exception as e:
-                     logger.warning(f"Error removing text item during clear: {e}")
-             if key in self.uuid_not_found_texts:
-                del self.uuid_not_found_texts[key]
-        self.missing_uuids.clear() # Assume clear means we forget missing status too
-
-
-        # Reset view ranges for all plot items
-        for plot_item in self.plot_items.values():
-            plot_item.setXRange(0, flowing_interval, padding=0.02)
-            plot_item.setYRange(0, 1, padding=0.1) # Reset Y range to default
-            plot_item.enableAutoRange(axis='y', enable=True) # Re-enable Y auto-ranging
+            try:
+                # Pass only the UUIDs that are *both* required by the component *and* missing overall
+                component.handle_missing_uuids(relevant_missing_uuids_for_comp)
+            except Exception as e:
+                 logger.error(f"Error notifying component {type(component).__name__} about missing UUIDs: {e}", exc_info=True)
 
 
 # --- Bluetooth Protocol Handling ---
@@ -600,10 +744,10 @@ async def notification_handler(char_config: CharacteristicConfig, sender: int, d
 
     for key, value in values.items():
         if key not in data_buffers:
-            data_buffers[key] = []
+            data_buffers[key] = [] # Use list, deque not strictly necessary here unless very high frequency/long runs
         data_buffers[key].append((relative_time, value))
 
-async def find_device(device_config: DeviceConfig) -> Optional[BleakClient]:
+async def find_device(device_config_current: DeviceConfig) -> Optional[BleakClient]: # Use current config
     """Finds the target device using BleakScanner."""
     found_event = asyncio.Event()
     target_device = None
@@ -612,33 +756,34 @@ async def find_device(device_config: DeviceConfig) -> Optional[BleakClient]:
     def detection_callback(device, advertisement_data):
         nonlocal target_device, found_event
         if not found_event.is_set():
-            target_service_lower = device_config.service_uuid.lower()
+            # Use name and service UUID from the *current* device_config object
+            target_service_lower = device_config_current.service_uuid.lower()
             advertised_uuids_lower = [u.lower() for u in advertisement_data.service_uuids]
             device_name = getattr(device, 'name', None)
-            if device_name == device_config.name and target_service_lower in advertised_uuids_lower:
+            if device_name == device_config_current.name and target_service_lower in advertised_uuids_lower:
                 target_device = device
                 found_event.set()
                 logger.info(f"Match found and event SET for: {device.name} ({device.address})")
-            elif device_name and device_config.name and device_name.lower() == device_config.name.lower():
+            elif device_name and device_config_current.name and device_name.lower() == device_config_current.name.lower():
                  logger.debug(f"Found name match '{device_name}' but service UUID mismatch. Adv: {advertised_uuids_lower}, Target: {target_service_lower}")
 
     scanner = BleakScanner(
         detection_callback=detection_callback,
-        service_uuids=[device_config.service_uuid]
+        service_uuids=[device_config_current.service_uuid] # Use current service UUID
     )
-    logger.info(f"Starting scanner for {device_config.name} (Service: {device_config.service_uuid})...")
+    logger.info(f"Starting scanner for {device_config_current.name} (Service: {device_config_current.service_uuid})...")
     gui_emitter.emit_scan_throbber("Scanning...")
 
     try:
         await scanner.start()
         try:
-            await asyncio.wait_for(found_event.wait(), timeout=device_config.find_timeout)
+            await asyncio.wait_for(found_event.wait(), timeout=device_config_current.find_timeout) # Use current timeout
             if target_device:
                 logger.info(f"Device found event confirmed for {target_device.name}")
             else:
                  logger.warning("Found event was set, but target_device is still None.")
         except asyncio.TimeoutError:
-            logger.warning(f"Device '{device_config.name}' not found within {device_config.find_timeout} seconds (timeout).")
+            logger.warning(f"Device '{device_config_current.name}' not found within {device_config_current.find_timeout} seconds (timeout).")
             target_device = None
         except asyncio.CancelledError:
              logger.info("Scan cancelled by user.")
@@ -652,37 +797,33 @@ async def find_device(device_config: DeviceConfig) -> Optional[BleakClient]:
          target_device = None
     finally:
         logger.debug("Executing scanner stop block...")
-        # Ensure the 'scanner' variable exists in the local scope before trying to access it
         if 'scanner' in locals() and scanner is not None:
             try:
-                # Attempt to stop the scanner regardless of its reported 'is_scanning' state.
-                # Bleak's stop() should be idempotent (safe to call multiple times)
-                # or handle the already-stopped state gracefully.
                 logger.info(f"Attempting to stop scanner {scanner}...")
                 await scanner.stop()
                 logger.info(f"Scanner stop command issued for {scanner}.")
             except Exception as e:
-                # Log the error but don't let it prevent further cleanup if possible.
-                # Avoid full traceback here unless debugging, as errors might be expected if already stopped.
                 logger.warning(f"Error encountered while stopping scanner: {e}", exc_info=False)
         else:
-            # This case can happen if scanner creation failed very early.
             logger.debug("Scanner object not found or is None in finally block, skipping stop.")
-            
+
     if scan_cancelled: raise asyncio.CancelledError
     return target_device
 
 
 async def connection_task():
-    global client, last_received_time, state
+    global client, last_received_time, state, device_config # Access global device_config
     # Keep track of characteristics we successfully subscribe to
     found_char_configs: List[CharacteristicConfig] = []
 
     while state == "scanning":
         target_device = None
         found_char_configs = [] # Reset for each connection attempt cycle
+        # --- Use the *current* global device_config state ---
+        current_device_config = device_config
+        # ----------------------------------------------------
         try:
-            target_device = await find_device(device_config)
+            target_device = await find_device(current_device_config) # Pass the current config
         except asyncio.CancelledError:
             logger.info("connection_task: Scan was cancelled.")
             break
@@ -694,21 +835,22 @@ async def connection_task():
 
         if not target_device:
             if state == "scanning":
-                 logger.info(f"Device '{device_config.name}' not found, retrying scan in 3 seconds...")
-                 gui_emitter.emit_scan_throbber(f"Device '{device_config.name}' not found. Retrying...")
+                 logger.info(f"Device '{current_device_config.name}' not found, retrying scan in 3 seconds...")
+                 gui_emitter.emit_scan_throbber(f"Device '{current_device_config.name}' not found. Retrying...")
                  await asyncio.sleep(3)
                  continue
             else:
                  logger.info("Scan stopped while waiting for device.")
                  break
 
-        gui_emitter.emit_connection_status(f"Found {device_config.name}. Connecting...")
+        gui_emitter.emit_connection_status(f"Found {current_device_config.name}. Connecting...")
         client = None
         connection_successful = False
         for attempt in range(3):
              if state != "scanning": logger.info("Connection attempt aborted, state changed."); break
              try:
                   logger.info(f"Connecting (attempt {attempt + 1})...")
+                  # Pass disconnected_callback here
                   client = BleakClient(target_device, disconnected_callback=disconnected_callback)
                   await client.connect(timeout=10.0)
                   logger.info("Connected successfully")
@@ -739,26 +881,26 @@ async def connection_task():
         notification_errors = False
         missing_uuids = set()
         try:
-            logger.info(f"Checking characteristics for service {device_config.service_uuid}...")
-            service = client.services.get_service(device_config.service_uuid)
+            # Use the service UUID from the config used for *this* connection attempt
+            logger.info(f"Checking characteristics for service {current_device_config.service_uuid}...")
+            service = client.services.get_service(current_device_config.service_uuid)
             if not service:
-                 logger.error(f"Service {device_config.service_uuid} not found on connected device.")
-                 gui_emitter.emit_show_error("Connection Error", f"Service UUID\n{device_config.service_uuid}\nnot found on device.")
+                 logger.error(f"Service {current_device_config.service_uuid} not found on connected device.")
+                 gui_emitter.emit_show_error("Connection Error", f"Service UUID\n{current_device_config.service_uuid}\nnot found on device.")
                  gui_emitter.emit_state_change("disconnecting") # Treat as fatal error for this connection
                  notification_errors = True # Skip notification attempts
             else:
                  logger.info("Service found. Checking configured characteristics...")
                  found_char_configs = [] # Reset list for this successful connection
-                 for char_config in device_config.characteristics:
+                 # Use characteristics from the config used for *this* connection attempt
+                 for char_config in current_device_config.characteristics:
                      bleak_char = service.get_characteristic(char_config.uuid)
                      if bleak_char:
                          logger.info(f"Characteristic found: {char_config.uuid}")
-                         # Check if characteristic supports notify or indicate
                          if "notify" in bleak_char.properties or "indicate" in bleak_char.properties:
                              found_char_configs.append(char_config)
                          else:
                              logger.warning(f"Characteristic {char_config.uuid} found but does not support notify/indicate.")
-                             # log and add to missing.
                              missing_uuids.add(char_config.uuid)
                      else:
                          logger.warning(f"Characteristic NOT FOUND: {char_config.uuid}")
@@ -786,8 +928,7 @@ async def connection_task():
                             char_uuid = found_char_configs[i].uuid # Use the correct list here
                             logger.error(f"Failed to start notification for {char_uuid}: {result}")
                             all_notifications_started = False; notification_errors = True
-                            # If start_notify fails, maybe add to missing_uuids and re-emit?
-                            missing_uuids.add(char_uuid)
+                            missing_uuids.add(char_uuid) # Add to missing if start_notify failed
 
                     if not all_notifications_started:
                         logger.error("Could not start all required notifications. Disconnecting.")
@@ -795,22 +936,23 @@ async def connection_task():
                         gui_emitter.emit_state_change("disconnecting")
                     else:
                         logger.info("Notifications started successfully. Listening...")
-                        # (Rest of the listening loop remains the same)
                         last_received_time = time.time()
                         disconnected_event.clear()
                         while state == "connected":
                              try:
-                                 await asyncio.wait_for(disconnected_event.wait(), timeout=device_config.data_timeout + 1.0)
+                                 # Use data timeout from the config used for *this* connection
+                                 await asyncio.wait_for(disconnected_event.wait(), timeout=current_device_config.data_timeout + 1.0)
                                  logger.info("Disconnected event received while listening.")
                                  gui_emitter.emit_state_change("disconnecting")
                                  break
                              except asyncio.TimeoutError:
                                  current_time = time.time()
-                                 if current_time - last_received_time > device_config.data_timeout:
-                                     logger.warning(f"No data received for {current_time - last_received_time:.1f}s (timeout: {device_config.data_timeout}s). Assuming disconnect.")
+                                 # Use data timeout from the config used for *this* connection
+                                 if current_time - last_received_time > current_device_config.data_timeout:
+                                     logger.warning(f"No data received for {current_time - last_received_time:.1f}s (timeout: {current_device_config.data_timeout}s). Assuming disconnect.")
                                      gui_emitter.emit_state_change("disconnecting")
                                      break
-                                 else: continue
+                                 else: continue # Continue listening
                              except asyncio.CancelledError:
                                  logger.info("Listening loop cancelled.")
                                  gui_emitter.emit_state_change("disconnecting"); raise
@@ -838,11 +980,11 @@ async def connection_task():
                       logger.info("Attempting to stop notifications and disconnect client...")
                       try:
                           stop_tasks = []
-                          # Iterate through FOUND characteristics only
+                          # Iterate through FOUND characteristics only (using the list from this connection attempt)
                           for char_config in found_char_configs:
                               try:
-                                  # Basic check if characteristic exists before stop_notify
-                                  service = local_client.services.get_service(device_config.service_uuid)
+                                  # Use service UUID from the config active during *this* connection
+                                  service = local_client.services.get_service(current_device_config.service_uuid)
                                   if service and service.get_characteristic(char_config.uuid):
                                       logger.debug(f"Preparing stop_notify for {char_config.uuid}")
                                       stop_tasks.append(local_client.stop_notify(char_config.uuid))
@@ -874,8 +1016,9 @@ async def connection_task():
                  gui_emitter.emit_state_change("idle")
 
             disconnected_event.clear()
-            found_char_configs = [] # Clear the list
+            found_char_configs = [] # Clear the list specific to this attempt
 
+        # Check global state before looping back to scan
         if state != "scanning":
             logger.info(f"Exiting connection_task as state is '{state}'.")
             break
@@ -897,7 +1040,7 @@ async def main_async():
     if current_task and not current_task.done():
         logger.info("main_async: Waiting for connection_task cancellation/cleanup to complete...")
         try:
-            await current_task
+            await current_task # Wait for the task to finish its cleanup after cancellation
             logger.info("main_async: connection_task completed its run after stop signal.")
         except asyncio.CancelledError:
             logger.info("main_async: connection_task finished handling cancellation.")
@@ -926,11 +1069,12 @@ class LEDWidget(QWidget):
 
 
 class MainWindow(QMainWindow):
+    # Signal to request an update (can be triggered by timer or other events)
     request_plot_update_signal = pyqtSignal()
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Live BLE Data Plotter (UUID Discovery)") # Updated title
+        self.setWindowTitle("Modular BLE Data GUI") # Updated title
         self.setGeometry(100, 100, 1200, 850)
 
         # --- Capture State ---
@@ -944,7 +1088,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.central_widget)
         self.main_layout = QVBoxLayout(self.central_widget)
 
-        # --- Top Button Bar ---
+        # --- Top Button Bar---
         self.button_bar = QWidget()
         self.button_layout = QHBoxLayout(self.button_bar)
         self.button_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
@@ -961,15 +1105,15 @@ class MainWindow(QMainWindow):
         self.scan_button = QPushButton("Start Scan"); self.scan_button.clicked.connect(self.toggle_scan); self.button_layout.addWidget(self.scan_button)
         self.pause_resume_button = QPushButton("Pause Plotting"); self.pause_resume_button.setEnabled(False); self.pause_resume_button.clicked.connect(self.toggle_pause_resume); self.button_layout.addWidget(self.pause_resume_button)
         self.capture_button = QPushButton("Start Capture"); self.capture_button.setEnabled(False); self.capture_button.clicked.connect(self.toggle_capture); self.button_layout.addWidget(self.capture_button)
-        self.clear_button = QPushButton("Clear Plots"); self.clear_button.clicked.connect(self.clear_plots_action); self.button_layout.addWidget(self.clear_button)
+        self.clear_button = QPushButton("Clear GUI"); self.clear_button.clicked.connect(self.clear_gui_action); self.button_layout.addWidget(self.clear_button) # Renamed slightly
         self.status_label = QLabel("On Standby"); self.status_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter); self.status_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred); self.button_layout.addWidget(self.status_label)
         self.main_layout.addWidget(self.button_bar)
 
-        # --- Plot Area (TabWidget with PlotManager) ---
+        # --- Tab Area (Managed by GuiManager) ---
         self.tab_widget = QTabWidget()
         self.tab_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        # Pass device_config reference to PlotManager
-        self.plot_manager = PlotManager(self.tab_widget, plot_groups, device_config)
+        # Instantiate the new GuiManager
+        self.gui_manager = GuiManager(self.tab_widget, tab_configs, data_buffers, device_config)
         self.main_layout.addWidget(self.tab_widget)
 
         # --- Bottom Control Bar ---
@@ -1005,7 +1149,7 @@ class MainWindow(QMainWindow):
         # --- Timers and Signals ---
         self.plot_update_timer = QTimer(self)
         self.plot_update_timer.setInterval(50) # ~20 FPS
-        self.plot_update_timer.timeout.connect(self.trigger_plot_update)
+        self.plot_update_timer.timeout.connect(self.trigger_gui_update) # Renamed target slot
         self.plot_update_timer.start()
 
         self.scan_throbber_timer = QTimer(self)
@@ -1014,13 +1158,15 @@ class MainWindow(QMainWindow):
         self.throbber_chars = ["|", "/", "-", "\\"]
         self.throbber_index = 0
 
+        # Connect signals from GuiEmitter
         gui_emitter.state_change_signal.connect(self.handle_state_change)
         gui_emitter.scan_throbber_signal.connect(self.update_scan_status)
         gui_emitter.connection_status_signal.connect(self.update_connection_status)
         gui_emitter.show_error_signal.connect(self.show_message_box)
-        # Connect the missing UUIDs signal to the PlotManager's slot
-        gui_emitter.missing_uuids_signal.connect(self.plot_manager.update_missing_uuids)
-        self.request_plot_update_signal.connect(self._update_plots_now)
+        # Connect the missing UUIDs signal to the GuiManager's slot
+        gui_emitter.missing_uuids_signal.connect(self.gui_manager.notify_missing_uuids)
+        # Connect internal request signal to the actual update slot
+        self.request_plot_update_signal.connect(self._update_gui_now)
 
         self.handle_state_change("idle") # Initialize state
 
@@ -1028,19 +1174,19 @@ class MainWindow(QMainWindow):
     def append_log_message(self, message):
         self.log_text_box.append(message)
 
-    # --- Plot Update Triggering ---
-    def trigger_plot_update(self):
+    # --- GUI Update Triggering ---
+    def trigger_gui_update(self):
+        """Slot called by the timer."""
         self.request_plot_update_signal.emit()
 
-    def _update_plots_now(self):
-         if start_time is not None: # Check start_time, plotting_paused is handled internally by PlotManager now indirectly
-             current_relative = (datetime.datetime.now() - start_time).total_seconds()
-             is_flowing = self.flowing_mode_check.isChecked()
-             self.plot_manager.update_plots(is_flowing, current_relative)
-         elif not start_time and state == "connected":
-             # If connected but no data received yet (start_time is None),
-             # ensure plots showing "UUID not found" are displayed correctly.
-             self.plot_manager.refresh_missing_uuid_texts() # Re-check positioning
+    def _update_gui_now(self):
+        """Slot that performs the actual GUI component update."""
+        if start_time is not None: # Check if connection established and data received
+            current_relative = (datetime.datetime.now() - start_time).total_seconds()
+            is_flowing = self.flowing_mode_check.isChecked()
+            # Delegate update to the GuiManager
+            self.gui_manager.update_all_components(current_relative, is_flowing)
+        # No else needed: GuiManager.update_all_components checks plotting_paused internally
 
     # --- Scan Animation ---
     def animate_scan_throbber(self):
@@ -1053,16 +1199,16 @@ class MainWindow(QMainWindow):
 
     # --- GUI Action Slots ---
 
-    # --- Handler for Device Dropdown Change ---
+    # --- Handler for Device Dropdown ---
     def update_target_device(self, selected_name: str):
-        global device_config
+        global device_config # Need to modify the global object
         if device_config.name != selected_name:
             logger.info(f"Target device changed via GUI: {selected_name}")
-            device_config.name = selected_name
-            # Also update the reference in plot manager if needed for future use?
-            self.plot_manager.device_config_ref = device_config
-            self.plot_manager._build_data_type_map() # Rebuild map if device changes
-            logger.info("Device config and plot manager map updated.")
+            # Update the name in the global device_config object
+            device_config.update_name(selected_name)
+            logger.info("Device config name updated.")
+            # If connected, changing device implies disconnect/rescan needed.
+            # update the config; user needs to manually restart scan.
 
     # State Change Handling
     def handle_state_change(self, new_state: str):
@@ -1075,26 +1221,22 @@ class MainWindow(QMainWindow):
             self.scan_throbber_timer.stop()
 
         is_idle = (new_state == "idle")
-        self.device_combo.setEnabled(is_idle)
-        self.scan_button.setEnabled(True) # Scan/Disconnect always enabled except during disconnect
+        self.device_combo.setEnabled(is_idle) # Can only change device when idle
+        self.scan_button.setEnabled(True) # Scan/Disconnect always enabled except during disconnect transition
 
         if new_state == "idle":
             self.scan_button.setText("Start Scan")
             self.led_indicator.set_color("red"); self.status_label.setText("On Standby")
-            self.pause_resume_button.setEnabled(False); self.pause_resume_button.setText("Pause Plotting") # Keep text as Pause Plotting
+            self.pause_resume_button.setEnabled(False); self.pause_resume_button.setText("Pause Plotting")
             self.capture_button.setEnabled(False); self.capture_button.setText("Start Capture")
             plotting_paused = True # Set plots to paused state logically
 
-            # *** Automatically clear plots/state when becoming idle ***
-            logger.info("State changed to idle. Automatically clearing plots and state.")
-            self.clear_plots_action(confirm=False) # This handles plots, buffers, start_time, missing_uuids
+            # Automatically clear GUI/state when becoming idle
+            logger.info("State changed to idle. Automatically clearing GUI and state.")
+            self.clear_gui_action(confirm=False) # Handles GUI components, buffers, start_time, missing_uuids
 
-            # Handle capture stopped due to disconnect (clear_plots_action warns but doesn't generate)
-            # If you WANT files generated automatically on disconnect, move this block *before* clear_plots_action
-            if self.is_capturing: # This flag should be false now if clear_plots_action ran correctly
+            if self.is_capturing: # Should be false if clear_gui_action ran correctly
                  logger.warning("Capture was active when state became idle (likely disconnect). Files were NOT generated automatically by clear.")
-                 # If generation on disconnect is desired, uncomment the next line AND move this block before clear_plots_action
-                 # QTimer.singleShot(0, self.stop_and_generate_files)
 
         elif new_state == "scanning":
             self.scan_button.setText("Stop Scan")
@@ -1105,6 +1247,7 @@ class MainWindow(QMainWindow):
             # Clearing state now happens in toggle_scan before starting scan
 
         elif new_state == "connected":
+            # Use the name from the *current* global device_config
             self.scan_button.setText("Disconnect")
             self.led_indicator.set_color("lightgreen"); self.status_label.setText(f"Connected to: {device_config.name}")
             # Enable pause/resume ONLY IF NOT currently capturing
@@ -1121,7 +1264,7 @@ class MainWindow(QMainWindow):
             self.capture_button.setEnabled(False)
             plotting_paused = True
 
-    # Scan/Connection Status Updates (Unchanged)
+    # Scan/Connection Status Updates
     def update_scan_status(self, text: str):
          if state == "scanning": self.status_label.setText(text)
     def update_connection_status(self, text: str):
@@ -1129,28 +1272,33 @@ class MainWindow(QMainWindow):
     def show_message_box(self, title: str, message: str):
         QMessageBox.warning(self, title, message)
 
-    # Scan/Connect/Disconnect Logic (MODIFIED to clear plots/state on start)
+    # Scan/Connect/Disconnect Logic (clear GUI/state on start)
     def toggle_scan(self):
         global current_task, loop, state, data_buffers, start_time
         if state == "idle":
             if loop and loop.is_running():
-                # Clear plots, buffers, state BEFORE starting scan
+                # Clear GUI, buffers, state BEFORE starting scan
                 logger.info("Clearing state before starting scan...")
-                self.clear_plots_action(confirm=False) # Ensures everything is reset
+                self.clear_gui_action(confirm=False) # Ensures everything is reset
 
                 self.handle_state_change("scanning")
-                current_task = loop.create_task(connection_task())
+                current_task = loop.create_task(connection_task()) # Uses global device_config implicitly
             else: logger.error("Asyncio loop not running!"); self.show_message_box("Error", "Asyncio loop is not running.")
         elif state == "scanning":
             # Request cancellation, state change handled via callback/finally block
             if current_task and not current_task.done():
                 logger.info("Requesting scan cancellation...")
-                loop.call_soon_threadsafe(current_task.cancel)
+                # Ensure cancellation is requested in the loop's thread
+                future = asyncio.run_coroutine_threadsafe(self.cancel_and_wait_task(current_task), loop)
+                try:
+                    future.result(timeout=0.1) # Brief wait for initiation
+                except TimeoutError: pass # Ignore timeout, cancellation sent
+                except Exception as e: logger.error(f"Error initiating task cancel: {e}")
                 # GUI state will change to idle via the task's cleanup calling emit_state_change("idle")
             else:
                 logger.warning("Stop scan requested, but no task was running/done.")
                 self.handle_state_change("idle") # Force idle if no task
-            current_task = None
+            current_task = None # Clear reference after requesting cancel
         elif state == "connected":
             # Request disconnect, state change handled via callback/finally block
             if loop and client and client.is_connected:
@@ -1159,16 +1307,18 @@ class MainWindow(QMainWindow):
                 # GUI state change will happen via connection_task cleanup
             elif loop and current_task and not current_task.done():
                 logger.info("Requesting disconnect via task cancellation...")
-                loop.call_soon_threadsafe(current_task.cancel)
+                future = asyncio.run_coroutine_threadsafe(self.cancel_and_wait_task(current_task), loop)
+                try: future.result(timeout=0.1)
+                except TimeoutError: pass
+                except Exception as e: logger.error(f"Error initiating task cancel for disconnect: {e}")
                  # GUI state change will happen via connection_task cleanup
             else:
                 logger.warning("Disconnect requested but no active connection/task found.")
                 self.handle_state_change("idle") # Force idle
 
-    # Pause/Resume Plotting (Unchanged)
+    # Pause/Resume Plotting (global flag logic)
     def toggle_pause_resume(self):
         global plotting_paused
-        # Should only be possible if button is enabled (i.e., connected and not capturing)
         if not self.pause_resume_button.isEnabled():
             logger.warning("Pause/Resume toggled while button disabled. Ignoring.")
             return
@@ -1176,11 +1326,11 @@ class MainWindow(QMainWindow):
         plotting_paused = not plotting_paused
         self.pause_resume_button.setText("Resume Plotting" if plotting_paused else "Pause Plotting")
         logger.info(f"Plotting {'paused' if plotting_paused else 'resumed'}")
-        # If resuming, trigger an immediate plot update
+        # If resuming, trigger an immediate GUI update
         if not plotting_paused:
-            self.trigger_plot_update()
+            self.trigger_gui_update()
 
-    # --- Capture Start/Stop Logic (MODIFIED to disable pause/resume) ---
+    # --- Capture Start/Stop Logic (uses global start_time) ---
     def toggle_capture(self):
         global start_time
         if not self.is_capturing:
@@ -1199,65 +1349,62 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 logger.error(f"Failed to create capture dir: {e}")
                 self.show_message_box("Capture Error", f"Failed to create directory:\n{e}")
-                # Reset potential partial state
                 self.capture_output_base_dir = None; self.capture_timestamp = None
-                return # Don't proceed to set capture state
+                return # Don't proceed
 
             # --- Set capture state variables ---
             self.is_capturing = True
             self.capture_button.setText("Stop Capture && Export")
             self.capture_t0_absolute = datetime.datetime.now()
+            # Calculate start relative to the session's absolute start_time
             self.capture_start_relative_time = (self.capture_t0_absolute - start_time).total_seconds()
 
             # --- Disable Pause/Resume Button ---
             self.pause_resume_button.setEnabled(False)
             logger.info("Pause/Resume plotting disabled during capture.")
 
-            logger.info(f"Capture started. Rel t0: {self.capture_start_relative_time:.3f}s.")
+            logger.info(f"Capture started. Abs t0: {self.capture_t0_absolute}, Rel t0: {self.capture_start_relative_time:.3f}s.")
 
         else:
             # Stop Capture and Generate
-            # Call the helper function which will also handle re-enabling the button
             self.stop_and_generate_files()
 
-    # --- Stop Capture & File Generation Helper (MODIFIED to re-enable pause/resume) ---
+    # --- Stop Capture & File Generation Helper ---
     def stop_and_generate_files(self):
-        if not self.is_capturing:
-            logger.warning("stop_and_generate called but capture inactive.")
-            # Ensure pause button state is correct even if called spuriously
-            if state == "connected":
-                 self.pause_resume_button.setEnabled(True)
-            else:
-                 self.pause_resume_button.setEnabled(False)
+        if not self.is_capturing or start_time is None: # Also check start_time exists
+            logger.warning("stop_and_generate called but capture inactive or start_time missing.")
+            if state == "connected": self.pause_resume_button.setEnabled(True)
+            else: self.pause_resume_button.setEnabled(False)
+            # Reset state just in case
+            self.is_capturing = False
+            self.capture_button.setText("Start Capture")
+            self.capture_button.setEnabled(state == "connected")
             return
 
         logger.info("Stopping capture, generating PGF & CSV.")
         output_dir = self.capture_output_base_dir
         start_rel_time = self.capture_start_relative_time
-        capture_end_relative_time = (datetime.datetime.now() - start_time).total_seconds() if start_time else None
+        # Calculate end relative to the session's absolute start_time
+        capture_end_relative_time = (datetime.datetime.now() - start_time).total_seconds()
 
         # --- Reset capture state FIRST ---
         self.is_capturing = False
         self.capture_button.setText("Start Capture")
-        # Ensure capture button is enabled only if connected (check current state)
-        self.capture_button.setEnabled(state == "connected")
+        self.capture_button.setEnabled(state == "connected") # Enable only if still connected
 
         # --- Re-enable Pause/Resume Button ONLY if connected ---
         if state == "connected":
             self.pause_resume_button.setEnabled(True)
             logger.info("Pause/Resume plotting re-enabled after capture (still connected).")
         else:
-            # If not connected, ensure pause/resume remains disabled
             self.pause_resume_button.setEnabled(False)
             logger.info("Pause/Resume plotting remains disabled after capture (not connected).")
 
 
         # --- File Generation Logic ---
-        if output_dir and start_rel_time is not None and capture_end_relative_time is not None:
+        if output_dir and start_rel_time is not None: # End time calculated above
             if not data_buffers:
                  logger.warning("No data captured during the active period. Skipping PGF/CSV generation.")
-                 # Optionally show message box here too
-                 # self.show_message_box("Generation Skipped", "No captured data found in the active period.")
                  # Reset vars even if generation skipped
                  self.capture_output_base_dir = None; self.capture_start_relative_time = None
                  self.capture_t0_absolute = None; self.capture_timestamp = None
@@ -1275,9 +1422,13 @@ class MainWindow(QMainWindow):
                 return
 
             gen_errors = []
-            try: self.generate_pgf_plots_from_buffer(pgf_subdir, start_rel_time)
+            try:
+                # Pass necessary info: output dir, start rel time (for filtering/offset)
+                self.generate_pgf_plots_from_buffer(pgf_subdir, start_rel_time)
             except Exception as e: logger.error(f"PGF generation failed: {e}", exc_info=True); gen_errors.append(f"PGF: {e}")
-            try: self.generate_csv_files_from_buffer(csv_subdir, start_rel_time, capture_end_relative_time, start_rel_time)
+            try:
+                # Pass necessary info: output dir, start/end rel time (for filtering), start rel time (for offset)
+                self.generate_csv_files_from_buffer(csv_subdir, start_rel_time, capture_end_relative_time, start_rel_time)
             except Exception as e: logger.error(f"CSV generation failed: {e}", exc_info=True); gen_errors.append(f"CSV: {e}")
 
             if not gen_errors: self.show_message_box("Generation Complete", f"Files generated in:\n{output_dir}")
@@ -1287,7 +1438,6 @@ class MainWindow(QMainWindow):
              reason = ""
              if not output_dir: reason += " Output dir missing."
              if start_rel_time is None: reason += " Start time missing."
-             if capture_end_relative_time is None: reason += " End time missing (start_time lost?)."
              logger.error(f"Cannot generate files:{reason}")
              self.show_message_box("File Gen Error", f"Internal error:{reason}")
 
@@ -1297,12 +1447,12 @@ class MainWindow(QMainWindow):
         self.capture_t0_absolute = None
         self.capture_timestamp = None
 
-    # --- PGF Generation (Unchanged logic, uses plot_groups config) ---
+
+    # --- PGF Generation (Uses tab_configs for structure, GuiManager for missing UUIDs) ---
     def generate_pgf_plots_from_buffer(self, pgf_dir: str, capture_start_relative_time: float):
-        global data_buffers, plot_groups
+        global data_buffers, tab_configs # Use new tab_configs
 
         logger.info(f"Generating PGF plots (t=0 at capture start, t_offset={capture_start_relative_time:.3f}s). Dir: {pgf_dir}")
-        # Check buffer again, although checked in caller
         if not data_buffers: logger.warning("Data buffer empty, skipping PGF generation."); return
 
         try:
@@ -1314,22 +1464,38 @@ class MainWindow(QMainWindow):
             plt.rcParams.update({'figure.figsize': [6.0, 4.0]})
 
         gen_success = False
-        for group_config in plot_groups:
-            group_title = group_config.get('tab_title', 'UnknownGroup')
-            for config in group_config.get('plots', []):
-                required_uuids_for_plot = set(self.plot_manager.data_type_to_uuid_map.get(ds['data_type'])
-                                              for ds in config.get('datasets', [])
-                                              if self.plot_manager.data_type_to_uuid_map.get(ds['data_type']))
-                missing_uuids_for_this_plot = required_uuids_for_plot.intersection(self.plot_manager.missing_uuids)
+        # Iterate through the new tab_configs structure
+        for tab_config in tab_configs:
+            for comp_def in tab_config.get('layout', []):
+                # Only process components that are TimeSeriesPlotComponent
+                if comp_def.get('component_class') != TimeSeriesPlotComponent:
+                    continue
+
+                plot_config = comp_def.get('config', {}) # Get the config for this plot instance
+                plot_title = plot_config.get('title', 'UntitledPlot')
+                datasets = plot_config.get('datasets', [])
+                if not datasets: continue
+
+                # Check if any required UUIDs for *this plot* were missing during connection
+                required_uuids_for_plot = set()
+                for ds in datasets:
+                    uuid = self.gui_manager.device_config_ref.get_uuid_for_data_type(ds['data_type'])
+                    if uuid: required_uuids_for_plot.add(uuid)
+
+                # Use the currently stored missing UUIDs from GuiManager
+                missing_uuids_for_this_plot = required_uuids_for_plot.intersection(self.gui_manager.active_missing_uuids)
 
                 if missing_uuids_for_this_plot:
-                    logger.warning(f"Skipping PGF for '{config['title']}' as it depends on missing UUID(s): {missing_uuids_for_this_plot}")
+                    logger.warning(f"Skipping PGF for '{plot_title}' as it depends on missing UUID(s): {missing_uuids_for_this_plot}")
                     continue # Skip this plot
 
+                # --- Plotting logic (same as before) ---
                 fig, ax = plt.subplots()
-                ax.set_title(config['title']); ax.set_xlabel(config['xlabel']); ax.set_ylabel(config['ylabel'])
+                ax.set_title(plot_config.get('title', 'Plot'));
+                ax.set_xlabel(plot_config.get('xlabel', 'Time [s]'));
+                ax.set_ylabel(plot_config.get('ylabel', 'Value'))
                 plot_created = False
-                for dataset in config['datasets']:
+                for dataset in datasets:
                     data_type = dataset['data_type']
                     if data_type in data_buffers and data_buffers[data_type]:
                         full_data = data_buffers[data_type]
@@ -1340,35 +1506,37 @@ class MainWindow(QMainWindow):
                             try:
                                 times_rel_capture = [p[0] for p in plot_data]
                                 values = [p[1] for p in plot_data]
-                                ax.plot(times_rel_capture, values, label=dataset['label'], color=dataset['color'], linewidth=1.2)
+                                ax.plot(times_rel_capture, values, label=dataset.get('label', data_type), color=dataset.get('color', 'k'), linewidth=1.2)
                                 plot_created = True
-                            except Exception as plot_err: logger.error(f"Error plotting {data_type}: {plot_err}")
+                            except Exception as plot_err: logger.error(f"Error plotting {data_type} for PGF '{plot_title}': {plot_err}")
 
                 if plot_created:
                     ax.legend(); ax.grid(True, linestyle='--', alpha=0.6); fig.tight_layout(pad=0.5)
-                    safe_title = "".join(c if c.isalnum() or c in (' ', '_', '-') else '_' for c in config['title']).rstrip().replace(' ', '_')
+                    safe_title = "".join(c if c.isalnum() or c in (' ', '_', '-') else '_' for c in plot_title).rstrip().replace(' ', '_')
                     prefix = f"{self.capture_timestamp}_" if self.capture_timestamp else ""
                     pgf_filename = f"{prefix}{safe_title}.pgf"
                     pgf_filepath = os.path.join(pgf_dir, pgf_filename)
                     try: fig.savefig(pgf_filepath, bbox_inches='tight'); logger.info(f"Saved PGF: {pgf_filename}"); gen_success = True
                     except Exception as save_err: logger.error(f"Error saving PGF {pgf_filename}: {save_err}"); raise RuntimeError(f"Save PGF failed: {save_err}") from save_err
-                else: logger.info(f"Skipping PGF '{config['title']}' (no data in capture window).")
-                plt.close(fig)
+                else: logger.info(f"Skipping PGF '{plot_title}' (no data in capture window).")
+                plt.close(fig) # Close the figure to release memory
 
         if gen_success: logger.info(f"PGF generation finished. Dir: {pgf_dir}")
         else: logger.warning("PGF done, but no plots saved (no data / missing UUIDs?).")
 
-    # --- CSV Generation (MODIFIED get_series to exclude missing UUID data) ---
+
+    # --- CSV Generation (Uses tab_configs, GuiManager for missing UUIDs) ---
     def generate_csv_files_from_buffer(self, csv_dir: str, filter_start_rel_time: float, filter_end_rel_time: float, time_offset: float):
-        global data_buffers, plot_groups
+        global data_buffers, tab_configs # Use new tab_configs
 
         logger.info(f"Generating CSVs (data {filter_start_rel_time:.3f}s-{filter_end_rel_time:.3f}s rel session, t=0 at capture start offset={time_offset:.3f}s). Dir: {csv_dir}")
         if not data_buffers: logger.warning("Data buffer empty, skipping CSV generation."); return
 
         def get_series(dt, start, end):
              # Exclude series if its source UUID was missing during the connection
-             uuid = self.plot_manager.data_type_to_uuid_map.get(dt)
-             if uuid and uuid in self.plot_manager.missing_uuids:
+             uuid = self.gui_manager.device_config_ref.get_uuid_for_data_type(dt)
+             # Use the currently stored missing UUIDs from GuiManager
+             if uuid and uuid in self.gui_manager.active_missing_uuids:
                  logger.debug(f"Excluding series '{dt}' from CSV (UUID {uuid} was missing).")
                  return None
 
@@ -1384,35 +1552,51 @@ class MainWindow(QMainWindow):
              return None # Return None if no data in range or buffer empty/missing
 
         master_gen = False
-        for group_config in plot_groups:
-            group_title = group_config.get('tab_title', f"Group_{id(group_config)}")
-            logger.info(f"Processing Master CSV for group: '{group_title}'")
-            group_types = set(ds['data_type'] for plot_cfg in group_config.get('plots', []) for ds in plot_cfg.get('datasets', []))
-            if not group_types: logger.warning(f"Skipping Master CSV '{group_title}': No data types defined."); continue
+        # Generate Master CSV per Tab
+        for tab_index, tab_config in enumerate(tab_configs):
+            tab_title = tab_config.get('tab_title', f"Tab_{tab_index}")
+            logger.info(f"Processing Master CSV for tab: '{tab_title}'")
 
-            series_list = [s for dt in sorted(list(group_types)) if (s := get_series(dt, filter_start_rel_time, filter_end_rel_time)) is not None]
-            if not series_list: logger.warning(f"Skipping Master CSV '{group_title}': No valid series data found in window."); continue
+            # Collect all unique data types used by TimeSeriesPlotComponents in this tab
+            tab_types = set()
+            for comp_def in tab_config.get('layout', []):
+                if comp_def.get('component_class') == TimeSeriesPlotComponent:
+                    plot_config = comp_def.get('config', {})
+                    for ds in plot_config.get('datasets', []):
+                        tab_types.add(ds['data_type'])
+
+            if not tab_types: logger.warning(f"Skipping Master CSV '{tab_title}': No plottable data types defined."); continue
+
+            series_list = [s for dt in sorted(list(tab_types)) if (s := get_series(dt, filter_start_rel_time, filter_end_rel_time)) is not None]
+            if not series_list: logger.warning(f"Skipping Master CSV '{tab_title}': No valid series data found in window."); continue
 
             try:
                 # Concatenate using the TimeRelSession index for alignment
                 master_df = pd.concat(series_list, axis=1, join='outer').sort_index()
                 # Insert the adjusted time column (relative to capture start)
                 master_df.insert(0, 'Master Time (s)', master_df.index - time_offset)
-                safe_g_title = "".join(c if c.isalnum() or c in (' ', '_', '-') else '_' for c in group_title).rstrip().replace(' ', '_')
+                safe_t_title = "".join(c if c.isalnum() or c in (' ', '_', '-') else '_' for c in tab_title).rstrip().replace(' ', '_')
                 prefix = f"{self.capture_timestamp}_" if self.capture_timestamp else ""
-                csv_fname = f"{prefix}master_{safe_g_title}.csv"
+                csv_fname = f"{prefix}master_tab_{safe_t_title}.csv"
                 csv_fpath = os.path.join(csv_dir, csv_fname)
                 master_df.to_csv(csv_fpath, index=False, float_format='%.6f') # Don't write the TimeRelSession index
                 logger.info(f"Saved Master CSV: {csv_fname}"); master_gen = True
-            except Exception as e: logger.error(f"Error generating Master CSV '{group_title}': {e}", exc_info=True); raise RuntimeError(f"Master CSV generation failed: {e}") from e
+            except Exception as e: logger.error(f"Error generating Master CSV '{tab_title}': {e}", exc_info=True); raise RuntimeError(f"Master CSV generation failed: {e}") from e
 
         indiv_gen = False
-        for group_config in plot_groups:
-            for plot_config in group_config.get('plots', []):
-                plot_title = plot_config.get('title', f"Plot_{id(plot_config)}")
-                logger.info(f"Processing Individual CSV for plot: '{plot_title}'")
+        # Generate Individual CSV per Plot Component
+        for tab_index, tab_config in enumerate(tab_configs):
+             for comp_index, comp_def in enumerate(tab_config.get('layout', [])):
+                # Only process components that are TimeSeriesPlotComponent
+                if comp_def.get('component_class') != TimeSeriesPlotComponent:
+                    continue
+
+                plot_config = comp_def.get('config', {})
+                plot_title = plot_config.get('title', f"Tab{tab_index}_Plot{comp_index}")
                 datasets = plot_config.get('datasets', [])
                 if not datasets: logger.warning(f"Skipping Individual CSV '{plot_title}': No datasets defined."); continue
+
+                logger.info(f"Processing Individual CSV for plot: '{plot_title}'")
 
                 # Get only series relevant to this specific plot
                 series_list = [s for ds in datasets if (s := get_series(ds['data_type'], filter_start_rel_time, filter_end_rel_time)) is not None]
@@ -1434,38 +1618,34 @@ class MainWindow(QMainWindow):
         else: logger.warning("CSV generation done, but no files were saved (no valid data in window?).")
 
 
-    # --- Clear Plots Action (MODIFIED to update PlotManager state) ---
-    def clear_plots_action(self, confirm=True):
+    # --- Clear GUI Action ---
+    def clear_gui_action(self, confirm=True):
         global data_buffers, start_time
-        logger.info("Attempting to clear plot data.")
+        logger.info("Attempting to clear GUI components and data.")
         do_clear = False
         if confirm:
-            # Ask slightly different question if capture is active
-            question = "Clear all plot data and reset UUID status?"
+            question = "Clear all displayed data, reset UUID status, and clear internal buffers?"
             if self.is_capturing:
-                question = "Capture is active. Clear all plot data (stopping capture WITHOUT exporting)?\nAlso resets UUID status."
+                question = "Capture is active. Clear all data (stopping capture WITHOUT exporting)?\nAlso resets UUID status and clears buffers."
 
-            reply = QMessageBox.question(self, 'Clear Plots', question,
+            reply = QMessageBox.question(self, 'Clear GUI & Data', question,
                                          QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                          QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.Yes: do_clear = True
         else: do_clear = True # Clear without confirm (used internally)
 
         if do_clear:
-            logger.info("Confirmed clearing data buffers, resetting start time, clearing plots and UUID status.")
+            logger.info("Confirmed clearing GUI, data buffers, resetting start time, and UUID status.")
 
             # --- Stop capture if active ---
             if self.is_capturing:
-                 logger.warning("Capture active during clear plots. Stopping capture WITHOUT generating files.")
+                 logger.warning("Capture active during clear. Stopping capture WITHOUT generating files.")
                  self.is_capturing = False
                  self.capture_button.setText("Start Capture")
-                 # Ensure capture button state reflects connection status after clearing
-                 self.capture_button.setEnabled(state == "connected")
+                 self.capture_button.setEnabled(state == "connected") # Update button state
                  # Also reset pause/resume button state appropriately
-                 if state == "connected":
-                    self.pause_resume_button.setEnabled(True)
-                 else:
-                    self.pause_resume_button.setEnabled(False)
+                 if state == "connected": self.pause_resume_button.setEnabled(True)
+                 else: self.pause_resume_button.setEnabled(False)
                  # Clear capture temp vars
                  self.capture_output_base_dir = None; self.capture_start_relative_time = None
                  self.capture_t0_absolute = None; self.capture_timestamp = None
@@ -1473,13 +1653,11 @@ class MainWindow(QMainWindow):
             # --- Clear data and state ---
             data_buffers.clear()
             start_time = None
-            # Reset the missing UUID state in PlotManager
-            self.plot_manager.update_missing_uuids(set())
-            # Clear visuals and internal text items in PlotManager
-            self.plot_manager.clear_plots()
+            # Delegate clearing visual components and their UUID state to GuiManager
+            self.gui_manager.clear_all_components()
 
 
-    # --- Apply Interval (Unchanged) ---
+    # --- Apply Interval ---
     def apply_interval(self):
         global flowing_interval
         try:
@@ -1487,16 +1665,14 @@ class MainWindow(QMainWindow):
             if new_interval > 0:
                 flowing_interval = new_interval
                 logger.info(f"Flowing interval updated to {new_interval}s")
-                # Trigger plot update immediately if flowing mode is active
+                # Trigger GUI update immediately if flowing mode is active
                 if self.flowing_mode_check.isChecked():
-                    self._update_plots_now()
+                    self._update_gui_now()
             else: self.show_message_box("Invalid Input", "Interval must be positive.")
         except ValueError: self.show_message_box("Invalid Input", "Please enter a valid number for the interval.")
 
-    # --- Toggle Data Logging (Unchanged) ---
+    # --- Toggle Data Logging ---
     def toggle_data_log(self, check_state_value):
-        # The check_state_value argument passed by Qt is the raw enum value (e.g., 2 for Checked, 0 for Unchecked)
-        # We compare against the enum value directly.
         is_checked = (check_state_value == Qt.CheckState.Checked.value)
         if is_checked:
             data_console_handler.setLevel(logging.INFO)
@@ -1505,9 +1681,7 @@ class MainWindow(QMainWindow):
             data_console_handler.setLevel(logging.WARNING) # Set level higher to effectively disable INFO logs
             logger.info("Raw data logging (INFO level) to console disabled.")
 
-    # --- Close Event Handling (MODIFIED to call clear_plots_action) ---
-    # In class MainWindow:
-    # In class MainWindow:
+    # --- Close Event Handling ---
     def closeEvent(self, event):
         global stop_flag, current_task, loop, asyncio_thread
 
@@ -1520,43 +1694,24 @@ class MainWindow(QMainWindow):
              if loop and loop.is_running():
                 logger.info("Requesting cancellation of active asyncio task...")
                 if not current_task.cancelled():
-                    # Schedule cancellation within the loop's thread
                     future = asyncio.run_coroutine_threadsafe(self.cancel_and_wait_task(current_task), loop)
                     try:
-                        # Wait briefly for cancellation to be processed by the loop
-                        future.result(timeout=1.0)
+                        future.result(timeout=1.0) # Wait briefly for cancellation to be processed
                         task_cancelled = True
                         logger.info("Asyncio task cancellation initiated.")
-                    except asyncio.TimeoutError:
-                        logger.warning("Timeout waiting for async task cancellation confirmation.")
-                    except Exception as e:
-                        logger.error(f"Error during async task cancellation: {e}")
-
-                else:
-                    logger.info("Asyncio task was already cancelled.")
-             else:
-                 logger.warning("Asyncio loop not running, cannot cancel task.")
-        else:
-             logger.info("No active asyncio task or task already done.")
+                    except asyncio.TimeoutError: logger.warning("Timeout waiting for async task cancellation confirmation.")
+                    except Exception as e: logger.error(f"Error during async task cancellation: {e}")
+                else: logger.info("Asyncio task was already cancelled.")
+             else: logger.warning("Asyncio loop not running, cannot cancel task.")
+        else: logger.info("No active asyncio task or task already done.")
 
         # --- Wait for asyncio thread to finish cleanly ---
-        # This join waits for main_async to finish, which in turn awaits the cancelled task's cleanup
         if asyncio_thread and asyncio_thread.is_alive():
             logger.info("Waiting for asyncio thread to finish (max 5s)...")
-            asyncio_thread.join(timeout=5.0) # Adjust timeout if needed
-            if asyncio_thread.is_alive():
-                 logger.warning("Asyncio thread did not terminate cleanly within the timeout.")
-                 # Potentially force loop stop if stuck? Be careful here.
-                 # if loop and loop.is_running():
-                 #     logger.warning("Forcing loop stop...")
-                 #     loop.call_soon_threadsafe(loop.stop)
-                 #     # Give it another short moment
-                 #     asyncio_thread.join(timeout=1.0)
-            else:
-                 logger.info("Asyncio thread finished.")
-        else:
-             logger.info("Asyncio thread not running or already finished.")
-
+            asyncio_thread.join(timeout=5.0)
+            if asyncio_thread.is_alive(): logger.warning("Asyncio thread did not terminate cleanly within the timeout.")
+            else: logger.info("Asyncio thread finished.")
+        else: logger.info("Asyncio thread not running or already finished.")
 
         # --- Now perform GUI/Synchronous cleanup ---
         logger.info("Performing GUI cleanup...")
@@ -1569,29 +1724,22 @@ class MainWindow(QMainWindow):
         if self.log_handler:
             logger.info("Removing GUI log handler...")
             try:
-                # Check if handler is still present before removing
-                if self.log_handler in logging.getLogger().handlers:
-                    logging.getLogger().removeHandler(self.log_handler)
-                self.log_handler.close()
-                self.log_handler = None
+                if self.log_handler in logging.getLogger().handlers: logging.getLogger().removeHandler(self.log_handler)
+                self.log_handler.close(); self.log_handler = None
                 logger.info("GUI log handler removed and closed.")
-            except Exception as e:
-                logging.error(f"Error removing/closing GUI log handler: {e}", exc_info=True)
+            except Exception as e: logging.error(f"Error removing/closing GUI log handler: {e}", exc_info=True)
 
-        # Clear Plots (Optional but good practice)
-        logger.info("Clearing plots before closing window...")
+        # Clear GUI Components (Optional but good practice)
+        logger.info("Clearing GUI components before closing window...")
         try:
-            self.clear_plots_action(confirm=False)
-        except Exception as e:
-            logger.error(f"Error clearing plots during closeEvent: {e}", exc_info=True)
+            self.clear_gui_action(confirm=False) # Use the new clear method
+        except Exception as e: logger.error(f"Error clearing GUI during closeEvent: {e}", exc_info=True)
 
-        # Handle final capture state (Likely redundant if clear_plots worked)
+        # Handle final capture state (Likely redundant if clear_gui_action worked)
         if self.is_capturing:
             logger.warning("Capture still marked active during final shutdown phase. Attempting generation.")
-            try:
-                self.stop_and_generate_files()
-            except Exception as e:
-                logger.error(f"Error generating files on close: {e}", exc_info=True)
+            try: self.stop_and_generate_files()
+            except Exception as e: logger.error(f"Error generating files on close: {e}", exc_info=True)
             self.is_capturing = False # Ensure reset
 
         logger.info("Exiting application.")
@@ -1634,8 +1782,9 @@ if __name__ == "__main__":
         exit_code = app.exec()
         logger.info(f"PyQt application finished with exit code {exit_code}.")
 
-        stop_flag = True
+        stop_flag = True # Ensure flag is set even if GUI closed abnormally
         if asyncio_thread.is_alive():
+            # Give the thread a chance to finish after loop stop signal
             asyncio_thread.join(timeout=2.0)
             if asyncio_thread.is_alive(): logger.warning("Asyncio thread still alive after final join.")
 
