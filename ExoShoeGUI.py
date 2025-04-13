@@ -11,10 +11,10 @@ import sys
 import datetime
 import csv # Added for CSV writing
 import os
-import pandas as pd # Re-added for easier CSV data handling (merging/resampling)
+import pandas as pd # Easier CSV data handling (merging/resampling)
 import struct
 import bisect
-import numpy as np # Still needed for pyqtgraph, potentially useful for PGF data prep
+import numpy as np # needed for pyqtgraph
 
 # --- Matplotlib Imports (used ONLY for PGF export) ---
 import matplotlib # Use Agg backend to avoid GUI conflicts if possible
@@ -40,11 +40,11 @@ pg.setConfigOption('background', 'w')
 pg.setConfigOption('foreground', 'k')
 pg.setConfigOptions(antialias=True) # Ensure anti-aliasing is enabled
 
-# Configure logging (same as before)
+# Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Create a separate logger for data logs (same as before)
+# Create a separate logger for data logs
 data_logger = logging.getLogger("data_logger")
 data_logger.propagate = False # Don't send data logs to root logger's handlers by default
 data_console_handler = logging.StreamHandler() # Specific handler for console data logs
@@ -71,7 +71,7 @@ class QtLogHandler(logging.Handler, QObject):
 # --- Global variables ---
 disconnected_event = asyncio.Event()
 last_received_time = 0
-# data_buffers now holds ALL received data since connection/clear
+# data_buffers hold ALL received data since connection/clear
 data_buffers: Dict[str, List[Tuple[float, float]]] = {}
 start_time: Optional[datetime.datetime] = None # Absolute start time of the current connection/session
 stop_flag = False
@@ -101,7 +101,7 @@ class DeviceConfig:
         self.data_type_to_uuid_map: Dict[str, str] = self._build_data_type_map()
 
     def _build_data_type_map(self) -> Dict[str, str]:
-        """Builds the mapping from data_type keys to their source UUID."""
+        # Builds the mapping from data_type keys to their source UUID.
         mapping = {}
         for char_config in self.characteristics:
             for data_type in char_config.produces_data_types:
@@ -113,7 +113,7 @@ class DeviceConfig:
 
     def update_name(self, name: str):
         self.name = name
-        # Potentially update other device-specific settings here if needed in the future
+        # update other device config-specific settings here if needed
 
     def get_uuid_for_data_type(self, data_type: str) -> Optional[str]:
         return self.data_type_to_uuid_map.get(data_type)
@@ -122,7 +122,7 @@ class DeviceConfig:
 #####################################################################################################################
 # Start of customizable section
 #####################################################################################################################
-# This section is where you can customize the device configuration, data handling, and plotting.
+# Section for customizing device configuration, data handling, and plotting.
 
 # 1. Data handlers for different characteristics
 # 2. Device configuration (add UUIDs AND `produces_data_types`)
