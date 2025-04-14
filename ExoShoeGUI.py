@@ -14,26 +14,34 @@ import os
 import pandas as pd # Easier CSV data handling (merging/resampling)
 import struct
 import bisect
-import numpy as np # needed for pyqtgraph
+import numpy as np # needed for pyqtgraph AND heatmap
+import re # For cleaning filenames
+import math # Needed for heatmap CoP
 
-# --- Matplotlib Imports (used ONLY for PGF export) ---
+# --- Matplotlib Imports (used ONLY for PGF export AND heatmap colormaps) ---
 import matplotlib # Use Agg backend to avoid GUI conflicts if possible
 matplotlib.use('Agg') # Set backend BEFORE importing pyplot
 import matplotlib.pyplot as plt
 import scienceplots # Make sure it's installed: pip install scienceplots for formatting
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
+
 
 # --- PyQt6 Imports ---
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFrame, QGridLayout, QCheckBox, QLineEdit,
     QScrollArea, QMessageBox, QSizePolicy, QTextEdit, QTabWidget,
-    QComboBox # Added QComboBox
+    QComboBox, QSlider # Added QComboBox, QSlider
 )
-from PyQt6.QtGui import QColor, QPainter, QBrush, QPen
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QMetaObject, QThread
+from PyQt6.QtGui import (QColor, QPainter, QBrush, QPen, QPixmap, QImage, QPolygonF, QIntValidator, QDoubleValidator) # Added heatmap graphics items
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QMetaObject, QThread, QPointF # Added QPointF for heatmap
 
 # --- PyQtGraph Import ---
 import pyqtgraph as pg
+
+# --- SuperQT Import for RangeSlider ---
+from superqt.sliders import QRangeSlider # Needed for heatmap pressure range
 
 # Apply PyQtGraph global options for background/foreground
 pg.setConfigOption('background', 'w')
@@ -129,6 +137,48 @@ class DeviceConfig:
 # 3. Define GUI Component Classes (e.g., plots, indicators)
 # 4. Define Tab Layout Configuration using the components
 
+# --- Constants needed for Insole Data Handling ---
+ADC_MAX_VOLTAGE = 3.3           # Maximal voltage expected from ADC
+# --- Define the keys specifically for the heatmap sensors ---
+HEATMAP_KEYS = ["A0C0", "A1C0", "A2C0", "A0C1", "A1C1", "A2C1", "A0C2", "A1C2", "A2C2", "A1C3", "A2C3"]
+NUM_HEATMAP_SENSORS = len(HEATMAP_KEYS)
+# --- Define the key for the flex sensor ---
+FLEX_SENSOR_KEY = "A0C3"
+
+# --- This gain list remains ONLY for the FSR sensors used in the heatmap ---
+DEFAULT_SENSOR_GAINS = np.array([ # Order corresponds to HEATMAP_KEYS.
+    2.0, # Gain for Sensor 0 (A0C0)
+    3.0, # Gain for Sensor 1 (A1C0)
+    1.0, # Gain for Sensor 2 (A2C0)
+    2.0, # Gain for Sensor 3 (A0C1)
+    2.0, # Gain for Sensor 4 (A1C1)
+    1.0, # Gain for Sensor 5 (A2C1)
+    2.0, # Gain for Sensor 6 (A0C2)
+    2.0, # Gain for Sensor 7 (A1C2)
+    1.0, # Gain for Sensor 8 (A2C2)
+    2.0, # Gain for Sensor 9 (A1C3)
+    1.0  # Gain for Sensor 10 (A2C3)
+], dtype=np.float32)
+
+# --- START: Flex Sensor Angle Conversion Parameters ---
+FLEX_REF_VOLTAGE = 2.415  # Voltage corresponding to 0 degrees
+FLEX_REF_ANGLE = 0.0       # Angle at the reference voltage
+FLEX_VOLTS_PER_90_DEG = -0.1 # Voltage change for a 90 degree increase
+# Calculate slope and intercept for y = mx + c (Angle = slope * Voltage + intercept)
+if abs(FLEX_VOLTS_PER_90_DEG) < 1e-9:
+    logger.warning("FLEX_VOLTS_PER_90_DEG is near zero. Angle conversion disabled (slope set to 0).")
+    FLEX_SLOPE_DEG_PER_VOLT = 0.0
+else:
+    FLEX_SLOPE_DEG_PER_VOLT = 90.0 / FLEX_VOLTS_PER_90_DEG # Degrees per Volt
+FLEX_INTERCEPT_DEG = FLEX_REF_ANGLE - (FLEX_SLOPE_DEG_PER_VOLT * FLEX_REF_VOLTAGE)
+logger.info(f"Flex sensor angle conversion: Slope={FLEX_SLOPE_DEG_PER_VOLT:.2f} deg/V, Intercept={FLEX_INTERCEPT_DEG:.2f} deg")
+# --- END: Flex Sensor Angle Conversion Parameters ---
+
+# --- Weight Estimation Factor ---
+VOLTAGE_TO_WEIGHT_FACTOR = 7.0  # Convert total summed voltage to weight units
+
+INITIAL_PRESSURE_SENSITIVITY = 300.0 # Initial Sensitivity range (GLOBAL, BUT HANDLED BY HEATMAP COMPONENT NOW)
+
 # --- Data Handlers ---
 def handle_orientation_data(data: bytearray) -> dict:
     try:
@@ -184,12 +234,113 @@ def handle_gravity_data(data: bytearray) -> dict:
         return {'gravity_x': x, 'gravity_y': y, 'gravity_z': z}
     except Exception as e: data_logger.error(f"Error parsing gravity data: {e}"); return {}
 
+def handle_insole_data(data: bytearray) -> dict:
+    """
+    Parses the incoming insole data string (bytearray) from BLE.
+    Extracts voltage values, applies gains, calculates individual pressures (FSR)
+    using INITIAL_PRESSURE_SENSITIVITY, calculates summed gained voltage (FSRs),
+    estimated weight (from sum), and flex angle (from flex sensor voltage).
+
+    Args:
+        data: The raw bytearray received via BLE.
+
+    Returns:
+        A dictionary containing keys for:
+        - Each FSR sensor ('A0C0'...'A2C3') with its pressure value (relative to initial sensitivity).
+        - 'estimated_weight' with the calculated weight value.
+        - 'flex_angle' with the calculated angle value in degrees.
+        Returns an empty dictionary if parsing or critical calculation fails.
+    """
+    try:
+        data_string = data.decode('utf-8')
+    except UnicodeDecodeError:
+        data_logger.warning(f"Received non-UTF8 raw bytes for insole: {data}")
+        return {}
+
+    output_dict: Dict[str, float] = {}
+    summed_gained_voltage = 0.0             # Accumulator for gained voltages (heatmap only)
+    flex_voltage: Optional[float] = None    # Storage for the flex sensor RAW voltage
+    # *** Uses INITIAL_PRESSURE_SENSITIVITY for the data stored in the buffer ***
+    pressure_sensitivity = INITIAL_PRESSURE_SENSITIVITY
+
+    part = "" # For error reporting
+    try:
+        parts = data_string.strip().rstrip(',').split(',')
+
+        for part in parts:
+            if ':' not in part:
+                # data_logger.debug(f"Skipping malformed part (no ':'): '{part}' in '{data_string}'")
+                continue
+
+            key, value_str = part.split(':', 1)
+            key = key.strip()
+            value_str = value_str.strip()
+
+            try:
+                voltage = float(value_str)
+            except ValueError:
+                # data_logger.warning(f"Could not parse voltage value for key '{key}': '{value_str}'. Skipping.")
+                continue
+
+            # --- Check if it's the Flex Sensor ---
+            if key == FLEX_SENSOR_KEY:
+                flex_voltage = voltage # Store the raw voltage
+
+            # --- Check if it's one of the Heatmap Sensors ---
+            elif key in HEATMAP_KEYS:
+                try:
+                    sensor_index = HEATMAP_KEYS.index(key)
+                    gain = DEFAULT_SENSOR_GAINS[sensor_index]
+                except (ValueError, IndexError) as e:
+                     # data_logger.warning(f"Error getting gain for heatmap key '{key}': {e}. Using gain=1.0.")
+                     gain = 1.0 # Fallback gain
+
+                gained_voltage = voltage * gain
+                summed_gained_voltage += gained_voltage # Add to sum
+
+                # Calculate pressure based on gained voltage and INITIAL sensitivity
+                clamped_gained_voltage = max(0.0, min(ADC_MAX_VOLTAGE, gained_voltage))
+                # *** This pressure is relative to the INITIAL sensitivity ***
+                pressure = (clamped_gained_voltage / ADC_MAX_VOLTAGE) * pressure_sensitivity
+                output_dict[key] = max(0.0, pressure) # Ensure pressure is non-negative, store FSR pressure
+
+            # --- Else: Key is unrecognized ---
+            # else: data_logger.debug(f"Skipping unrecognized key: '{key}'")
+
+    except ValueError as e:
+        data_logger.warning(f"ValueError parsing part '{part}': {e} in string: {data_string}")
+        return {} # Indicate failure
+    except Exception as e:
+        data_logger.error(f"Error parsing data string '{data_string}' (part: '{part}'): {e}")
+        return {} # Indicate failure
+
+    # --- Perform final calculations ---
+
+    # Weight Estimation
+    output_dict['estimated_weight'] = summed_gained_voltage * VOLTAGE_TO_WEIGHT_FACTOR
+
+    # Flex Angle Calculation
+    if flex_voltage is None:
+        # data_logger.debug(f"Flex sensor key '{FLEX_SENSOR_KEY}' not found in current packet. Calculating angle from default voltage 0.0.")
+        flex_voltage = 0.0 # Use default voltage if not found
+    flex_angle = FLEX_SLOPE_DEG_PER_VOLT * flex_voltage + FLEX_INTERCEPT_DEG
+    output_dict['flex_angle'] = flex_angle
+
+    # Check if all heatmap keys were populated (can be zero if voltage was zero/unparseable)
+    for key in HEATMAP_KEYS:
+        if key not in output_dict:
+            output_dict[key] = 0.0 # Ensure all heatmap keys exist
+
+    data_logger.info(f"Insole Parsed: { {k: f'{v:.1f}' for k, v in output_dict.items()} }")
+    return output_dict
+
 # --- Device Configuration (Initial Device Name still set here) ---
 # This object's 'name' attribute will be updated by the dropdown menu
 device_config = DeviceConfig(
     name="Nano33IoT", # Initial default name
     service_uuid="19B10000-E8F2-537E-4F6C-D104768A1214", # Assuming same service UUID for now
     characteristics=[
+        # IMU Characteristics
         CharacteristicConfig(uuid="19B10001-E8F2-537E-4F6C-D104768A1214", handler=handle_orientation_data,
                              produces_data_types=['orientation_x', 'orientation_y', 'orientation_z']),
         CharacteristicConfig(uuid="19B10003-E8F2-537E-4F6C-D104768A1214", handler=handle_gyro_data,
@@ -202,6 +353,9 @@ device_config = DeviceConfig(
                              produces_data_types=['accel_x', 'accel_y', 'accel_z']),
         CharacteristicConfig(uuid="19B10007-E8F2-537E-4F6C-D104768A1214", handler=handle_gravity_data,
                              produces_data_types=['gravity_x', 'gravity_y', 'gravity_z']),
+        # Insole Characteristic
+        CharacteristicConfig(uuid="19B10002-E8F2-537E-4F6C-D104768A1214", handler=handle_insole_data,
+                             produces_data_types=HEATMAP_KEYS + ['estimated_weight', 'flex_angle']), # Produces FSR pressures + weight + angle
     ],
     find_timeout=5.0,
     data_timeout=1.0
@@ -219,32 +373,113 @@ class BaseGuiComponent(QWidget):
         self.config = config
         self.data_buffers_ref = data_buffers_ref
         self.device_config_ref = device_config_ref
+        self.tab_index: Optional[int] = None # Will be set by GuiManager during creation
+        self.is_loggable: bool = config.get('enable_logging', False) # Check if logging is enabled via config
         # Basic size policy, can be overridden by subclasses or config
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.uuid_missing_overlay: Optional[QLabel] = None # Optional overlay for missing UUID message
 
     def get_widget(self) -> QWidget:
-        """Returns the primary widget this component manages."""
+        #Returns the primary widget this component manages.
         return self # Default: the component itself is the widget
 
     def update_component(self, current_relative_time: float, is_flowing: bool):
-        """Update the component's visual representation based on current data and time."""
+        #Update the component's visual representation based on current data and time.
         raise NotImplementedError("Subclasses must implement update_component")
 
     def clear_component(self):
-        """Clear the component's display and internal state."""
+        #Clear the component's display and internal state.
         raise NotImplementedError("Subclasses must implement clear_component")
 
     def get_required_data_types(self) -> Set[str]:
-        """Returns a set of data_type keys this component requires."""
-        return set() # Default: no data required
+        #Returns a set of data_type keys this component requires for display.
+        # By default, assume a component doesn't directly require data types.
+        return set()
+
+    def get_loggable_data_types(self) -> Set[str]:
+        """
+        Returns a set of data_type keys this component wants to log,
+        IF self.is_loggable is True.
+        By default, it logs the same data types it requires for display.
+        Subclasses can override this for more specific logging needs.
+        """
+        if self.is_loggable:
+            return self.get_required_data_types()
+        else:
+            return set()
+
+    def get_log_filename_suffix(self) -> str:
+        """
+        Returns a string suffix used to create the unique CSV filename for this component,
+        IF self.is_loggable is True. The main window adds prefixes (like timestamp).
+        This should be file-system safe.
+        """
+        if self.is_loggable:
+            # Default implementation: Use class name and object ID (or position if available)
+            class_name = self.__class__.__name__
+            # Try to get a title from config as a better default
+            title = self.config.get('title', f'Component_{id(self)}')
+            # Clean the title for use in filename
+            safe_suffix = re.sub(r'[^\w\-]+', '_', title).strip('_')
+            return f"log_{safe_suffix}" if safe_suffix else f"log_{class_name}_{id(self)}"
+        return "" # Return empty if not loggable
 
     def handle_missing_uuids(self, missing_uuids_for_component: Set[str]):
         """
         Called by the GuiManager when relevant UUIDs are found to be missing.
         'missing_uuids_for_component' contains only the UUIDs relevant to this specific component.
+        Handles showing/hiding a generic overlay message.
         """
-        pass # Default: do nothing
+        if missing_uuids_for_component:
+            first_missing_uuid = next(iter(missing_uuids_for_component), None)
+            text_content = f"Required UUID:\n{first_missing_uuid}\nnot found!"
 
+            if not self.uuid_missing_overlay:
+                # Create overlay label centered within the component
+                self.uuid_missing_overlay = QLabel(text_content, self)
+                self.uuid_missing_overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.uuid_missing_overlay.setStyleSheet("background-color: rgba(100, 100, 100, 200); color: white; font-weight: bold; border-radius: 5px; padding: 10px;")
+                self.uuid_missing_overlay.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Maximum) # Let it determine its size
+                # Use layout to center (requires component to have a layout set)
+                if self.layout():
+                    # Position it manually - QLayout might be complex if overlaying
+                    pass # See resizeEvent
+                else:
+                    logger.warning(f"Cannot auto-position missing UUID overlay for {self.__class__.__name__} as it has no layout.")
+                self.uuid_missing_overlay.adjustSize() # Adjust size to content
+                self.uuid_missing_overlay.raise_() # Bring to front
+                self.uuid_missing_overlay.setVisible(True)
+                self._position_overlay() # Initial positioning
+            else:
+                self.uuid_missing_overlay.setText(text_content)
+                self.uuid_missing_overlay.adjustSize()
+                self._position_overlay()
+                self.uuid_missing_overlay.setVisible(True)
+                self.uuid_missing_overlay.raise_()
+
+        else: # No missing UUIDs for this component
+            if self.uuid_missing_overlay:
+                self.uuid_missing_overlay.setVisible(False)
+
+
+    def resizeEvent(self, event):
+        """Reposition overlay on resize."""
+        super().resizeEvent(event)
+        self._position_overlay()
+
+    def _position_overlay(self):
+        """Helper to center the overlay label."""
+        if self.uuid_missing_overlay and self.uuid_missing_overlay.isVisible():
+            overlay_size = self.uuid_missing_overlay.sizeHint()
+            self_size = self.size()
+            x = (self_size.width() - overlay_size.width()) // 2
+            y = (self_size.height() - overlay_size.height()) // 2
+            self.uuid_missing_overlay.setGeometry(x, y, overlay_size.width(), overlay_size.height())
+
+    def showEvent(self, event):
+        """ Ensure overlay is positioned correctly when widget becomes visible """
+        super().showEvent(event)
+        QTimer.singleShot(0, self._position_overlay) # Delay position until layout settles
 
 # --- Specific Component Implementations ---
 
@@ -256,8 +491,8 @@ class TimeSeriesPlotComponent(BaseGuiComponent):
         self.plot_widget = pg.PlotWidget()
         self.plot_item: pg.PlotItem = self.plot_widget.getPlotItem()
         self.lines: Dict[str, pg.PlotDataItem] = {} # data_type -> PlotDataItem
-        self.uuid_not_found_text: Optional[pg.TextItem] = None
-        self.required_data_types: Set[str] = set()
+        # self.uuid_not_found_text: Optional[pg.TextItem] = None # Use base class overlay instead
+        self._required_data_types: Set[str] = set() # Internal store
         self.missing_relevant_uuids: Set[str] = set() # UUIDs this plot needs that are missing
 
         self._setup_plot()
@@ -295,12 +530,10 @@ class TimeSeriesPlotComponent(BaseGuiComponent):
         self.plot_item.showGrid(x=True, y=True, alpha=0.1)
         self.plot_item.addLegend(offset=(10, 5))
         self.plot_item.getViewBox().setDefaultPadding(0.01)
-        # Connect view change signal to reposition text
-        self.plot_item.getViewBox().sigRangeChanged.connect(self._position_text_item)
 
         for dataset in self.config.get('datasets', []):
             data_type = dataset['data_type']
-            self.required_data_types.add(data_type)
+            self._required_data_types.add(data_type) # Use internal set
             pen = pg.mkPen(color=dataset.get('color', 'k'), width=1.5)
             line = self.plot_item.plot(pen=pen, name=dataset.get('label', data_type))
             self.lines[data_type] = line
@@ -308,37 +541,25 @@ class TimeSeriesPlotComponent(BaseGuiComponent):
         self.clear_component() # Initialize axes
 
     def get_required_data_types(self) -> Set[str]:
-        return self.required_data_types
+        # Returns the data types needed for plotting.
+        return self._required_data_types
+
+    # get_loggable_data_types is inherited from BaseGuiComponent and will use get_required_data_types
+
+    def get_log_filename_suffix(self) -> str:
+        """Overrides base method to provide a filename suffix based on the plot title."""
+        if self.is_loggable:
+            title = self.config.get('title', f'Plot_{id(self)}')
+            safe_suffix = re.sub(r'[^\w\-]+', '_', title).strip('_')
+            return f"plot_{safe_suffix}" if safe_suffix else f"plot_{id(self)}"
+        return ""
 
     def handle_missing_uuids(self, missing_uuids_for_component: Set[str]):
-        """Shows or hides the 'UUID not found' message."""
+        """Shows or hides the 'UUID not found' message using the base class overlay."""
         self.missing_relevant_uuids = missing_uuids_for_component
-        first_missing_uuid = next(iter(missing_uuids_for_component), None)
+        super().handle_missing_uuids(missing_uuids_for_component) # Call base implementation for overlay
 
-        if first_missing_uuid:
-            text_content = f"UUID:\n{first_missing_uuid}\nnot found!"
-            if self.uuid_not_found_text:
-                # logger.debug(f"Updating existing text for plot '{self.config.get('title')}'")
-                self.uuid_not_found_text.setText(text_content)
-            else:
-                # logger.debug(f"Creating new text for plot '{self.config.get('title')}'")
-                self.uuid_not_found_text = pg.TextItem(text_content, color=(150, 150, 150), anchor=(0.5, 0.5))
-                self.uuid_not_found_text.setZValue(100) # Ensure it's on top
-                self.plot_item.addItem(self.uuid_not_found_text)
-
-            # Position the text item (or reposition if it existed)
-            self._position_text_item()
-
-        else: # No missing UUIDs for this plot
-            if self.uuid_not_found_text:
-                # logger.debug(f"Removing text for plot '{self.config.get('title')}'")
-                try:
-                     self.plot_item.removeItem(self.uuid_not_found_text)
-                except Exception as e:
-                     logger.warning(f"Error removing text item from plot '{self.config.get('title')}': {e}")
-                self.uuid_not_found_text = None
-
-        # Trigger an update to clear lines if needed and adjust Y-axis ranging
+        # Request GUI update to potentially clear lines / adjust y-range if overlay is shown/hidden
         QTimer.singleShot(0, self._request_gui_update_for_yrange)
 
     def _request_gui_update_for_yrange(self):
@@ -349,27 +570,6 @@ class TimeSeriesPlotComponent(BaseGuiComponent):
          except StopIteration: logger.error("Could not find MainWindow instance to request plot update.")
          except Exception as e: logger.error(f"Error requesting plot update: {e}")
 
-    def _position_text_item(self):
-        """Positions the text item in the center of the plot's current view."""
-        if not self.uuid_not_found_text: return
-
-        try:
-            view_box = self.plot_item.getViewBox()
-            if not view_box.autoRangeEnabled()[1]: # If Y is not auto-ranging, use default range
-                 y_range = self.plot_item.getAxis('left').range
-            else:
-                 y_range = view_box.viewRange()[1] # Use view range if auto-ranging
-            x_range = view_box.viewRange()[0]
-
-            if None in x_range or None in y_range or x_range[1] <= x_range[0] or y_range[1] <= y_range[0]:
-                center_x, center_y = 0.5, 0.5
-            else:
-                center_x = x_range[0] + (x_range[1] - x_range[0]) / 2
-                center_y = y_range[0] + (y_range[1] - y_range[0]) / 2
-
-            self.uuid_not_found_text.setPos(center_x, center_y)
-        except Exception as e:
-            logger.warning(f"Could not position text item for plot '{self.config.get('title')}': {e}")
 
     def update_component(self, current_relative_time: float, is_flowing: bool):
         """Updates the plot lines based on data in the shared buffer."""
@@ -386,7 +586,7 @@ class TimeSeriesPlotComponent(BaseGuiComponent):
         else:
             max_data_time = 0
             # Only consider data types from non-missing UUIDs for axis range
-            for data_type in self.required_data_types:
+            for data_type in self.get_required_data_types(): # Use the method here
                  uuid = self.device_config_ref.get_uuid_for_data_type(data_type)
                  if uuid and uuid not in self.missing_relevant_uuids and data_type in self.data_buffers_ref and self.data_buffers_ref[data_type]:
                      try: max_data_time = max(max_data_time, self.data_buffers_ref[data_type][-1][0])
@@ -397,7 +597,9 @@ class TimeSeriesPlotComponent(BaseGuiComponent):
 
         # --- Update Data for Lines ---
         data_updated_in_plot = False
-        plot_has_missing_uuid_text = (self.uuid_not_found_text is not None)
+        # plot_has_missing_uuid_overlay = (self.uuid_missing_overlay is not None and self.uuid_missing_overlay.isVisible())
+        plot_has_missing_uuid_overlay = bool(self.missing_relevant_uuids) # Simpler check
+
 
         for data_type, line in self.lines.items():
             uuid = self.device_config_ref.get_uuid_for_data_type(data_type)
@@ -432,25 +634,23 @@ class TimeSeriesPlotComponent(BaseGuiComponent):
                 line.setData(x=[], y=[]) # Clear line if data_type not found in buffers
 
         # --- Y Auto-Ranging ---
-        if data_updated_in_plot and not plot_has_missing_uuid_text:
+        if data_updated_in_plot and not plot_has_missing_uuid_overlay:
             self.plot_item.enableAutoRange(axis='y', enable=True)
-        elif plot_has_missing_uuid_text:
-             # Disable auto-ranging and set a default range if text is shown
+        elif plot_has_missing_uuid_overlay:
+             # Disable auto-ranging and set a default range if overlay is shown
              self.plot_item.enableAutoRange(axis='y', enable=False)
              # Keep existing range or set a default? Let's try setting a simple default.
              self.plot_item.setYRange(-1, 1, padding=0.1) # Example default range
+
 
     def clear_component(self):
         """Clears the plot lines and resets axes."""
         for line in self.lines.values():
             line.setData(x=[], y=[])
 
-        # Remove "UUID not found" text if present
-        if self.uuid_not_found_text:
-             try: self.plot_item.removeItem(self.uuid_not_found_text)
-             except Exception as e: logger.warning(f"Error removing text item during clear: {e}")
-             self.uuid_not_found_text = None
-        self.missing_relevant_uuids.clear()
+        # Hide overlay via base class method (handles None check)
+        self.handle_missing_uuids(set())
+        self.missing_relevant_uuids.clear() # Also clear internal set
 
         # Reset view ranges
         self.plot_item.setXRange(0, flowing_interval, padding=0.02)
@@ -458,34 +658,1001 @@ class TimeSeriesPlotComponent(BaseGuiComponent):
         self.plot_item.enableAutoRange(axis='y', enable=True) # Re-enable Y auto-ranging
 
 
-# --- Add more component classes here in the future ---
-# Example:
-# class StatusIndicatorComponent(BaseGuiComponent):
-#     def __init__(self, config, data_buffers_ref, device_config_ref, parent=None):
-#         super().__init__(config, data_buffers_ref, device_config_ref, parent)
-#         self.label = QLabel("Status: --")
-#         # ... setup layout ...
-#         layout = QVBoxLayout(self)
-#         layout.addWidget(self.label)
-#         self.setLayout(layout)
-#     def update_component(self, current_relative_time, is_flowing):
-#         # Example: Update label based on latest value of a specific data_type
-#         dtype = self.config.get("data_type_to_monitor")
-#         if dtype and dtype in self.data_buffers_ref and self.data_buffers_ref[dtype]:
-#             latest_val = self.data_buffers_ref[dtype][-1][1]
-#             self.label.setText(f"{dtype}: {latest_val:.2f}")
-#     def clear_component(self):
-#         self.label.setText("Status: --")
-#     def get_required_data_types(self) -> Set[str]:
-#         dtype = self.config.get("data_type_to_monitor")
-#         return {dtype} if dtype else set()
+# --- HEATMAP COMPONENT ---
+class PressureHeatmapComponent(BaseGuiComponent):
+    """ Displays a pressure heatmap based on sensor data. """
+
+    # --- Constants specific to this component ---
+    DEFAULT_INSOLE_IMAGE_PATH = 'Sohle_rechts.png'
+    DEFAULT_OUTLINE_COORDS = np.array([(186, 0), (146, 9), (108, 34), (79, 66), (59, 101), (43, 138), (30, 176), (19, 215),
+                                       (11, 255), (6, 303), (2, 358), (0, 418), (3, 463), (8, 508), (14, 550), (23, 590),
+                                       (34, 630), (47, 668), (60, 706), (71, 745), (82, 786), (91, 825), (95, 865),
+                                       (97, 945), (94, 990), (89, 1035), (83, 1077), (76, 1121), (69, 1161), (64, 1204),
+                                       (59, 1252), (56, 1293), (54, 1387), (57, 1430), (63, 1470), (70, 1512), (81, 1551),
+                                       (97, 1588), (123, 1626), (152, 1654), (187, 1674), (226, 1688), (273, 1696),
+                                       (314, 1696), (353, 1686), (390, 1668), (441, 1625), (466, 1591), (485, 1555),
+                                       (500, 1515), (509, 1476), (515, 1431), (517, 1308), (516, 1264), (514, 1199),
+                                       (512, 1141), (511, 1052), (514, 1011), (519, 969), (524, 929), (529, 887),
+                                       (534, 845), (540, 801), (547, 759), (554, 719), (562, 674), (568, 634),
+                                       (573, 584), (575, 536), (572, 491), (566, 451), (556, 409), (543, 369), (528, 331),
+                                       (512, 294), (495, 257), (476, 220), (456, 185), (432, 150), (405, 116), (364, 73),
+                                       (329, 45), (294, 23), (254, 7), (206, 0)])
+    # This coordinate list remains ONLY for the FSR sensors used in the heatmap
+    DEFAULT_SENSOR_COORDS = np.array([ # Order corresponds to HEATMAP_KEYS above.
+        [439, 307], [129, 136], [440, 1087], [415, 567], [260, 451], [424, 1273],
+        [273, 140], [116, 452], [205, 1580], [435, 925], [372, 1580]
+    ])
+    NUM_SENSORS = len(DEFAULT_SENSOR_COORDS) # Should match NUM_HEATMAP_SENSORS
+
+    # --- Configuration Values (set in __init__ based on `config` arg) ---
+    # These have defaults here but can be overridden via the `config` dict passed at instantiation
+    DEFAULT_GRID_RESOLUTION = 10
+    DEFAULT_ALPHA = 180
+    DEFAULT_WINDOW_MIN = 0.0
+    DEFAULT_WINDOW_MAX = 100.0
+    DEFAULT_GAUSSIAN_SIGMA = 120.0
+    DEFAULT_SENSITIVITY = 300.0 # Matches INITIAL_PRESSURE_SENSITIVITY
+    DEFAULT_CMAP_NAME = 'jet'
+    AVAILABLE_CMAPS = ['jet', 'nipy_spectral', 'gist_ncar', 'gist_rainbow', 'turbo', 'cubehelix', 'tab20b', 'tab20c']
+    # https://matplotlib.org/stable/users/explain/colors/colormaps.html for more colormaps
+
+    # --- Center of Pressure & Trail Configuration ---
+    COP_MAIN_POINT_RADIUS = 8.0
+    COP_MAIN_POINT_COLOR = QColor(255, 255, 255, 255) #white
+    COP_TRAIL_MAX_LEN = 30
+    COP_TRAIL_POINT_RADIUS = 5.0
+    COP_TRAIL_COLOR = QColor(243 , 100 , 248) # bright pink
+    COP_TRAIL_MAX_ALPHA = 255
+    COP_TRAIL_MIN_ALPHA = 0
+    COP_TRAIL_LINE_WIDTH = 7
+    SPLINE_SAMPLES_PER_SEGMENT = 10
+    TEXTBOX_WIDTH = 50
+
+    def __init__(self, config: Dict[str, Any], data_buffers_ref: Dict[str, List[Tuple[float, float]]], device_config_ref: DeviceConfig, parent: Optional[QWidget] = None):
+        super().__init__(config, data_buffers_ref, device_config_ref, parent)
+
+        self._required_data_types = set(HEATMAP_KEYS) # Internal store
+
+        # --- Load Configurable Parameters ---
+        self.image_path = self.config.get('image_path', self.DEFAULT_INSOLE_IMAGE_PATH)
+        self.grid_resolution = max(1, self.config.get('grid_resolution', self.DEFAULT_GRID_RESOLUTION))
+        self.alpha_int = np.clip(self.config.get('alpha', self.DEFAULT_ALPHA), 0, 255)
+        self.alpha_float = self.alpha_int / 255.0
+        # Initial operational values (can be changed by GUI controls)
+        # **** Uses the GLOBAL INITIAL_PRESSURE_SENSITIVITY as its starting point ****
+        self.current_pressure_sensitivity = float(self.config.get('initial_sensitivity', INITIAL_PRESSURE_SENSITIVITY))
+        self.current_gaussian_sigma = float(self.config.get('initial_gaussian_sigma', self.DEFAULT_GAUSSIAN_SIGMA))
+        self.current_pressure_min = float(self.config.get('initial_window_min', self.DEFAULT_WINDOW_MIN))
+        # Ensure initial max window isn't higher than initial sensitivity
+        self.current_pressure_max = min(float(self.config.get('initial_window_max', self.DEFAULT_WINDOW_MAX)), self.current_pressure_sensitivity)
+        self.current_cmap_name = self.config.get('initial_colormap', self.DEFAULT_CMAP_NAME)
+        self.save_directory = self.config.get('snapshot_dir', "captured_pressure_maps")
+        os.makedirs(self.save_directory, exist_ok=True)
+
+        # Basic parameters for heatmap
+        self.sensor_coords = self.DEFAULT_SENSOR_COORDS.astype(np.float32)
+        self.pressure_values = np.zeros(self.NUM_SENSORS, dtype=np.float32) # Stores latest *rescaled* pressure values for heatmap sensors
+
+        # Load background image
+        self.original_pixmap = QPixmap(self.image_path)
+        if self.original_pixmap.isNull():
+            logger.error(f"Heatmap Error: loading image '{self.image_path}'. Using placeholder.")
+            # Create a placeholder pixmap
+            self.original_pixmap = QPixmap(300, 500) # Example size
+            self.original_pixmap.fill(Qt.GlobalColor.lightGray)
+            painter = QPainter(self.original_pixmap)
+            painter.setPen(Qt.GlobalColor.red)
+            painter.drawText(self.original_pixmap.rect(), Qt.AlignmentFlag.AlignCenter, f"Error:\nCould not load\n{os.path.basename(self.image_path)}")
+            painter.end()
+            self.img_width = 300
+            self.img_height = 500
+            # Use default coords even if image failed, mask will just cover the placeholder
+        else:
+            self.img_width = self.original_pixmap.width()
+            self.img_height = self.original_pixmap.height()
+
+        # Pre-computation for heatmap
+        logger.info("Starting heatmap pre-computation...")
+        try:
+            self.mask_image = self._generate_outline_mask()
+            self.mask_array = self._qimage_to_bool_mask(self.mask_image)
+            self.valid_grid_pixels_y, self.valid_grid_pixels_x = self._precompute_valid_grid_pixels()
+            self.num_valid_grid_points = len(self.valid_grid_pixels_x)
+            if self.num_valid_grid_points == 0: logger.warning("Heatmap: No grid points inside mask!")
+            self.precomputed_gaussian_factors = self._precompute_gaussian_factors() # Uses self.current_gaussian_sigma
+            # Setup colormap and normalization
+            try:
+                self.cmap = matplotlib.colormaps[self.current_cmap_name]
+            except KeyError:
+                logger.warning(f"Heatmap: Colormap '{self.current_cmap_name}' not found. Using 'jet'.")
+                self.current_cmap_name = 'jet' # Fallback default
+                self.cmap = matplotlib.colormaps[self.current_cmap_name]
+            self.norm = mcolors.Normalize(vmin=self.current_pressure_min, vmax=self.current_pressure_max, clip=True)
+            # Buffers
+            self.heatmap_buffer = np.zeros((self.img_height, self.img_width), dtype=np.uint32)
+            self.heatmap_qimage = QImage(self.heatmap_buffer.data, self.img_width, self.img_height,
+                                        self.img_width * 4, QImage.Format.Format_ARGB32_Premultiplied)
+            logger.info("Heatmap pre-computation finished.")
+        except Exception as e:
+            logger.error(f"Heatmap pre-computation failed: {e}", exc_info=True)
+            # Mark precomputation as failed to prevent errors later
+            self.mask_image = None
+            self.mask_array = None
+            self.num_valid_grid_points = 0
+            self.precomputed_gaussian_factors = None
+            self.heatmap_buffer = None
+            self.heatmap_qimage = None
+            # Set up a dummy image label to show the error
+            self.image_label = QLabel("Heatmap Precomputation Failed.\nCheck Logs.", self)
+            self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.image_label.setStyleSheet("background-color: gray; color: white; font-weight: bold;")
+            main_layout = QVBoxLayout(self)
+            main_layout.addWidget(self.image_label)
+            self.setLayout(main_layout)
+            return # Stop __init__ here if precomputation failed
+
+        # Center of Pressure & Trail state
+        self.center_of_pressure: Optional[QPointF] = None
+        self.cop_trail: deque[QPointF] = deque(maxlen=self.COP_TRAIL_MAX_LEN)
+
+        # --- GUI Layout Setup ---
+        self.main_layout = QHBoxLayout(self) # Main layout horizontal
+        self.left_panel = QWidget() # Panel for image
+        self.left_layout = QVBoxLayout(self.left_panel)
+        self.left_layout.setContentsMargins(0,0,0,0)
+
+        self.image_label = QLabel()
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_label.setMinimumSize(150, 250) # Min size for heatmap display
+        self.image_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.left_layout.addWidget(self.image_label)
+
+        self.right_panel = QWidget() # Panel for controls
+        self.controls_layout = QVBoxLayout(self.right_panel)
+        self.right_panel.setMaximumWidth(300) # Limit control panel width
+
+        # --- Sensitivity Control ---
+        sensitivity_layout = QHBoxLayout()
+        self.sensitivity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.sensitivity_slider.setRange(100, 10000)
+        self.sensitivity_slider.setValue(int(self.current_pressure_sensitivity))
+        self.sensitivity_slider.valueChanged.connect(self._update_sensitivity_from_slider)
+        self.sensitivity_textbox = QLineEdit()
+        self.sensitivity_textbox.setValidator(QIntValidator(100, 10000, self))
+        self.sensitivity_textbox.setText(str(int(self.current_pressure_sensitivity)))
+        self.sensitivity_textbox.setFixedWidth(self.TEXTBOX_WIDTH)
+        self.sensitivity_textbox.editingFinished.connect(self._update_sensitivity_from_textbox)
+        sensitivity_layout.addWidget(QLabel("Sensitivity:"))
+        sensitivity_layout.addWidget(self.sensitivity_slider)
+        sensitivity_layout.addWidget(self.sensitivity_textbox)
+        self.controls_layout.addLayout(sensitivity_layout)
+
+        # --- Gaussian Sigma (Blur) Control ---
+        sigma_layout = QHBoxLayout()
+        self.sigma_slider = QSlider(Qt.Orientation.Horizontal)
+        self.sigma_slider.setRange(10, 500)
+        self.sigma_slider.setValue(int(self.current_gaussian_sigma))
+        self.sigma_slider.valueChanged.connect(self._update_gaussian_sigma_from_slider)
+        self.sigma_textbox = QLineEdit()
+        self.sigma_textbox.setValidator(QIntValidator(10, 500, self))
+        self.sigma_textbox.setText(str(int(self.current_gaussian_sigma)))
+        self.sigma_textbox.setFixedWidth(self.TEXTBOX_WIDTH)
+        self.sigma_textbox.editingFinished.connect(self._update_sigma_from_textbox)
+        sigma_layout.addWidget(QLabel("Gaussian Sigma:"))
+        sigma_layout.addWidget(self.sigma_slider)
+        sigma_layout.addWidget(self.sigma_textbox)
+        self.controls_layout.addLayout(sigma_layout)
+
+        # --- Pressure Range Control (QRangeSlider + Textboxes) ---
+        range_v_layout = QVBoxLayout()
+        range_label_layout = QHBoxLayout()
+        range_label_layout.addWidget(QLabel("Windowing:"))
+        range_label_layout.addStretch(1)
+        min_layout = QHBoxLayout(); min_layout.addWidget(QLabel("Min:"));
+        self.min_pressure_textbox = QLineEdit()
+        self.min_pressure_validator = QDoubleValidator(0.0, self.current_pressure_max, 1, self)
+        self.min_pressure_textbox.setValidator(self.min_pressure_validator)
+        self.min_pressure_textbox.setText(f"{self.current_pressure_min:.1f}")
+        self.min_pressure_textbox.setFixedWidth(self.TEXTBOX_WIDTH)
+        self.min_pressure_textbox.editingFinished.connect(self._update_range_from_textboxes)
+        min_layout.addWidget(self.min_pressure_textbox); range_label_layout.addLayout(min_layout)
+        range_label_layout.addStretch(2)
+        max_layout = QHBoxLayout(); max_layout.addWidget(QLabel("Max:"))
+        self.max_pressure_textbox = QLineEdit()
+        self.max_pressure_validator = QDoubleValidator(0.0, self.current_pressure_sensitivity, 1, self)
+        self.max_pressure_textbox.setValidator(self.max_pressure_validator)
+        self.max_pressure_textbox.setText(f"{self.current_pressure_max:.1f}")
+        self.max_pressure_textbox.setFixedWidth(self.TEXTBOX_WIDTH)
+        self.max_pressure_textbox.editingFinished.connect(self._update_range_from_textboxes)
+        max_layout.addWidget(self.max_pressure_textbox); range_label_layout.addLayout(max_layout)
+        range_v_layout.addLayout(range_label_layout)
+        self.pressure_range_slider = QRangeSlider(Qt.Orientation.Horizontal)
+        self.pressure_range_slider.setRange(0, int(self.current_pressure_sensitivity))
+        self.pressure_range_slider.setValue((int(self.current_pressure_min), int(self.current_pressure_max)))
+        self.pressure_range_slider.valueChanged.connect(self._update_pressure_range_from_slider)
+        range_v_layout.addWidget(self.pressure_range_slider)
+        self.controls_layout.addLayout(range_v_layout)
+
+        # --- Colormap Selection ---
+        cmap_layout = QHBoxLayout()
+        self.cmap_combobox = QComboBox()
+        available_cmaps = sorted(self.AVAILABLE_CMAPS)
+        self.cmap_combobox.addItems(available_cmaps)
+        if self.current_cmap_name in available_cmaps:
+            self.cmap_combobox.setCurrentText(self.current_cmap_name)
+        else:
+             logger.warning(f"Heatmap: Configured cmap '{self.current_cmap_name}' not in available list. Using '{available_cmaps[0]}'.")
+             self.cmap_combobox.setCurrentIndex(0)
+             self._update_colormap(self.cmap_combobox.currentText()) # Update internal state
+        self.cmap_combobox.currentTextChanged.connect(self._update_colormap)
+        cmap_layout.addWidget(QLabel("Colormap:"))
+        cmap_layout.addWidget(self.cmap_combobox)
+        self.controls_layout.addLayout(cmap_layout)
+
+        # --- Save/Snapshot Button ---
+        self.save_button = QPushButton("Take Snapshot")
+        self.save_button.clicked.connect(self.save_current_view)
+        self.controls_layout.addWidget(self.save_button)
+
+        self.controls_layout.addStretch(1) # Push controls up
+
+        # --- Add panels to main layout ---
+        self.main_layout.addWidget(self.left_panel, stretch=3) # Give image more space
+        self.main_layout.addWidget(self.right_panel, stretch=1)
+        self.setLayout(self.main_layout)
+
+        # Initial display update if precomputation succeeded
+        if self.heatmap_qimage:
+             self._update_display_pixmap()
+
+    def get_widget(self) -> QWidget:
+        return self
+
+    def get_required_data_types(self) -> Set[str]:
+        return self._required_data_types
+
+    # get_loggable_data_types is inherited from BaseGuiComponent
+    # It will return HEATMAP_KEYS if logging is enabled for this component
+
+    def get_log_filename_suffix(self) -> str:
+        if self.is_loggable:
+            title = self.config.get('title', 'PressureHeatmap')
+            safe_suffix = re.sub(r'[^\w\-]+', '_', title).strip('_')
+            return f"heatmap_{safe_suffix}" if safe_suffix else f"heatmap_{id(self)}"
+        return ""
+
+    def handle_missing_uuids(self, missing_uuids_for_component: Set[str]):
+        """ Shows overlay and disables controls if the required UUID is missing. """
+        is_missing = bool(missing_uuids_for_component)
+        # Use base class overlay for the message
+        super().handle_missing_uuids(missing_uuids_for_component)
+        # Disable/Enable controls
+        if hasattr(self, 'right_panel'): # Check if panel exists (init might fail)
+             self.right_panel.setEnabled(not is_missing) # Disable entire control panel
+        if is_missing:
+             self.clear_component() # Also clear heatmap visually
+
+    # --- Update and Clear ---
+    def update_component(self, current_relative_time: float, is_flowing: bool):
+        if plotting_paused: return
+        if not self.heatmap_qimage: return # Skip update if precomputation failed
+
+        # --- Get Latest Pressure Data AND RESCALE IT ---
+        data_found_count = 0
+        # Create a temporary array to store the pressures scaled by the *current* sensitivity
+        rescaled_pressures = np.zeros(self.NUM_SENSORS, dtype=np.float32)
+
+        for i, key in enumerate(HEATMAP_KEYS):
+             if key in self.data_buffers_ref and self.data_buffers_ref[key]:
+                 # Get the pressure value calculated with INITIAL_PRESSURE_SENSITIVITY
+                 initial_pressure = self.data_buffers_ref[key][-1][1]
+
+                 # --- FIX: Rescale the pressure using the current sensitivity ---
+                 if INITIAL_PRESSURE_SENSITIVITY > 1e-6: # Avoid division by zero
+                     current_pressure = initial_pressure * (self.current_pressure_sensitivity / INITIAL_PRESSURE_SENSITIVITY)
+                 else:
+                     current_pressure = 0.0 # Or handle error appropriately
+
+                 rescaled_pressures[i] = max(0.0, current_pressure) # Apply non-negative constraint
+                 # --- END FIX ---
+                 data_found_count += 1
+             # else: logger.debug(f"No data found for heatmap sensor {key}")
+
+        # Only update if we actually found data for at least one sensor
+        if data_found_count > 0:
+            # --- Store the RESCALED pressures for rendering ---
+            self.pressure_values = rescaled_pressures
+            # logger.debug(f"Updating heatmap with RESCALED pressures: {self.pressure_values.round(1)}")
+
+            # --- Heatmap Calculation and Rendering ---
+            current_cop_qpoint = self._calculate_center_of_pressure()
+            self.center_of_pressure = current_cop_qpoint
+            if current_cop_qpoint is not None:
+                is_different = True
+                if self.cop_trail:
+                    last_point = self.cop_trail[-1]
+                    if abs(current_cop_qpoint.x() - last_point.x()) < 0.1 and abs(current_cop_qpoint.y() - last_point.y()) < 0.1: is_different = False
+                if is_different: self.cop_trail.append(current_cop_qpoint)
+
+            # Calculate pressure distribution using the rescaled pressure values and current gaussian factors
+            calculated_pressures = self._calculate_pressure_fast()
+            # Render the heatmap using the current windowing (norm) and colormap
+            self._render_heatmap_to_buffer(calculated_pressures)
+            # Update the display widget
+            self._update_display_pixmap()
+
+
+    def clear_component(self):
+        if not self.heatmap_qimage: return # Skip if precomputation failed
+        logger.info("Clearing PressureHeatmapComponent.")
+        self.pressure_values.fill(0.0)
+        self.center_of_pressure = None
+        self.cop_trail.clear()
+        # Clear the visual display
+        calculated_pressures = self._calculate_pressure_fast() # Will be zeros
+        self._render_heatmap_to_buffer(calculated_pressures)
+        self._update_display_pixmap()
+        # Hide overlay via base class method
+        super().handle_missing_uuids(set())
+
+
+    # --- Precomputation and Masking Methods (Internal) ---
+    def _generate_outline_mask(self) -> QImage:
+        mask_img = QImage(self.img_width, self.img_height, QImage.Format.Format_Grayscale8)
+        mask_img.fill(Qt.GlobalColor.black)
+        painter = QPainter(mask_img)
+        polygon_points = [QPointF(p[0], p[1]) for p in self.DEFAULT_OUTLINE_COORDS]
+        outline_polygon = QPolygonF(polygon_points)
+        painter.setBrush(QBrush(Qt.GlobalColor.white))
+        painter.setPen(QPen(Qt.PenStyle.NoPen))
+        painter.drawPolygon(outline_polygon)
+        painter.end()
+        return mask_img
+
+    def _qimage_to_bool_mask(self, q_image: QImage) -> np.ndarray:
+        ptr = q_image.constBits()
+        byte_count = q_image.sizeInBytes()
+        ptr.setsize(byte_count)
+        arr = np.frombuffer(ptr, dtype=np.uint8).reshape((self.img_height, self.img_width))
+        bool_mask = arr > 128
+        return bool_mask.copy()
+
+    def _precompute_valid_grid_pixels(self) -> Tuple[np.ndarray, np.ndarray]:
+        step = self.grid_resolution
+        y_coords = np.arange(0, self.img_height, step, dtype=int)
+        x_coords = np.arange(0, self.img_width, step, dtype=int)
+        grid_y, grid_x = np.meshgrid(y_coords, x_coords, indexing='ij')
+        grid_y_flat = grid_y.ravel()
+        grid_x_flat = grid_x.ravel()
+        # Ensure mask_array is valid before indexing
+        if self.mask_array is None or self.mask_array.size == 0:
+             logger.error("Heatmap: Mask array not available during valid grid pixel precomputation.")
+             return np.array([], dtype=np.float32), np.array([], dtype=np.float32)
+
+        # Clip coordinates to be within mask bounds before checking
+        valid_indices = (grid_y_flat >= 0) & (grid_y_flat < self.img_height) & \
+                        (grid_x_flat >= 0) & (grid_x_flat < self.img_width)
+        grid_y_flat = grid_y_flat[valid_indices]
+        grid_x_flat = grid_x_flat[valid_indices]
+
+        # Check if any valid indices remain after bounding
+        if grid_y_flat.size == 0:
+             return np.array([], dtype=np.float32), np.array([], dtype=np.float32)
+
+        is_inside = self.mask_array[grid_y_flat, grid_x_flat]
+        valid_pixels_y = grid_y_flat[is_inside]
+        valid_pixels_x = grid_x_flat[is_inside]
+        return valid_pixels_y.astype(np.float32), valid_pixels_x.astype(np.float32)
+
+    def _precompute_gaussian_factors(self) -> np.ndarray:
+        if self.num_valid_grid_points == 0: return np.empty((self.NUM_SENSORS, 0), dtype=np.float32)
+        grid_y_valid = self.valid_grid_pixels_y
+        grid_x_valid = self.valid_grid_pixels_x
+        factors = np.zeros((self.NUM_SENSORS, self.num_valid_grid_points), dtype=np.float32)
+        sigma = self.current_gaussian_sigma # Use the current sigma
+        two_sigma_sq = 2.0 * (sigma ** 2)
+        if two_sigma_sq <= 1e-9:
+             logger.warning(f"Heatmap: Gaussian sigma ({sigma}) resulted in near-zero denominator. Clamping.")
+             two_sigma_sq = 1e-9
+        dy_sq = (self.sensor_coords[:, 1, np.newaxis] - grid_y_valid)**2
+        dx_sq = (self.sensor_coords[:, 0, np.newaxis] - grid_x_valid)**2
+        dist_sq = dy_sq + dx_sq
+        factors = np.exp(-dist_sq / two_sigma_sq)
+        return factors
+
+    # --- Pressure Calculation Methods (Internal) ---
+    def _calculate_pressure_fast(self) -> np.ndarray:
+        # This function now uses self.pressure_values which are *already rescaled* in update_component
+        # It also uses self.precomputed_gaussian_factors which are updated when sigma changes
+        if self.num_valid_grid_points == 0 or self.precomputed_gaussian_factors is None or self.precomputed_gaussian_factors.size == 0:
+             # logger.debug("Skipping calculate_pressure_fast: No grid points or factors.")
+             return np.array([], dtype=np.float32)
+        # Ensure pressure_values and factors have compatible shapes
+        if self.pressure_values.shape[0] != self.precomputed_gaussian_factors.shape[0]:
+             logger.error(f"Heatmap: Mismatch between pressure values ({self.pressure_values.shape[0]}) and gaussian factors ({self.precomputed_gaussian_factors.shape[0]}). Skipping calculation.")
+             return np.array([], dtype=np.float32)
+
+        current_pressures = self.pressure_values[:, np.newaxis] # Use the RESCALED pressures
+        weighted_factors = current_pressures * self.precomputed_gaussian_factors # Use the CURRENT factors
+        calculated_pressures_masked = np.sum(weighted_factors, axis=0)
+        # logger.debug(f"Calculated pressures min/max: {np.min(calculated_pressures_masked):.1f}/{np.max(calculated_pressures_masked):.1f}")
+        return calculated_pressures_masked
+
+    def _calculate_center_of_pressure(self) -> Optional[QPointF]:
+        # Use the current internal *rescaled* pressure values
+        pressures = np.maximum(self.pressure_values, 0.0)
+        total_pressure = np.sum(pressures)
+        if total_pressure < 1e-6: return None
+        sensor_x = self.sensor_coords[:, 0]
+        sensor_y = self.sensor_coords[:, 1]
+        cop_x = np.sum(pressures * sensor_x) / total_pressure
+        cop_y = np.sum(pressures * sensor_y) / total_pressure
+        return QPointF(cop_x, cop_y)
+
+    # --- Heatmap Rendering Method (Internal) ---
+    def _render_heatmap_to_buffer(self, calculated_pressures_masked: np.ndarray):
+        if self.heatmap_buffer is None or self.heatmap_qimage is None: return # Skip if precomputation failed
+        self.heatmap_buffer.fill(0) # Clear buffer (transparent)
+        if calculated_pressures_masked is None or calculated_pressures_masked.size == 0: return
+        # Determine which grid points have pressure above the minimum threshold
+        draw_mask = calculated_pressures_masked >= self.current_pressure_min # Use >= to include min
+        if not np.any(draw_mask): return
+
+        valid_pressures = calculated_pressures_masked[draw_mask]
+        valid_y_coords = self.valid_grid_pixels_y[draw_mask].astype(int)
+        valid_x_coords = self.valid_grid_pixels_x[draw_mask].astype(int)
+
+        # Normalize and colorize only the points that need drawing
+        norm_pressures = self.norm(valid_pressures) # Apply current normalization
+        rgba_colors_float = self.cmap(norm_pressures) # Apply current colormap
+
+        # Apply alpha and pre-multiply
+        alpha_f = self.alpha_float
+        # Avoid in-place modification if rgba_colors_float is needed elsewhere unmodified
+        rgba_premult_float = rgba_colors_float.copy()
+        rgba_premult_float[:, 0] *= alpha_f
+        rgba_premult_float[:, 1] *= alpha_f
+        rgba_premult_float[:, 2] *= alpha_f
+        # Convert to uint8 for QImage buffer
+        rgba_premult_uint8 = (rgba_premult_float * 255).astype(np.uint8)
+
+        # Combine into ARGB uint32 format (faster for buffer assignment)
+        A = np.uint32(self.alpha_int) # Use the integer alpha directly
+        R = rgba_premult_uint8[:, 0].astype(np.uint32)
+        G = rgba_premult_uint8[:, 1].astype(np.uint32)
+        B = rgba_premult_uint8[:, 2].astype(np.uint32)
+        argb_values = (A << 24) | (R << 16) | (G << 8) | B
+
+        # Draw squares onto the buffer efficiently
+        draw_size = self.grid_resolution
+        half_draw_size = draw_size // 2
+        if draw_size == 1:
+             # Direct assignment if grid resolution is 1 pixel
+             # Ensure coordinates are within buffer bounds before assigning
+             valid_coords_mask = (valid_y_coords >= 0) & (valid_y_coords < self.img_height) & \
+                                (valid_x_coords >= 0) & (valid_x_coords < self.img_width)
+             self.heatmap_buffer[valid_y_coords[valid_coords_mask], valid_x_coords[valid_coords_mask]] = argb_values[valid_coords_mask]
+        else:
+            # Iterate and draw squares for resolutions > 1
+            h, w = self.img_height, self.img_width
+            target_buffer = self.heatmap_buffer # Local reference for potential speedup
+            for i in range(len(valid_pressures)):
+                y, x = valid_y_coords[i], valid_x_coords[i]
+                color = argb_values[i]
+                # Calculate square bounds, clipping to image dimensions
+                y_start = max(0, y - half_draw_size)
+                y_end = min(h, y + draw_size - half_draw_size)
+                x_start = max(0, x - half_draw_size)
+                x_end = min(w, x + draw_size - half_draw_size)
+                # Assign color block if valid bounds
+                if y_start < y_end and x_start < x_end:
+                    target_buffer[y_start:y_end, x_start:x_end] = color
+
+    # --- CoP Trail Calculation Helpers (Internal) ---
+    def _calculate_catmull_rom_point(self, t: float, p0: QPointF, p1: QPointF, p2: QPointF, p3: QPointF) -> QPointF:
+        t2 = t * t; t3 = t2 * t
+        x = 0.5 * ( (2 * p1.x()) + (-p0.x() + p2.x()) * t + (2 * p0.x() - 5 * p1.x() + 4 * p2.x() - p3.x()) * t2 + (-p0.x() + 3 * p1.x() - 3 * p2.x() + p3.x()) * t3 )
+        y = 0.5 * ( (2 * p1.y()) + (-p0.y() + p2.y()) * t + (2 * p0.y() - 5 * p1.y() + 4 * p2.y() - p3.y()) * t2 + (-p0.y() + 3 * p1.y() - 3 * p2.y() + p3.y()) * t3 )
+        return QPointF(x, y)
+
+    def _get_spline_segment_points(self, p0: QPointF, p1: QPointF, p2: QPointF, p3: QPointF) -> List[QPointF]:
+        points = []
+        for i in range(self.SPLINE_SAMPLES_PER_SEGMENT + 1):
+            t = i / self.SPLINE_SAMPLES_PER_SEGMENT
+            points.append(self._calculate_catmull_rom_point(t, p0, p1, p2, p3))
+        return points
+
+    # --- Heatmap/CoP Drawing Method (Internal) ---
+    def _update_display_pixmap(self):
+        if not self.heatmap_qimage or self.original_pixmap.isNull():
+             # logger.debug("Skipping display pixmap update: heatmap image or background missing.")
+             return # Don't update if essential components missing
+
+        # Get the target rectangle of the QLabel for scaling
+        target_rect = self.image_label.contentsRect()
+        if target_rect.isEmpty():
+             # logger.debug("Skipping display pixmap update: target label rect is empty.")
+             return # Don't try to scale into nothing
+
+        # Create the final pixmap with a transparent background
+        final_pixmap = QPixmap(target_rect.size())
+        final_pixmap.fill(Qt.GlobalColor.transparent)
+        painter_final = QPainter(final_pixmap)
+
+        # Scale the background pixmap to fit the label
+        scaled_background = self.original_pixmap.scaled(target_rect.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+
+        # Calculate position to center the scaled background
+        x_bg = (target_rect.width() - scaled_background.width()) / 2
+        y_bg = (target_rect.height() - scaled_background.height()) / 2
+
+        # Draw the scaled background onto the final pixmap
+        painter_final.drawPixmap(int(x_bg), int(y_bg), scaled_background)
+
+        # Now, prepare to overlay the heatmap and CoP onto the *original sized* combined image first
+        # This requires drawing onto a pixmap matching the original image dimensions
+        combined_orig_size_pixmap = self.original_pixmap.copy()
+        painter_orig = QPainter(combined_orig_size_pixmap)
+        painter_orig.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # 1. Draw the heatmap (using the pre-rendered QImage buffer)
+        painter_orig.drawImage(0, 0, self.heatmap_qimage)
+
+        # 2. Draw CoP Trail (Spline + Points)
+        num_trail_points = len(self.cop_trail)
+        trail_list = list(self.cop_trail)
+        if num_trail_points >= 2:
+            spline_pen = QPen(self.COP_TRAIL_COLOR)
+            spline_pen.setWidthF(self.COP_TRAIL_LINE_WIDTH)
+            spline_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            spline_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter_orig.setBrush(Qt.BrushStyle.NoBrush) # Ensure no fill for the polyline
+
+            for i in range(num_trail_points - 1):
+                p1 = trail_list[i]; p2 = trail_list[i+1]
+                p0 = trail_list[i-1] if i > 0 else p1 # Handle start endpoint
+                p3 = trail_list[i+2] if i < num_trail_points - 2 else p2 # Handle end endpoint
+
+                # Calculate alpha based on position in the trail (fades out)
+                alpha_fraction = (i + 1) / (num_trail_points - 1) if num_trail_points > 1 else 1.0
+                current_alpha = int(self.COP_TRAIL_MIN_ALPHA + alpha_fraction * (self.COP_TRAIL_MAX_ALPHA - self.COP_TRAIL_MIN_ALPHA))
+                current_alpha = max(0, min(255, current_alpha)) # Clamp alpha
+
+                faded_line_color = QColor(self.COP_TRAIL_COLOR)
+                faded_line_color.setAlpha(current_alpha)
+                spline_pen.setColor(faded_line_color)
+                painter_orig.setPen(spline_pen)
+
+                # Calculate and draw the Catmull-Rom spline segment
+                segment_points = self._get_spline_segment_points(p0, p1, p2, p3)
+                if segment_points:
+                    poly = QPolygonF(segment_points)
+                    painter_orig.drawPolyline(poly)
+
+        # 3. Draw CoP Trail Points (Circles)
+        if num_trail_points > 0:
+            point_pen = QPen(Qt.PenStyle.NoPen) # No outline for points
+            point_brush = QBrush(self.COP_TRAIL_COLOR) # Base color
+            painter_orig.setPen(point_pen)
+
+            for i in range(num_trail_points):
+                point_pos = trail_list[i]
+                # Calculate alpha based on position (same logic as spline)
+                alpha_fraction = i / (num_trail_points - 1) if num_trail_points > 1 else 1.0
+                current_alpha = int(self.COP_TRAIL_MIN_ALPHA + alpha_fraction * (self.COP_TRAIL_MAX_ALPHA - self.COP_TRAIL_MIN_ALPHA))
+                current_alpha = max(0, min(255, current_alpha))
+
+                faded_point_color = QColor(self.COP_TRAIL_COLOR)
+                faded_point_color.setAlpha(current_alpha)
+                point_brush.setColor(faded_point_color)
+                painter_orig.setBrush(point_brush)
+
+                painter_orig.drawEllipse(point_pos, self.COP_TRAIL_POINT_RADIUS, self.COP_TRAIL_POINT_RADIUS)
+
+        # 4. Draw Current CoP Point (Main White Dot)
+        if self.center_of_pressure is not None:
+             main_pen = QPen(Qt.PenStyle.NoPen) # No outline
+             main_brush = QBrush(self.COP_MAIN_POINT_COLOR) # Solid white
+             painter_orig.setPen(main_pen)
+             painter_orig.setBrush(main_brush)
+             painter_orig.drawEllipse(self.center_of_pressure, self.COP_MAIN_POINT_RADIUS, self.COP_MAIN_POINT_RADIUS)
+
+        painter_orig.end() # Finish drawing on the original size pixmap
+
+        # Scale the combined original size pixmap (with heatmap+CoP) down to fit the label
+        scaled_combined = combined_orig_size_pixmap.scaled(target_rect.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+
+        # Calculate position to center the scaled combined image on the final pixmap
+        x_comb = (target_rect.width() - scaled_combined.width()) / 2
+        y_comb = (target_rect.height() - scaled_combined.height()) / 2
+
+        # Draw the scaled combined image OVER the scaled background
+        painter_final.drawPixmap(int(x_comb), int(y_comb), scaled_combined)
+        painter_final.end() # Finish drawing on the final pixmap
+
+        # Set the final pixmap on the label
+        self.image_label.setPixmap(final_pixmap)
+
+
+    # --- Slot for Save Button ---
+    def save_current_view(self):
+        """ Saves the current heatmap view including CoP to a file. """
+        if self.original_pixmap.isNull() or not self.heatmap_qimage:
+             logger.warning("Cannot save snapshot: Background or heatmap data missing.")
+             # Optionally show a message box to the user
+             # QMessageBox.warning(self, "Snapshot Error", "Cannot save snapshot.\nBackground image or heatmap data missing.")
+             return
+
+        # Create a pixmap matching the *original* dimensions to draw onto
+        save_pixmap = self.original_pixmap.copy()
+        save_painter = QPainter(save_pixmap)
+        save_painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # Draw heatmap QImage onto the background copy
+        save_painter.drawImage(0, 0, self.heatmap_qimage)
+
+        # Draw CoP Trail (Spline) - Reuse logic from _update_display_pixmap
+        num_trail_points = len(self.cop_trail); trail_list = list(self.cop_trail)
+        if num_trail_points >= 2:
+            spline_pen = QPen(self.COP_TRAIL_COLOR); spline_pen.setWidthF(self.COP_TRAIL_LINE_WIDTH); spline_pen.setCapStyle(Qt.PenCapStyle.RoundCap); spline_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            save_painter.setBrush(Qt.BrushStyle.NoBrush)
+            for i in range(num_trail_points - 1):
+                p1 = trail_list[i]; p2 = trail_list[i+1]; p0 = trail_list[i-1] if i > 0 else p1; p3 = trail_list[i+2] if i < num_trail_points - 2 else p2
+                alpha_fraction = (i + 1) / (num_trail_points - 1) if num_trail_points > 1 else 1.0; current_alpha = int(self.COP_TRAIL_MIN_ALPHA + alpha_fraction * (self.COP_TRAIL_MAX_ALPHA - self.COP_TRAIL_MIN_ALPHA)); current_alpha = max(0, min(255, current_alpha))
+                faded_line_color = QColor(self.COP_TRAIL_COLOR); faded_line_color.setAlpha(current_alpha); spline_pen.setColor(faded_line_color); save_painter.setPen(spline_pen)
+                segment_points = self._get_spline_segment_points(p0, p1, p2, p3)
+                if segment_points: poly = QPolygonF(segment_points); save_painter.drawPolyline(poly)
+
+        # Draw CoP Trail Points
+        if num_trail_points > 0:
+            point_pen = QPen(Qt.PenStyle.NoPen); point_brush = QBrush(self.COP_TRAIL_COLOR)
+            save_painter.setPen(point_pen)
+            for i in range(num_trail_points):
+                point_pos = trail_list[i]; alpha_fraction = i / (num_trail_points - 1) if num_trail_points > 1 else 1.0; current_alpha = int(self.COP_TRAIL_MIN_ALPHA + alpha_fraction * (self.COP_TRAIL_MAX_ALPHA - self.COP_TRAIL_MIN_ALPHA)); current_alpha = max(0, min(255, current_alpha))
+                faded_point_color = QColor(self.COP_TRAIL_COLOR); faded_point_color.setAlpha(current_alpha); point_brush.setColor(faded_point_color); save_painter.setBrush(point_brush)
+                save_painter.drawEllipse(point_pos, self.COP_TRAIL_POINT_RADIUS, self.COP_TRAIL_POINT_RADIUS)
+
+        # Draw Current CoP Point
+        if self.center_of_pressure is not None:
+             main_pen = QPen(Qt.PenStyle.NoPen); main_brush = QBrush(self.COP_MAIN_POINT_COLOR); save_painter.setPen(main_pen); save_painter.setBrush(main_brush)
+             save_painter.drawEllipse(self.center_of_pressure, self.COP_MAIN_POINT_RADIUS, self.COP_MAIN_POINT_RADIUS)
+
+        save_painter.end()
+
+        # Generate filename and save
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        filename = f"pressure_map_{timestamp}.png"
+        filepath = os.path.join(self.save_directory, filename)
+        success = save_pixmap.save(filepath, "PNG")
+        if success:
+             logger.info(f"Successfully saved snapshot to: {filepath}")
+             # Optional: Show confirmation to user
+             # QMessageBox.information(self, "Snapshot Saved", f"Snapshot saved to:\n{filepath}")
+        else:
+             logger.error(f"Failed to save snapshot to: {filepath}")
+             # Optional: Show error to user
+             # QMessageBox.critical(self, "Snapshot Error", f"Failed to save snapshot to:\n{filepath}")
+
+    # --- Sensitivity Control Logic (Internal Slots) ---
+    def _update_sensitivity(self, new_value: float):
+        """Core logic to update sensitivity state and dependent controls."""
+        min_sens, max_sens = self.sensitivity_slider.minimum(), self.sensitivity_slider.maximum()
+        new_value = max(float(min_sens), min(float(max_sens), new_value)) # Clamp to slider range
+        value_int = int(new_value)
+        new_sensitivity_float = float(value_int)
+
+        if abs(self.current_pressure_sensitivity - new_sensitivity_float) < 1e-6: return # No change
+
+        self.current_pressure_sensitivity = new_sensitivity_float
+        logger.info(f"Heatmap sensitivity updated to: {self.current_pressure_sensitivity}")
+
+        # Update slider and textbox (preventing signal loops)
+        self.sensitivity_slider.blockSignals(True); self.sensitivity_slider.setValue(value_int); self.sensitivity_slider.blockSignals(False)
+        self.sensitivity_textbox.blockSignals(True); self.sensitivity_textbox.setText(str(value_int)); self.sensitivity_textbox.blockSignals(False)
+
+        # Update range slider's maximum and its validator
+        self.pressure_range_slider.blockSignals(True)
+        current_slider_min_range, _ = self.pressure_range_slider.value() # Keep current min window val
+        self.pressure_range_slider.setRange(0, value_int) # Max range is now sensitivity
+        # Try to preserve window, clamping if necessary
+        new_max_window = min(self.current_pressure_max, self.current_pressure_sensitivity)
+        new_min_window = min(self.current_pressure_min, new_max_window)
+        # Only set value if it differs from current to avoid recursive updates
+        if self.pressure_range_slider.value() != (int(new_min_window), int(new_max_window)):
+             self.pressure_range_slider.setValue((int(new_min_window), int(new_max_window)))
+        self.pressure_range_slider.blockSignals(False)
+
+        # Update the validator for the MAX pressure textbox
+        self.max_pressure_validator.setTop(new_sensitivity_float)
+        self.max_pressure_textbox.setValidator(self.max_pressure_validator)
+
+        # Update the text for the MAX pressure textbox if it exceeds the new sensitivity
+        if float(self.max_pressure_textbox.text()) > new_sensitivity_float:
+            self.max_pressure_textbox.blockSignals(True)
+            self.max_pressure_textbox.setText(f"{new_sensitivity_float:.1f}")
+            self.max_pressure_textbox.blockSignals(False)
+
+
+        # Also re-call the _update_pressure_range to ensure normalization/textboxes are updated
+        # This uses the potentially clamped window values from above
+        # This needs to happen *after* the max textbox validator/value is potentially updated
+        self._update_pressure_range(new_min_window, new_max_window)
+
+
+    def _update_sensitivity_from_slider(self, value):
+        self._update_sensitivity(float(value))
+
+    def _update_sensitivity_from_textbox(self):
+        try: value = float(self.sensitivity_textbox.text())
+        except ValueError: value = self.current_pressure_sensitivity # Revert on bad input
+        self._update_sensitivity(value)
+
+    # --- Gaussian Sigma Control Logic (Internal Slots) ---
+    def _update_gaussian_sigma(self, new_value: float):
+        min_sigma, max_sigma = self.sigma_slider.minimum(), self.sigma_slider.maximum()
+        new_value = max(float(min_sigma), min(float(max_sigma), new_value))
+        value_int = int(new_value)
+        new_sigma_float = float(value_int)
+
+        if abs(self.current_gaussian_sigma - new_sigma_float) < 1e-6: return # No change
+
+        self.current_gaussian_sigma = new_sigma_float
+        logger.info(f"Heatmap Gaussian sigma updated to: {self.current_gaussian_sigma}")
+
+        self.sigma_slider.blockSignals(True); self.sigma_slider.setValue(value_int); self.sigma_slider.blockSignals(False)
+        self.sigma_textbox.blockSignals(True); self.sigma_textbox.setText(str(value_int)); self.sigma_textbox.blockSignals(False)
+
+        self._recompute_gaussian_factors() # Recalculate factors when sigma changes
+
+    def _update_gaussian_sigma_from_slider(self, value):
+        self._update_gaussian_sigma(float(value))
+
+    def _update_sigma_from_textbox(self):
+        try: value = float(self.sigma_textbox.text())
+        except ValueError: value = self.current_gaussian_sigma # Revert on bad input
+        self._update_gaussian_sigma(value)
+
+
+    def _recompute_gaussian_factors(self):
+        logger.debug("Heatmap: Recomputing Gaussian factors...")
+        try:
+            # Recalculate using the current sigma
+            new_factors = self._precompute_gaussian_factors()
+            # Only update if the calculation was successful (returned a valid array)
+            if new_factors is not None and new_factors.size > 0:
+                 self.precomputed_gaussian_factors = new_factors
+                 logger.debug("Heatmap: Gaussian factors recomputed.")
+            else:
+                 logger.warning("Heatmap: Gaussian factor recomputation resulted in empty factors. Check grid/mask.")
+                 # Keep old factors or set to None? Setting to None might be safer to prevent errors.
+                 # self.precomputed_gaussian_factors = None # Or keep old ones? Let's keep old for now.
+        except Exception as e:
+             logger.error(f"Heatmap: Failed to recompute gaussian factors: {e}")
+             # Optionally invalidate factors on error, e.g., self.precomputed_gaussian_factors = None
+
+
+    # --- Pressure Range Control Logic (Internal Slots) ---
+    def _update_pressure_range(self, min_val: float, max_val: float):
+        """Core logic to update pressure window min/max and related controls."""
+        effective_max_limit = self.current_pressure_sensitivity # Window cannot exceed sensitivity
+        slider_min_limit = 0.0 # Typically 0
+
+        # Clamp max_val first
+        max_val = max(slider_min_limit, min(effective_max_limit, max_val))
+        # Clamp min_val based on slider min and the clamped max_val
+        min_val = max(slider_min_limit, min(max_val, min_val))
+
+        # Check if values actually changed
+        if abs(self.current_pressure_min - min_val) < 1e-6 and abs(self.current_pressure_max - max_val) < 1e-6:
+            return # No change
+
+        self.current_pressure_min = min_val
+        self.current_pressure_max = max_val
+
+        # Update normalization object used for rendering
+        self.norm = mcolors.Normalize(vmin=self.current_pressure_min, vmax=self.current_pressure_max, clip=True)
+        logger.info(f"Heatmap pressure window updated to: Min={self.current_pressure_min:.1f}, Max={self.current_pressure_max:.1f}")
+
+        # Update range slider (prevent signal loops)
+        self.pressure_range_slider.blockSignals(True)
+        # Check if the value needs updating before setting it
+        if self.pressure_range_slider.value() != (int(min_val), int(max_val)):
+            self.pressure_range_slider.setValue((int(min_val), int(max_val)))
+        self.pressure_range_slider.blockSignals(False)
+
+
+        # Update min textbox validator (max is the current window max)
+        self.min_pressure_validator.setTop(self.current_pressure_max)
+        self.min_pressure_textbox.setValidator(self.min_pressure_validator) # Reapply validator
+
+        # Update textboxes (prevent signal loops)
+        # Check if text needs updating before setting it
+        if self.min_pressure_textbox.text() != f"{self.current_pressure_min:.1f}":
+             self.min_pressure_textbox.blockSignals(True); self.min_pressure_textbox.setText(f"{self.current_pressure_min:.1f}"); self.min_pressure_textbox.blockSignals(False)
+
+        # Max textbox validator max limit already updated by sensitivity change if needed
+        if self.max_pressure_textbox.text() != f"{self.current_pressure_max:.1f}":
+             self.max_pressure_textbox.blockSignals(True); self.max_pressure_textbox.setText(f"{self.current_pressure_max:.1f}"); self.max_pressure_textbox.blockSignals(False)
+
+
+        # Trigger a visual update since normalization changed
+        # (Assuming update_component will be called shortly by the main timer anyway)
+
+
+    def _update_pressure_range_from_slider(self, value_tuple):
+        min_val_int, max_val_int = value_tuple # QRangeSlider emits an int tuple
+        self._update_pressure_range(float(min_val_int), float(max_val_int))
+
+    def _update_range_from_textboxes(self):
+        try: min_val_f = float(self.min_pressure_textbox.text())
+        except ValueError: min_val_f = self.current_pressure_min # Revert on bad input
+        try: max_val_f = float(self.max_pressure_textbox.text())
+        except ValueError: max_val_f = self.current_pressure_max # Revert on bad input
+        self._update_pressure_range(min_val_f, max_val_f)
+
+    # --- Colormap Selection Slot (Internal) ---
+    def _update_colormap(self, cmap_name):
+        try:
+            self.cmap = matplotlib.colormaps[cmap_name]
+            self.current_cmap_name = cmap_name
+            logger.info(f"Heatmap colormap changed to: {self.current_cmap_name}")
+             # Trigger a visual update since colormap changed
+            # (Assuming update_component will be called shortly by the main timer anyway)
+        except KeyError:
+             logger.error(f"Heatmap: Invalid colormap selected in dropdown: {cmap_name}. Keeping previous.")
+             # Revert dropdown to previous valid value
+             self.cmap_combobox.blockSignals(True)
+             self.cmap_combobox.setCurrentText(self.current_cmap_name)
+             self.cmap_combobox.blockSignals(False)
+
+# --- SingleValueDisplayComponent ---
+class SingleValueDisplayComponent(BaseGuiComponent):
+    def __init__(self, config: Dict[str, Any], data_buffers_ref: Dict[str, List[Tuple[float, float]]], device_config_ref: DeviceConfig, parent: Optional[QWidget] = None):
+        super().__init__(config, data_buffers_ref, device_config_ref, parent)
+        self.data_type_to_monitor = self.config.get("data_type")
+        self.display_label = self.config.get("label", self.data_type_to_monitor)
+        self.format_string = self.config.get("format", "{:.2f}")
+        self.units = self.config.get("units", "")
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(5, 5, 5, 5)
+        self.title_label = QLabel(f"{self.display_label}:")
+        self.value_label = QLabel("--")
+        self.value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter) # Align value right
+        self.value_label.setMinimumWidth(60) # Give value space
+
+        layout.addWidget(self.title_label)
+        layout.addStretch(1) # Push value label to the right
+        layout.addWidget(self.value_label)
+        # layout.addStretch(1) # Push labels to the left
+
+        self.setLayout(layout)
+
+        # Fix height, allow width expansion
+        self.setFixedHeight(30)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def update_component(self, current_relative_time: float, is_flowing: bool):
+        if plotting_paused: self.value_label.setText("(Paused)"); return
+
+        value_found = False
+        is_uuid_missing = False # Flag to check if UUID is missing
+
+        if self.data_type_to_monitor:
+             # Check if UUID is missing
+             uuid = self.device_config_ref.get_uuid_for_data_type(self.data_type_to_monitor)
+             # Attempt to access the missing UUID set from the GuiManager via parent traversal
+             missing_uuids = set()
+             try:
+                 # Traverse up widget hierarchy to find MainWindow -> GuiManager
+                 current_widget = self
+                 while current_widget is not None:
+                     if isinstance(current_widget, MainWindow):
+                         missing_uuids = current_widget.gui_manager.active_missing_uuids
+                         break
+                     current_widget = current_widget.parent()
+             except AttributeError:
+                  logger.warning("Could not access active_missing_uuids from parent.", exc_info=False)
+
+
+             if uuid and uuid in missing_uuids:
+                 self.value_label.setText("(UUID Missing)")
+                 is_uuid_missing = True # Set the flag
+                 # return # Don't return yet, check buffer below just in case
+
+             if not is_uuid_missing and self.data_type_to_monitor in self.data_buffers_ref:
+                 buffer = self.data_buffers_ref[self.data_type_to_monitor]
+                 if buffer:
+                     latest_value = buffer[-1][1]
+                     try: display_text = self.format_string.format(latest_value) + f" {self.units}"
+                     except (ValueError, TypeError): display_text = f"{latest_value} {self.units}" # Fallback if format fails
+                     self.value_label.setText(display_text)
+                     value_found = True
+
+        # Only show '--' if not paused, not missing UUID, and value not found
+        if not value_found and not is_uuid_missing and not plotting_paused:
+             self.value_label.setText("--")
+
+
+    def clear_component(self):
+        self.value_label.setText("--")
+
+    def get_required_data_types(self) -> Set[str]:
+        # This component requires only the specified data type for display
+        return {self.data_type_to_monitor} if self.data_type_to_monitor else set()
+
+    # get_loggable_data_types will inherit default behavior (logs required types if enabled)
+
+    def get_log_filename_suffix(self) -> str:
+        """Provides a filename suffix based on the component's label or data type."""
+        if self.is_loggable:
+            # Use label if available, otherwise data type
+            name_part = self.display_label if self.display_label else self.data_type_to_monitor
+            if not name_part: name_part = f'ValueDisplay_{id(self)}'
+            safe_suffix = re.sub(r'[^\w\-]+', '_', name_part).strip('_')
+            return f"value_{safe_suffix}" if safe_suffix else f"value_{id(self)}"
+        return ""
+
+    def handle_missing_uuids(self, missing_uuids_for_component: Set[str]):
+        """ Overrides base to update display immediately if UUID goes missing/found """
+        # Update the display if our specific data type's UUID is affected
+        is_missing = False
+        if self.data_type_to_monitor:
+            uuid = self.device_config_ref.get_uuid_for_data_type(self.data_type_to_monitor)
+            if uuid and uuid in missing_uuids_for_component:
+                is_missing = True
+
+        if is_missing:
+            self.value_label.setText("(UUID Missing)")
+        else:
+             # Force update from buffer if UUID is no longer missing
+             # Use dummy time, is_flowing=False to get latest non-flowing value
+             # Need a way to get current time if available, otherwise use 0
+             current_time = 0.0
+             if start_time: current_time = (datetime.datetime.now() - start_time).total_seconds()
+             self.update_component(current_time, False)
 
 
 # --- Tab Layout Configuration ---
 # List of dictionaries, each defining a tab.
 # Each dictionary contains 'tab_title' and 'layout'.
 # 'layout' is a list of component definitions for that tab's grid.
+# 'enable_logging': True/False to component configs where logging is desired
 tab_configs = [
+    {
+        'tab_title': 'Insole View',
+        'layout': [
+            {   'component_class': PressureHeatmapComponent,
+                'row': 0, 'col': 0, 'rowspan': 2, # Heatmap takes more vertical space
+                'config': { # Configuration for the heatmap
+                    'title': 'Insole Pressure Heatmap', # Used for log filename
+                    # Optional: override defaults like initial_sensitivity, image_path etc.
+                    # 'initial_sensitivity': 500, # Example override
+                    # 'initial_gaussian_sigma': 150, # Example override
+                    # 'initial_colormap': 'turbo',
+                    'enable_logging': True # Log the 11 FSR pressure values (keys from HEATMAP_KEYS)
+                }
+            },
+            {   'component_class': TimeSeriesPlotComponent,
+                'row': 0, 'col': 1, # Plot for estimated weight
+                'config': {
+                    'title': 'Estimated Weight vs Time', 'xlabel': 'Time [s]', 'ylabel': 'Estimated Weight [kg]', # Adjusted units
+                    'plot_height': 250, # Adjust height as needed
+                    'datasets': [{'data_type': 'estimated_weight', 'label': 'Weight', 'color': 'b'}],
+                    'enable_logging': True # Log estimated weight
+                }
+            },
+            {   'component_class': TimeSeriesPlotComponent,
+                'row': 1, 'col': 1, # Plot for flex angle
+                'config': {
+                    'title': 'Flex Sensor Angle vs Time', 'xlabel': 'Time [s]', 'ylabel': 'Angle [°]',
+                    'plot_height': 250, # Adjust height as needed
+                    'datasets': [{'data_type': 'flex_angle', 'label': 'Flex Angle', 'color': 'r'}],
+                    'enable_logging': True # Log flex angle
+                }
+            },
+        ]
+    },
     {
         'tab_title': 'IMU Basic',
         'layout': [
@@ -496,7 +1663,8 @@ tab_configs = [
                     'plot_height': 300, 'plot_width': 450, # Size constraints applied to the component
                     'datasets': [{'data_type': 'orientation_x', 'label': 'X (Roll)', 'color': 'r'},
                                  {'data_type': 'orientation_y', 'label': 'Y (Pitch)', 'color': 'g'},
-                                 {'data_type': 'orientation_z', 'label': 'Z (Yaw)', 'color': 'b'}]
+                                 {'data_type': 'orientation_z', 'label': 'Z (Yaw)', 'color': 'b'}],
+                    'enable_logging': True # Enable logging for this specific plot
                 }
             },
             {   'component_class': TimeSeriesPlotComponent,
@@ -506,13 +1674,30 @@ tab_configs = [
                     'plot_height': 300, 'plot_width': 600,
                     'datasets': [{'data_type': 'gyro_x', 'label': 'X', 'color': 'r'},
                                  {'data_type': 'gyro_y', 'label': 'Y', 'color': 'g'},
-                                 {'data_type': 'gyro_z', 'label': 'Z', 'color': 'b'}]
+                                 {'data_type': 'gyro_z', 'label': 'Z', 'color': 'b'}],
+                    'enable_logging': False # Logging disabled for this plot (default if key omitted)
                 }
             },
-            # Add other components (plots, labels, etc.) here for this tab
-            # Example: Add a placeholder label component if defined
-            # { 'component_class': StatusIndicatorComponent, 'row': 1, 'col': 0,
-            #   'config': {'data_type_to_monitor': 'gyro_x'} }
+            {   'component_class': SingleValueDisplayComponent,
+                'row': 1, 'col': 0,
+                'config': {
+                    'label': 'Current Roll', # Display name
+                    'data_type': 'orientation_x', # Data source
+                    'format': '{:.1f}', # Format string
+                    'units': '°', # Units string
+                    'enable_logging': True # Also log this single value
+                }
+            },
+            {   'component_class': SingleValueDisplayComponent,
+                'row': 1, 'col': 1,
+                'config': {
+                    'label': 'Current Yaw Rate',
+                    'data_type': 'gyro_z',
+                    'format': '{:.1f}',
+                    'units': '°/s',
+                    'enable_logging': False # Don't log this one
+                }
+            }
         ]
     },
     {
@@ -525,7 +1710,8 @@ tab_configs = [
                     # No size constraints -> uses default Expanding policy
                     'datasets': [{'data_type': 'lin_accel_x', 'label': 'X', 'color': 'r'},
                                  {'data_type': 'lin_accel_y', 'label': 'Y', 'color': 'g'},
-                                 {'data_type': 'lin_accel_z', 'label': 'Z', 'color': 'b'}]
+                                 {'data_type': 'lin_accel_z', 'label': 'Z', 'color': 'b'}],
+                    'enable_logging': True # Log this plot's data
                 }
             },
             {   'component_class': TimeSeriesPlotComponent,
@@ -536,6 +1722,7 @@ tab_configs = [
                     'datasets': [{'data_type': 'accel_x', 'label': 'X', 'color': 'r'},
                                  {'data_type': 'accel_y', 'label': 'Y', 'color': 'g'},
                                  {'data_type': 'accel_z', 'label': 'Z', 'color': 'b'}]
+                    # enable_logging defaults to False if omitted
                 }
             },
             {   'component_class': TimeSeriesPlotComponent,
@@ -545,7 +1732,8 @@ tab_configs = [
                      'plot_width': 400, # Width constraint
                      'datasets': [{'data_type': 'gravity_x', 'label': 'X', 'color': 'r'},
                                   {'data_type': 'gravity_y', 'label': 'Y', 'color': 'g'},
-                                  {'data_type': 'gravity_z', 'label': 'Z', 'color': 'b'}]
+                                  {'data_type': 'gravity_z', 'label': 'Z', 'color': 'b'}],
+                     'enable_logging': True # Log this one too
                 }
             }
         ]
@@ -560,11 +1748,19 @@ tab_configs = [
                      'plot_height': 350, 'plot_width': 600, # Both constraints
                      'datasets': [{'data_type': 'mag_x', 'label': 'X', 'color': 'r'},
                                   {'data_type': 'mag_y', 'label': 'Y', 'color': 'g'},
-                                  {'data_type': 'mag_z', 'label': 'Z', 'color': 'b'}]
+                                  {'data_type': 'mag_z', 'label': 'Z', 'color': 'b'}],
+                     'enable_logging': True # Log magnetometer data
                  }
              },
-             # Example of a future component placement
-             # {  'component_class': SomeOtherComponent, 'row': 1, 'col': 0, 'config': {...} }
+             # Example of placing another loggable value display
+             {   'component_class': SingleValueDisplayComponent,
+                 'row': 1, 'col': 0,
+                 'config': {
+                    'label': 'Current Mag X', 'data_type': 'mag_x',
+                    'format': '{:.1f}', 'units': 'µT',
+                    'enable_logging': True # Log this specific value as well
+                }
+            }
         ]
     }
 ]
@@ -604,7 +1800,7 @@ class GuiManager:
                 grid_layout.addWidget(empty_label, 0, 0)
             else:
                 # Instantiate and place components
-                for comp_def in component_layout_defs:
+                for comp_index, comp_def in enumerate(component_layout_defs): # Added comp_index for unique IDs if needed
                     comp_class: Type[BaseGuiComponent] = comp_def.get('component_class')
                     config = comp_def.get('config', {})
                     row = comp_def.get('row', 0)
@@ -623,12 +1819,15 @@ class GuiManager:
                     try:
                         # Instantiate the component
                         component_instance = comp_class(config, self.data_buffers_ref, self.device_config_ref)
+                        component_instance.tab_index = tab_index # <<< Set the tab index for the component
                         self.all_components.append(component_instance)
 
                         # Add the component's widget to the grid
                         widget_to_add = component_instance.get_widget()
                         grid_layout.addWidget(widget_to_add, row, col, rowspan, colspan)
-                        logger.debug(f"Added component {comp_class.__name__} to tab '{tab_title}' at ({row}, {col})")
+                        log_status = "LOGGING ENABLED" if component_instance.is_loggable else "logging disabled"
+                        logger.debug(f"Added component {comp_class.__name__} to tab '{tab_title}' at ({row}, {col}) - {log_status}")
+
 
                     except Exception as e:
                         logger.error(f"Failed to instantiate/add component {comp_class.__name__} in tab '{tab_title}': {e}", exc_info=True)
@@ -799,13 +1998,15 @@ async def find_device(device_config_current: DeviceConfig) -> Optional[BleakClie
         logger.debug("Executing scanner stop block...")
         if 'scanner' in locals() and scanner is not None:
             try:
-                logger.info(f"Attempting to stop scanner {scanner}...")
-                await scanner.stop()
-                logger.info(f"Scanner stop command issued for {scanner}.")
+                # Scanner stop logic was sometimes unreliable or slow; removed explicit stop call.
+                # Relying on context management or garbage collection, potentially check Bleak docs.
+                # await scanner.stop() # Stop call removed for potential improvement, monitor behavior.
+                logger.info(f"Scanner stop process skipped or handled implicitly for {scanner}.")
             except Exception as e:
-                logger.warning(f"Error encountered while stopping scanner: {e}", exc_info=False)
+                logger.warning(f"Error encountered during explicit scanner stop attempt: {e}", exc_info=False)
         else:
             logger.debug("Scanner object not found or is None in finally block, skipping stop.")
+
 
     if scan_cancelled: raise asyncio.CancelledError
     return target_device
@@ -1448,9 +2649,9 @@ class MainWindow(QMainWindow):
         self.capture_timestamp = None
 
 
-    # --- PGF Generation (Uses tab_configs for structure, GuiManager for missing UUIDs) ---
+    # --- PGF Generation (Uses GuiManager components, checks UUIDs) ---
     def generate_pgf_plots_from_buffer(self, pgf_dir: str, capture_start_relative_time: float):
-        global data_buffers, tab_configs # Use new tab_configs
+        global data_buffers # Uses data_buffers
 
         logger.info(f"Generating PGF plots (t=0 at capture start, t_offset={capture_start_relative_time:.3f}s). Dir: {pgf_dir}")
         if not data_buffers: logger.warning("Data buffer empty, skipping PGF generation."); return
@@ -1464,70 +2665,72 @@ class MainWindow(QMainWindow):
             plt.rcParams.update({'figure.figsize': [6.0, 4.0]})
 
         gen_success = False
-        # Iterate through the new tab_configs structure
-        for tab_config in tab_configs:
-            for comp_def in tab_config.get('layout', []):
-                # Only process components that are TimeSeriesPlotComponent
-                if comp_def.get('component_class') != TimeSeriesPlotComponent:
-                    continue
+        # Iterate through components managed by GuiManager
+        for component in self.gui_manager.all_components:
+            # Only generate PGF for TimeSeriesPlotComponent instances
+            if not isinstance(component, TimeSeriesPlotComponent):
+                continue
 
-                plot_config = comp_def.get('config', {}) # Get the config for this plot instance
-                plot_title = plot_config.get('title', 'UntitledPlot')
-                datasets = plot_config.get('datasets', [])
-                if not datasets: continue
+            plot_config = component.config # Get the config for this plot instance
+            plot_title = plot_config.get('title', 'UntitledPlot')
+            datasets = plot_config.get('datasets', [])
+            if not datasets: continue
 
-                # Check if any required UUIDs for *this plot* were missing during connection
-                required_uuids_for_plot = set()
-                for ds in datasets:
-                    uuid = self.gui_manager.device_config_ref.get_uuid_for_data_type(ds['data_type'])
-                    if uuid: required_uuids_for_plot.add(uuid)
+            # Check if any required UUIDs for *this plot* were missing during connection
+            required_uuids_for_plot = set()
+            required_types = component.get_required_data_types()
+            for dtype in required_types:
+                uuid = self.gui_manager.device_config_ref.get_uuid_for_data_type(dtype)
+                if uuid: required_uuids_for_plot.add(uuid)
 
-                # Use the currently stored missing UUIDs from GuiManager
-                missing_uuids_for_this_plot = required_uuids_for_plot.intersection(self.gui_manager.active_missing_uuids)
+            # Use the currently stored missing UUIDs from GuiManager
+            missing_uuids_for_this_plot = required_uuids_for_plot.intersection(self.gui_manager.active_missing_uuids)
 
-                if missing_uuids_for_this_plot:
-                    logger.warning(f"Skipping PGF for '{plot_title}' as it depends on missing UUID(s): {missing_uuids_for_this_plot}")
-                    continue # Skip this plot
+            if missing_uuids_for_this_plot:
+                logger.warning(f"Skipping PGF for plot '{plot_title}' as it depends on missing UUID(s): {missing_uuids_for_this_plot}")
+                continue # Skip this plot
 
-                # --- Plotting logic (same as before) ---
-                fig, ax = plt.subplots()
-                ax.set_title(plot_config.get('title', 'Plot'));
-                ax.set_xlabel(plot_config.get('xlabel', 'Time [s]'));
-                ax.set_ylabel(plot_config.get('ylabel', 'Value'))
-                plot_created = False
-                for dataset in datasets:
-                    data_type = dataset['data_type']
-                    if data_type in data_buffers and data_buffers[data_type]:
-                        full_data = data_buffers[data_type]
-                        # Filter data based on capture start time *relative to session start*
-                        plot_data = [(item[0] - capture_start_relative_time, item[1])
-                                     for item in full_data if item[0] >= capture_start_relative_time]
-                        if plot_data:
-                            try:
-                                times_rel_capture = [p[0] for p in plot_data]
-                                values = [p[1] for p in plot_data]
-                                ax.plot(times_rel_capture, values, label=dataset.get('label', data_type), color=dataset.get('color', 'k'), linewidth=1.2)
-                                plot_created = True
-                            except Exception as plot_err: logger.error(f"Error plotting {data_type} for PGF '{plot_title}': {plot_err}")
+            # --- Plotting logic (using component's config) ---
+            fig, ax = plt.subplots()
+            ax.set_title(plot_config.get('title', 'Plot'));
+            ax.set_xlabel(plot_config.get('xlabel', 'Time [s]'));
+            ax.set_ylabel(plot_config.get('ylabel', 'Value'))
+            plot_created = False
+            for dataset in datasets:
+                data_type = dataset['data_type']
+                if data_type in data_buffers and data_buffers[data_type]:
+                    full_data = data_buffers[data_type]
+                    # Filter data based on capture start time *relative to session start*
+                    plot_data = [(item[0] - capture_start_relative_time, item[1])
+                                    for item in full_data if item[0] >= capture_start_relative_time]
+                    if plot_data:
+                        try:
+                            times_rel_capture = [p[0] for p in plot_data]
+                            values = [p[1] for p in plot_data]
+                            ax.plot(times_rel_capture, values, label=dataset.get('label', data_type), color=dataset.get('color', 'k'), linewidth=1.2)
+                            plot_created = True
+                        except Exception as plot_err: logger.error(f"Error plotting {data_type} for PGF '{plot_title}': {plot_err}")
 
-                if plot_created:
-                    ax.legend(); ax.grid(True, linestyle='--', alpha=0.6); fig.tight_layout(pad=0.5)
-                    safe_title = "".join(c if c.isalnum() or c in (' ', '_', '-') else '_' for c in plot_title).rstrip().replace(' ', '_')
-                    prefix = f"{self.capture_timestamp}_" if self.capture_timestamp else ""
-                    pgf_filename = f"{prefix}{safe_title}.pgf"
-                    pgf_filepath = os.path.join(pgf_dir, pgf_filename)
-                    try: fig.savefig(pgf_filepath, bbox_inches='tight'); logger.info(f"Saved PGF: {pgf_filename}"); gen_success = True
-                    except Exception as save_err: logger.error(f"Error saving PGF {pgf_filename}: {save_err}"); raise RuntimeError(f"Save PGF failed: {save_err}") from save_err
-                else: logger.info(f"Skipping PGF '{plot_title}' (no data in capture window).")
-                plt.close(fig) # Close the figure to release memory
+            if plot_created:
+                ax.legend(); ax.grid(True, linestyle='--', alpha=0.6); fig.tight_layout(pad=0.5)
+                # Use the plot component's method to get a safe filename suffix
+                safe_suffix = component.get_log_filename_suffix() # This is already cleaned
+                prefix = f"{self.capture_timestamp}_" if self.capture_timestamp else ""
+                # Adjust filename to use the suffix from component
+                pgf_filename = f"{prefix}{safe_suffix}.pgf"
+                pgf_filepath = os.path.join(pgf_dir, pgf_filename)
+                try: fig.savefig(pgf_filepath, bbox_inches='tight'); logger.info(f"Saved PGF: {pgf_filename}"); gen_success = True
+                except Exception as save_err: logger.error(f"Error saving PGF {pgf_filename}: {save_err}"); raise RuntimeError(f"Save PGF failed: {save_err}") from save_err
+            else: logger.info(f"Skipping PGF '{plot_title}' (no data in capture window).")
+            plt.close(fig) # Close the figure to release memory
 
         if gen_success: logger.info(f"PGF generation finished. Dir: {pgf_dir}")
-        else: logger.warning("PGF done, but no plots saved (no data / missing UUIDs?).")
+        else: logger.warning("PGF done, but no plots saved (no data / missing UUIDs / no plot components?).")
 
 
-    # --- CSV Generation (Uses tab_configs, GuiManager for missing UUIDs) ---
+    # --- CSV Generation (NEW logic for any loggable component) ---
     def generate_csv_files_from_buffer(self, csv_dir: str, filter_start_rel_time: float, filter_end_rel_time: float, time_offset: float):
-        global data_buffers, tab_configs # Use new tab_configs
+        global data_buffers # Uses data_buffers and GuiManager components
 
         logger.info(f"Generating CSVs (data {filter_start_rel_time:.3f}s-{filter_end_rel_time:.3f}s rel session, t=0 at capture start offset={time_offset:.3f}s). Dir: {csv_dir}")
         if not data_buffers: logger.warning("Data buffer empty, skipping CSV generation."); return
@@ -1551,71 +2754,84 @@ class MainWindow(QMainWindow):
                          logger.error(f"Error creating Pandas Series for {dt}: {e}")
              return None # Return None if no data in range or buffer empty/missing
 
+        # --- Generate Individual CSV per Loggable Component ---
+        indiv_gen = False
+        for component in self.gui_manager.all_components:
+            if not component.is_loggable:
+                continue # Skip components not marked for logging
+
+            loggable_data_types = component.get_loggable_data_types()
+            log_filename_suffix = component.get_log_filename_suffix()
+
+            if not loggable_data_types or not log_filename_suffix:
+                logger.warning(f"Skipping individual CSV for component {type(component).__name__} (ID: {id(component)}): No loggable types or filename suffix.")
+                continue
+
+            logger.info(f"Processing Individual CSV for component: {log_filename_suffix}")
+
+            # Get only series relevant to this specific component
+            series_list = [s for dt in sorted(list(loggable_data_types)) if (s := get_series(dt, filter_start_rel_time, filter_end_rel_time)) is not None]
+            if not series_list:
+                logger.warning(f"Skipping Individual CSV '{log_filename_suffix}': No valid series data found in window or UUIDs missing.")
+                continue
+
+            try:
+                # Concatenate using the TimeRelSession index for alignment
+                component_df = pd.concat(series_list, axis=1, join='outer').sort_index()
+                # Insert adjusted time column (relative to capture start)
+                component_df.insert(0, 'Time (s)', component_df.index - time_offset)
+                prefix = f"{self.capture_timestamp}_" if self.capture_timestamp else ""
+                # Use the suffix provided by the component
+                csv_fname = f"{prefix}{log_filename_suffix}.csv"
+                csv_fpath = os.path.join(csv_dir, csv_fname)
+                component_df.to_csv(csv_fpath, index=False, float_format='%.6f') # Don't write the TimeRelSession index
+                logger.info(f"Saved Individual CSV: {csv_fname}"); indiv_gen = True
+            except Exception as e:
+                logger.error(f"Error generating Individual CSV '{log_filename_suffix}': {e}", exc_info=True)
+                raise RuntimeError(f"Individual CSV generation failed: {e}") from e
+
+        # --- Generate Master CSV per Tab ---
         master_gen = False
-        # Generate Master CSV per Tab
-        for tab_index, tab_config in enumerate(tab_configs):
+        for tab_index, tab_config in enumerate(self.gui_manager.tab_configs): # Iterate through original tab configs for structure
             tab_title = tab_config.get('tab_title', f"Tab_{tab_index}")
             logger.info(f"Processing Master CSV for tab: '{tab_title}'")
 
-            # Collect all unique data types used by TimeSeriesPlotComponents in this tab
-            tab_types = set()
-            for comp_def in tab_config.get('layout', []):
-                if comp_def.get('component_class') == TimeSeriesPlotComponent:
-                    plot_config = comp_def.get('config', {})
-                    for ds in plot_config.get('datasets', []):
-                        tab_types.add(ds['data_type'])
+            # Collect all unique *loggable* data types from *all* loggable components within this tab
+            tab_loggable_types = set()
+            components_in_tab = [comp for comp in self.gui_manager.all_components if comp.tab_index == tab_index and comp.is_loggable]
 
-            if not tab_types: logger.warning(f"Skipping Master CSV '{tab_title}': No plottable data types defined."); continue
+            if not components_in_tab:
+                 logger.warning(f"Skipping Master CSV '{tab_title}': No loggable components found in this tab."); continue
 
-            series_list = [s for dt in sorted(list(tab_types)) if (s := get_series(dt, filter_start_rel_time, filter_end_rel_time)) is not None]
-            if not series_list: logger.warning(f"Skipping Master CSV '{tab_title}': No valid series data found in window."); continue
+            for component in components_in_tab:
+                tab_loggable_types.update(component.get_loggable_data_types())
+
+            if not tab_loggable_types:
+                logger.warning(f"Skipping Master CSV '{tab_title}': No loggable data types found among loggable components in this tab."); continue
+
+            # Get series for all loggable types in this tab
+            series_list = [s for dt in sorted(list(tab_loggable_types)) if (s := get_series(dt, filter_start_rel_time, filter_end_rel_time)) is not None]
+            if not series_list:
+                logger.warning(f"Skipping Master CSV '{tab_title}': No valid series data found for loggable types in window or UUIDs missing."); continue
 
             try:
                 # Concatenate using the TimeRelSession index for alignment
                 master_df = pd.concat(series_list, axis=1, join='outer').sort_index()
                 # Insert the adjusted time column (relative to capture start)
                 master_df.insert(0, 'Master Time (s)', master_df.index - time_offset)
-                safe_t_title = "".join(c if c.isalnum() or c in (' ', '_', '-') else '_' for c in tab_title).rstrip().replace(' ', '_')
+                safe_t_title = re.sub(r'[^\w\-]+', '_', tab_title).strip('_')
                 prefix = f"{self.capture_timestamp}_" if self.capture_timestamp else ""
                 csv_fname = f"{prefix}master_tab_{safe_t_title}.csv"
                 csv_fpath = os.path.join(csv_dir, csv_fname)
                 master_df.to_csv(csv_fpath, index=False, float_format='%.6f') # Don't write the TimeRelSession index
                 logger.info(f"Saved Master CSV: {csv_fname}"); master_gen = True
-            except Exception as e: logger.error(f"Error generating Master CSV '{tab_title}': {e}", exc_info=True); raise RuntimeError(f"Master CSV generation failed: {e}") from e
+            except Exception as e:
+                logger.error(f"Error generating Master CSV '{tab_title}': {e}", exc_info=True)
+                raise RuntimeError(f"Master CSV generation failed: {e}") from e
 
-        indiv_gen = False
-        # Generate Individual CSV per Plot Component
-        for tab_index, tab_config in enumerate(tab_configs):
-             for comp_index, comp_def in enumerate(tab_config.get('layout', [])):
-                # Only process components that are TimeSeriesPlotComponent
-                if comp_def.get('component_class') != TimeSeriesPlotComponent:
-                    continue
-
-                plot_config = comp_def.get('config', {})
-                plot_title = plot_config.get('title', f"Tab{tab_index}_Plot{comp_index}")
-                datasets = plot_config.get('datasets', [])
-                if not datasets: logger.warning(f"Skipping Individual CSV '{plot_title}': No datasets defined."); continue
-
-                logger.info(f"Processing Individual CSV for plot: '{plot_title}'")
-
-                # Get only series relevant to this specific plot
-                series_list = [s for ds in datasets if (s := get_series(ds['data_type'], filter_start_rel_time, filter_end_rel_time)) is not None]
-                if not series_list: logger.warning(f"Skipping Individual CSV '{plot_title}': No valid series data found in window."); continue
-
-                try:
-                    plot_df = pd.concat(series_list, axis=1, join='outer').sort_index()
-                    # Insert adjusted time column
-                    plot_df.insert(0, 'Time (s)', plot_df.index - time_offset)
-                    safe_p_title = "".join(c if c.isalnum() or c in (' ', '_', '-') else '_' for c in plot_title).rstrip().replace(' ', '_')
-                    prefix = f"{self.capture_timestamp}_" if self.capture_timestamp else ""
-                    csv_fname = f"{prefix}plot_{safe_p_title}.csv"
-                    csv_fpath = os.path.join(csv_dir, csv_fname)
-                    plot_df.to_csv(csv_fpath, index=False, float_format='%.6f') # Don't write the TimeRelSession index
-                    logger.info(f"Saved Individual CSV: {csv_fname}"); indiv_gen = True
-                except Exception as e: logger.error(f"Error generating Individual CSV '{plot_title}': {e}", exc_info=True); raise RuntimeError(f"Individual CSV generation failed: {e}") from e
 
         if master_gen or indiv_gen: logger.info(f"CSV generation finished. Dir: {csv_dir}")
-        else: logger.warning("CSV generation done, but no files were saved (no valid data in window?).")
+        else: logger.warning("CSV generation done, but no files were saved (no loggable components / no valid data?).")
 
 
     # --- Clear GUI Action ---
@@ -1673,6 +2889,7 @@ class MainWindow(QMainWindow):
 
     # --- Toggle Data Logging ---
     def toggle_data_log(self, check_state_value):
+        # Qt6: Pass the integer value of the check state enum
         is_checked = (check_state_value == Qt.CheckState.Checked.value)
         if is_checked:
             data_console_handler.setLevel(logging.INFO)
