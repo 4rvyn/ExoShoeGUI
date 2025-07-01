@@ -2078,147 +2078,113 @@ tab_configs = [
             }
         ]
     }
-
-
 ]
+
 
 #####################################################################################################################
 # End of customizable section
 #####################################################################################################################
-
+# DONT CHANGE ANYTHING BELOW THIS LINE UNLESS YOU KNOW WHAT YOU'RE DOING
 
 # --- GUI Manager ---
 class GuiManager:
     #Manages the creation, layout, and updating of GUI components across tabs.
+
     def __init__(self, tab_widget: QTabWidget, tab_configs: List[Dict], data_buffers_ref: Dict[str, List[Tuple[float, float]]], device_config_ref: DeviceConfig):
         self.tab_widget = tab_widget
         self.tab_configs = tab_configs
         self.data_buffers_ref = data_buffers_ref
         self.device_config_ref = device_config_ref
-        self.all_components: List[BaseGuiComponent] = [] # Flat list of all instantiated components
-        self.active_missing_uuids: Set[str] = set() # Overall set of missing UUIDs
-
+        self.all_components: List[BaseGuiComponent] = []
+        self.active_missing_uuids: Set[str] = set()
         self.create_gui_layout()
 
     def create_gui_layout(self):
-        # Creates tabs and places components based on tab_configs.
         for tab_index, tab_config in enumerate(self.tab_configs):
             tab_title = tab_config.get('tab_title', f'Tab {tab_index + 1}')
             component_layout_defs = tab_config.get('layout', [])
-
-            # Create the content widget and grid layout for the tab
             tab_content_widget = QWidget()
             grid_layout = QGridLayout(tab_content_widget)
-
             if not component_layout_defs:
-                # Handle empty tab definition
                 empty_label = QLabel(f"No components configured for '{tab_title}'")
                 empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 grid_layout.addWidget(empty_label, 0, 0)
             else:
-                # Instantiate and place components
-                for comp_index, comp_def in enumerate(component_layout_defs): # Added comp_index for unique IDs if needed
+                for comp_index, comp_def in enumerate(component_layout_defs):
                     comp_class: Type[BaseGuiComponent] = comp_def.get('component_class')
                     config = comp_def.get('config', {})
                     row = comp_def.get('row', 0)
                     col = comp_def.get('col', 0)
                     rowspan = comp_def.get('rowspan', 1)
                     colspan = comp_def.get('colspan', 1)
-
                     if not comp_class or not issubclass(comp_class, BaseGuiComponent):
                         logger.error(f"Invalid or missing 'component_class' in tab '{tab_title}', row {row}, col {col}. Skipping.")
-                        # Optionally add a placeholder error widget
                         error_widget = QLabel(f"Error:\nInvalid Component\n(Row {row}, Col {col})")
                         error_widget.setStyleSheet("QLabel { color: red; border: 1px solid red; }")
                         grid_layout.addWidget(error_widget, row, col, rowspan, colspan)
                         continue
-
                     try:
-                        # Instantiate the component
                         component_instance = comp_class(config, self.data_buffers_ref, self.device_config_ref)
-                        component_instance.tab_index = tab_index # <<< Set the tab index for the component
+                        component_instance.tab_index = tab_index
                         self.all_components.append(component_instance)
-
-                        # Add the component's widget to the grid
                         widget_to_add = component_instance.get_widget()
                         grid_layout.addWidget(widget_to_add, row, col, rowspan, colspan)
                         log_status = "LOGGING ENABLED" if component_instance.is_loggable else "logging disabled"
                         logger.debug(f"Added component {comp_class.__name__} to tab '{tab_title}' at ({row}, {col}) - {log_status}")
-
-
                     except Exception as e:
                         logger.error(f"Failed to instantiate/add component {comp_class.__name__} in tab '{tab_title}': {e}", exc_info=True)
-                        # Add a placeholder error widget
                         error_widget = QLabel(f"Error:\n{comp_class.__name__}\nFailed to load\n(Row {row}, Col {col})")
                         error_widget.setStyleSheet("QLabel { color: red; border: 1px solid red; }")
                         grid_layout.addWidget(error_widget, row, col, rowspan, colspan)
-
-
-            # Make the grid layout the layout for the content widget
             tab_content_widget.setLayout(grid_layout)
-
-            # Add the content widget (potentially within a scroll area) to the tab widget
-            # Decide if scroll area is needed (e.g., based on total component size hint?) - simple approach: always use scroll area
             scroll_area = QScrollArea()
             scroll_area.setWidgetResizable(True)
             scroll_area.setWidget(tab_content_widget)
             self.tab_widget.addTab(scroll_area, tab_title)
 
-
     def update_all_components(self, current_relative_time: float, is_flowing: bool):
-        # Calls the update method on all managed components.
-        if plotting_paused or start_time is None: # Check global pause state here
+        if plotting_paused or start_time is None:
             return
         for component in self.all_components:
             try:
                 component.update_component(current_relative_time, is_flowing)
             except Exception as e:
                 logger.error(f"Error updating component {type(component).__name__}: {e}", exc_info=True)
-                # Optionally disable the component or show an error state visually
 
     def clear_all_components(self):
-        # Calls the clear method on all managed components.
         logger.info("GuiManager clearing all components.")
-        self.active_missing_uuids.clear() # Clear overall missing UUID state
+        self.active_missing_uuids.clear()
         for component in self.all_components:
             try:
                 component.clear_component()
-                # Also reset any missing UUID state within the component itself
                 component.handle_missing_uuids(set())
             except Exception as e:
                 logger.error(f"Error clearing component {type(component).__name__}: {e}", exc_info=True)
 
     def notify_missing_uuids(self, missing_uuids_set: Set[str]):
-        # Receives the set of all missing UUIDs and notifies relevant components.
         logger.info(f"GuiManager received missing UUIDs: {missing_uuids_set if missing_uuids_set else 'None'}")
         self.active_missing_uuids = missing_uuids_set
-
         for component in self.all_components:
             required_types = component.get_required_data_types()
             if not required_types:
-                continue # Component doesn't need data, skip UUID check
-
+                continue
             relevant_missing_uuids_for_comp = set()
             for data_type in required_types:
                 uuid = self.device_config_ref.get_uuid_for_data_type(data_type)
                 if uuid and uuid in self.active_missing_uuids:
                     relevant_missing_uuids_for_comp.add(uuid)
-
             try:
-                # Pass only the UUIDs that are *both* required by the component *and* missing overall
                 component.handle_missing_uuids(relevant_missing_uuids_for_comp)
             except Exception as e:
                  logger.error(f"Error notifying component {type(component).__name__} about missing UUIDs: {e}", exc_info=True)
-
 
 # --- Bluetooth Protocol Handling ---
 class GuiSignalEmitter(QObject):
     state_change_signal = pyqtSignal(str)
     scan_throbber_signal = pyqtSignal(str)
     connection_status_signal = pyqtSignal(str)
-    show_error_signal = pyqtSignal(str, str) # title, message
-    # Signal to emit the set of missing UUIDs
-    missing_uuids_signal = pyqtSignal(set) # Emits set[str]
+    show_error_signal = pyqtSignal(str, str)
+    missing_uuids_signal = pyqtSignal(set)
 
     def emit_state_change(self, new_state):
         self.state_change_signal.emit(new_state)
@@ -2235,11 +2201,11 @@ class GuiSignalEmitter(QObject):
     def emit_missing_uuids(self, missing_set: set):
         self.missing_uuids_signal.emit(missing_set)
 
-
 gui_emitter = GuiSignalEmitter()
 
 def disconnected_callback(client_instance: BleakClient) -> None:
     logger.info(f"Device {client_instance.address} disconnected (detected by Bleak). Setting disconnected_event.")
+    loop = asyncio.get_event_loop()
     if loop and loop.is_running():
         loop.call_soon_threadsafe(disconnected_event.set)
     else:
@@ -2250,29 +2216,23 @@ async def notification_handler(char_config: CharacteristicConfig, sender: int, d
     last_received_time = time.time()
     values = char_config.handler(data)
     if not values: return
-
     current_time_dt = datetime.datetime.now()
     if start_time is None:
         start_time = current_time_dt
         logger.info(f"First data received. Setting session start time: {start_time}")
-
     relative_time = (current_time_dt - start_time).total_seconds()
-
     for key, value in values.items():
         if key not in data_buffers:
-            data_buffers[key] = [] # Use list, deque not strictly necessary here unless very high frequency/long runs
+            data_buffers[key] = []
         data_buffers[key].append((relative_time, value))
 
-async def find_device(device_config_current: DeviceConfig) -> Optional[BleakClient]: # Use current config
-    """Finds the target device using BleakScanner."""
+async def find_device(device_config_current: DeviceConfig) -> Optional[BleakClient]:
     found_event = asyncio.Event()
     target_device = None
     scan_cancelled = False
-
     def detection_callback(device, advertisement_data):
         nonlocal target_device, found_event
         if not found_event.is_set():
-            # Use name and service UUID from the *current* device_config object
             target_service_lower = device_config_current.service_uuid.lower()
             advertised_uuids_lower = [u.lower() for u in advertisement_data.service_uuids]
             device_name = getattr(device, 'name', None)
@@ -2282,18 +2242,18 @@ async def find_device(device_config_current: DeviceConfig) -> Optional[BleakClie
                 logger.info(f"Match found and event SET for: {device.name} ({device.address})")
             elif device_name and device_config_current.name and device_name.lower() == device_config_current.name.lower():
                  logger.debug(f"Found name match '{device_name}' but service UUID mismatch. Adv: {advertised_uuids_lower}, Target: {target_service_lower}")
-
+    
     scanner = BleakScanner(
         detection_callback=detection_callback,
-        service_uuids=[device_config_current.service_uuid] # Use current service UUID
+        service_uuids=[device_config_current.service_uuid]
     )
+
     logger.info(f"Starting scanner for {device_config_current.name} (Service: {device_config_current.service_uuid})...")
     gui_emitter.emit_scan_throbber("Scanning...")
-
     try:
         await scanner.start()
         try:
-            await asyncio.wait_for(found_event.wait(), timeout=device_config_current.find_timeout) # Use current timeout
+            await asyncio.wait_for(found_event.wait(), timeout=device_config_current.find_timeout)
             if target_device:
                 logger.info(f"Device found event confirmed for {target_device.name}")
             else:
@@ -2313,35 +2273,29 @@ async def find_device(device_config_current: DeviceConfig) -> Optional[BleakClie
          target_device = None
     finally:
         logger.debug("Executing scanner stop block...")
-        if 'scanner' in locals() and scanner is not None:
+        if scanner is not None: 
             try:
-                # Scanner stop logic was sometimes unreliable or slow; removed explicit stop call.
-                # Relying on context management or garbage collection, potentially check Bleak docs.
-                # await scanner.stop() # Stop call removed for potential improvement, monitor behavior.
-                logger.info(f"Scanner stop process skipped or handled implicitly for {scanner}.")
+                await scanner.stop()
+                logger.info(f"Scanner stopped for {device_config_current.name}.")
+            except BleakError as e: 
+                logger.warning(f"BleakError stopping scanner: {e}")
             except Exception as e:
-                logger.warning(f"Error encountered during explicit scanner stop attempt: {e}", exc_info=False)
+                logger.warning(f"Error encountered during explicit scanner stop: {e}", exc_info=False)
         else:
-            logger.debug("Scanner object not found or is None in finally block, skipping stop.")
-
+            logger.debug("Scanner object was None in finally block, skipping stop.")
 
     if scan_cancelled: raise asyncio.CancelledError
     return target_device
 
-
 async def connection_task():
-    global client, last_received_time, state, device_config # Access global device_config
-    # Keep track of characteristics we successfully subscribe to
+    global client, last_received_time, state, device_config, stop_flag
     found_char_configs: List[CharacteristicConfig] = []
-
-    while state == "scanning":
+    while state == "scanning" and not stop_flag: 
         target_device = None
-        found_char_configs = [] # Reset for each connection attempt cycle
-        # --- Use the *current* global device_config state ---
+        found_char_configs = []
         current_device_config = device_config
-        # ----------------------------------------------------
         try:
-            target_device = await find_device(current_device_config) # Pass the current config
+            target_device = await find_device(current_device_config)
         except asyncio.CancelledError:
             logger.info("connection_task: Scan was cancelled.")
             break
@@ -2350,6 +2304,8 @@ async def connection_task():
             gui_emitter.emit_show_error("Scan Error", f"Scan failed: {e}")
             await asyncio.sleep(3)
             continue
+        
+        if stop_flag: break 
 
         if not target_device:
             if state == "scanning":
@@ -2360,15 +2316,13 @@ async def connection_task():
             else:
                  logger.info("Scan stopped while waiting for device.")
                  break
-
         gui_emitter.emit_connection_status(f"Found {current_device_config.name}. Connecting...")
         client = None
         connection_successful = False
         for attempt in range(3):
-             if state != "scanning": logger.info("Connection attempt aborted, state changed."); break
+             if state != "scanning" or stop_flag: logger.info("Connection attempt aborted, state changed or stop_flag set."); break
              try:
                   logger.info(f"Connecting (attempt {attempt + 1})...")
-                  # Pass disconnected_callback here
                   client = BleakClient(target_device, disconnected_callback=disconnected_callback)
                   await client.connect(timeout=10.0)
                   logger.info("Connected successfully")
@@ -2382,10 +2336,12 @@ async def connection_task():
                       except Exception as disconnect_err: logger.warning(f"Error during disconnect after failed connection: {disconnect_err}")
                   client = None
                   if attempt < 2: await asyncio.sleep(2)
+        
+        if stop_flag: break 
 
         if not connection_successful:
              logger.error("Max connection attempts reached or connection aborted.")
-             gui_emitter.emit_missing_uuids(set()) # Ensure GUI resets if connection fails
+             gui_emitter.emit_missing_uuids(set())
              if state == "scanning":
                  logger.info("Retrying scan...")
                  gui_emitter.emit_scan_throbber("Connection failed. Retrying scan...")
@@ -2394,180 +2350,164 @@ async def connection_task():
              else:
                  logger.info("Exiting connection task as state is no longer 'scanning'.")
                  break
-
-        # --- *** CHARACTERISTIC DISCOVERY AND NOTIFICATION START *** ---
         notification_errors = False
         missing_uuids = set()
         try:
-            # Use the service UUID from the config used for *this* connection attempt
             logger.info(f"Checking characteristics for service {current_device_config.service_uuid}...")
-            service = client.services.get_service(current_device_config.service_uuid)
-            if not service:
-                 logger.error(f"Service {current_device_config.service_uuid} not found on connected device.")
-                 gui_emitter.emit_show_error("Connection Error", f"Service UUID\n{current_device_config.service_uuid}\nnot found on device.")
-                 gui_emitter.emit_state_change("disconnecting") # Treat as fatal error for this connection
-                 notification_errors = True # Skip notification attempts
+            if not client or not client.is_connected:
+                logger.error("Client not available or not connected before characteristic check.")
+                gui_emitter.emit_state_change("disconnecting")
+                notification_errors = True
             else:
-                 logger.info("Service found. Checking configured characteristics...")
-                 found_char_configs = [] # Reset list for this successful connection
-                 # Use characteristics from the config used for *this* connection attempt
-                 for char_config in current_device_config.characteristics:
-                     bleak_char = service.get_characteristic(char_config.uuid)
-                     if bleak_char:
-                         logger.info(f"Characteristic found: {char_config.uuid}")
-                         if "notify" in bleak_char.properties or "indicate" in bleak_char.properties:
-                             found_char_configs.append(char_config)
-                         else:
-                             logger.warning(f"Characteristic {char_config.uuid} found but does not support notify/indicate.")
-                             missing_uuids.add(char_config.uuid)
-                     else:
-                         logger.warning(f"Characteristic NOT FOUND: {char_config.uuid}")
-                         missing_uuids.add(char_config.uuid)
-
-                 # Emit the set of missing UUIDs to the GUI
-                 gui_emitter.emit_missing_uuids(missing_uuids)
-
-                 if not found_char_configs:
-                      logger.error("No usable (found and notifiable) characteristics from config. Disconnecting.")
-                      gui_emitter.emit_show_error("Connection Error", "None of the configured characteristics\nwere found or support notifications.")
-                      gui_emitter.emit_state_change("disconnecting")
-                      notification_errors = True
-                 else:
-                    logger.info(f"Starting notifications for {len(found_char_configs)} found characteristics...")
-                    notify_tasks = []
-                    for char_config in found_char_configs: # Iterate through FOUND characteristics
-                        handler_with_char = partial(notification_handler, char_config)
-                        notify_tasks.append(client.start_notify(char_config.uuid, handler_with_char))
-
-                    results = await asyncio.gather(*notify_tasks, return_exceptions=True)
-                    all_notifications_started = True
-                    for i, result in enumerate(results):
-                        if isinstance(result, Exception):
-                            char_uuid = found_char_configs[i].uuid # Use the correct list here
-                            logger.error(f"Failed to start notification for {char_uuid}: {result}")
-                            all_notifications_started = False; notification_errors = True
-                            missing_uuids.add(char_uuid) # Add to missing if start_notify failed
-
-                    if not all_notifications_started:
-                        logger.error("Could not start all required notifications. Disconnecting.")
-                        gui_emitter.emit_missing_uuids(missing_uuids) # Update GUI with newly failed ones
+                service = client.services.get_service(current_device_config.service_uuid)
+                if not service:
+                    logger.error(f"Service {current_device_config.service_uuid} not found on connected device.")
+                    gui_emitter.emit_show_error("Connection Error", f"Service UUID\n{current_device_config.service_uuid}\nnot found on device.")
+                    gui_emitter.emit_state_change("disconnecting")
+                    notification_errors = True
+                else:
+                    logger.info("Service found. Checking configured characteristics...")
+                    found_char_configs = []
+                    for char_config in current_device_config.characteristics:
+                        bleak_char = service.get_characteristic(char_config.uuid)
+                        if bleak_char:
+                            logger.info(f"Characteristic found: {char_config.uuid}")
+                            if "notify" in bleak_char.properties or "indicate" in bleak_char.properties:
+                                found_char_configs.append(char_config)
+                            else:
+                                logger.warning(f"Characteristic {char_config.uuid} found but does not support notify/indicate.")
+                                missing_uuids.add(char_config.uuid)
+                        else:
+                            logger.warning(f"Characteristic NOT FOUND: {char_config.uuid}")
+                            missing_uuids.add(char_config.uuid)
+                    gui_emitter.emit_missing_uuids(missing_uuids)
+                    if not found_char_configs:
+                        logger.error("No usable (found and notifiable) characteristics from config. Disconnecting.")
+                        gui_emitter.emit_show_error("Connection Error", "None of the configured characteristics\nwere found or support notifications.")
                         gui_emitter.emit_state_change("disconnecting")
+                        notification_errors = True
                     else:
-                        logger.info("Notifications started successfully. Listening...")
-                        last_received_time = time.time()
-                        disconnected_event.clear()
-                        while state == "connected":
-                             try:
-                                 # Use data timeout from the config used for *this* connection
-                                 await asyncio.wait_for(disconnected_event.wait(), timeout=current_device_config.data_timeout + 1.0)
-                                 logger.info("Disconnected event received while listening.")
-                                 gui_emitter.emit_state_change("disconnecting")
-                                 break
-                             except asyncio.TimeoutError:
-                                 current_time = time.time()
-                                 # Use data timeout from the config used for *this* connection
-                                 if current_time - last_received_time > current_device_config.data_timeout:
-                                     logger.warning(f"No data received for {current_time - last_received_time:.1f}s (timeout: {current_device_config.data_timeout}s). Assuming disconnect.")
-                                     gui_emitter.emit_state_change("disconnecting")
-                                     break
-                                 else: continue # Continue listening
-                             except asyncio.CancelledError:
-                                 logger.info("Listening loop cancelled.")
-                                 gui_emitter.emit_state_change("disconnecting"); raise
-                             except Exception as e:
-                                 logger.error(f"Error during notification listening loop: {e}")
-                                 gui_emitter.emit_state_change("disconnecting"); notification_errors = True; break
-
-
+                        logger.info(f"Starting notifications for {len(found_char_configs)} found characteristics...")
+                        notify_tasks = []
+                        for char_config in found_char_configs:
+                            handler_with_char = partial(notification_handler, char_config)
+                            if client and client.is_connected:
+                                notify_tasks.append(client.start_notify(char_config.uuid, handler_with_char))
+                            else:
+                                logger.error(f"Client disconnected before starting notify for {char_config.uuid}")
+                                notification_errors = True; break 
+                        
+                        if notification_errors: 
+                            gui_emitter.emit_state_change("disconnecting")
+                        else:
+                            results = await asyncio.gather(*notify_tasks, return_exceptions=True)
+                            all_notifications_started = True
+                            for i, result in enumerate(results):
+                                if isinstance(result, Exception):
+                                    char_uuid = found_char_configs[i].uuid
+                                    logger.error(f"Failed to start notification for {char_uuid}: {result}")
+                                    all_notifications_started = False; notification_errors = True
+                                    missing_uuids.add(char_uuid)
+                            if not all_notifications_started:
+                                logger.error("Could not start all required notifications. Disconnecting.")
+                                gui_emitter.emit_missing_uuids(missing_uuids)
+                                gui_emitter.emit_state_change("disconnecting")
+                            else:
+                                logger.info("Notifications started successfully. Listening...")
+                                last_received_time = time.time()
+                                disconnected_event.clear()
+                                while state == "connected" and not stop_flag: 
+                                    try:
+                                        await asyncio.wait_for(disconnected_event.wait(), timeout=0.2) 
+                                        logger.info("Disconnected event received while listening.")
+                                        gui_emitter.emit_state_change("disconnecting")
+                                        break
+                                    except asyncio.TimeoutError:
+                                        current_time = time.time()
+                                        if current_time - last_received_time > current_device_config.data_timeout:
+                                            logger.warning(f"No data received for {current_time - last_received_time:.1f}s (timeout: {current_device_config.data_timeout}s). Assuming disconnect.")
+                                            gui_emitter.emit_state_change("disconnecting")
+                                            break
+                                        if client and not client.is_connected:
+                                            logger.warning("Bleak client reported disconnected during listening loop.")
+                                            disconnected_event.set() 
+                                            gui_emitter.emit_state_change("disconnecting")
+                                            break
+                                        continue
+                                    except asyncio.CancelledError:
+                                        logger.info("Listening loop cancelled.")
+                                        gui_emitter.emit_state_change("disconnecting"); raise
+                                    except Exception as e:
+                                        logger.error(f"Error during notification listening loop: {e}")
+                                        gui_emitter.emit_state_change("disconnecting"); notification_errors = True; break
         except asyncio.CancelledError:
              logger.info("Notification setup or listening task was cancelled.")
              if state == "connected": gui_emitter.emit_state_change("disconnecting")
-        except Exception as e: # Catch BleakError and others
+        except Exception as e: 
              logger.error(f"Error during characteristic check or notification handling: {e}")
              gui_emitter.emit_state_change("disconnecting"); notification_errors = True
         finally:
             logger.info("Performing cleanup for connection task...")
-            local_client = client; client = None # Use local var for safety
-            stop_notify_errors = []
-            if local_client:
-                 is_conn = False
-                 try: is_conn = local_client.is_connected
-                 except Exception as check_err: logger.warning(f"Error checking client connection status during cleanup: {check_err}")
+            local_client_ref = client 
+            client = None 
 
-                 if is_conn:
-                      logger.info("Attempting to stop notifications and disconnect client...")
-                      try:
-                          stop_tasks = []
-                          # Iterate through FOUND characteristics only (using the list from this connection attempt)
-                          for char_config in found_char_configs:
-                              try:
-                                  # Use service UUID from the config active during *this* connection
-                                  service = local_client.services.get_service(current_device_config.service_uuid)
-                                  if service and service.get_characteristic(char_config.uuid):
-                                      logger.debug(f"Preparing stop_notify for {char_config.uuid}")
-                                      stop_tasks.append(local_client.stop_notify(char_config.uuid))
-                                  else: logger.debug(f"Characteristic {char_config.uuid} not found/unavailable during cleanup, skipping stop_notify.")
-                              except Exception as notify_stop_err: logger.warning(f"Error preparing stop_notify for {char_config.uuid}: {notify_stop_err}")
+            if local_client_ref:
+                is_conn_at_cleanup_start = False
+                try: is_conn_at_cleanup_start = local_client_ref.is_connected
+                except Exception as check_err: logger.warning(f"Error checking client connection status during cleanup: {check_err}")
 
-                          if stop_tasks:
-                               results = await asyncio.gather(*stop_tasks, return_exceptions=True)
-                               logger.info(f"Notifications stop attempts completed for {len(stop_tasks)} characteristics.")
-                               for i, result in enumerate(results):
-                                   if isinstance(result, Exception): logger.warning(f"Error stopping notification {i} ({found_char_configs[i].uuid}): {result}"); stop_notify_errors.append(result)
-                          else: logger.info("No notifications needed stopping or could be prepared.")
-                      except Exception as e: logger.warning(f"General error during stop_notify phase: {e}"); stop_notify_errors.append(e)
+                if is_conn_at_cleanup_start:
+                    logger.info("Attempting to stop notifications and disconnect client...")
+                    stop_notify_tasks = []
+                    for char_config in found_char_configs: 
+                        try:
+                            if local_client_ref.is_connected:
+                                logger.debug(f"Preparing stop_notify for {char_config.uuid}")
+                                stop_notify_tasks.append(local_client_ref.stop_notify(char_config.uuid))
+                            else:
+                                logger.debug(f"Client disconnected before stop_notify for {char_config.uuid}, skipping.")
+                                break 
+                        except Exception as prep_err:
+                            logger.warning(f"Error preparing stop_notify for {char_config.uuid}: {prep_err}")
+                    
+                    if stop_notify_tasks:
+                        try:
+                            results = await asyncio.gather(*stop_notify_tasks, return_exceptions=True)
+                            logger.info(f"Notifications stop attempts completed for {len(stop_notify_tasks)} characteristics.")
+                            for i, result in enumerate(results):
+                                if isinstance(result, Exception):
+                                    logger.warning(f"Error stopping notification {found_char_configs[i].uuid if i < len(found_char_configs) else 'unknown_uuid'}: {result}")
+                        except Exception as gather_err:
+                            logger.error(f"Error during asyncio.gather for stop_notify: {gather_err}")
 
-                      try:
-                          await asyncio.wait_for(local_client.disconnect(), timeout=5.0)
-                          if not stop_notify_errors: logger.info("Client disconnected.")
-                          else: logger.warning("Client disconnected, but errors occurred during notification cleanup.")
-                      except Exception as e: logger.error(f"Error during client disconnect: {e}")
-                 else: logger.info("Client object existed but was not connected during cleanup.")
-            else: logger.info("No active client object to cleanup.")
+                    
+                    try:
+                        if local_client_ref.is_connected:
+                            await asyncio.wait_for(local_client_ref.disconnect(), timeout=5.0)
+                            logger.info("Client disconnected.")
+                        else:
+                            logger.info("Client was already disconnected before explicit disconnect call in cleanup.")
+                    except asyncio.TimeoutError:
+                        logger.error("Timeout during client disconnect.")
+                    except Exception as e:
+                        logger.error(f"Error during client disconnect: {e}")
+                else:
+                    logger.info("Client object existed but was not connected at start of cleanup.")
+            else:
+                logger.info("No active client object to cleanup at start of finally block.")
 
-            # Reset missing UUIDs in GUI when disconnected or connection failed
             if state in ["connected", "disconnecting"] or not connection_successful:
                  gui_emitter.emit_missing_uuids(set())
-
-            if state in ["connected", "disconnecting"]:
+            if state in ["connected", "disconnecting"] and not stop_flag : 
                  logger.info("Signalling state change to idle after cleanup.")
                  gui_emitter.emit_state_change("idle")
-
+            
             disconnected_event.clear()
-            found_char_configs = [] # Clear the list specific to this attempt
-
-        # Check global state before looping back to scan
-        if state != "scanning":
-            logger.info(f"Exiting connection_task as state is '{state}'.")
+            found_char_configs = []
+        if state != "scanning" or stop_flag: 
+            logger.info(f"Exiting connection_task as state is '{state}' or stop_flag is set.")
             break
-
     logger.info("Connection task loop finished.")
-
-
-async def main_async():
-    """The main entry point for the asyncio part."""
-    global loop, current_task
-    loop = asyncio.get_running_loop()
-    logger.info("Asyncio loop running.")
-
-    while not stop_flag:
-        await asyncio.sleep(0.1) # Keep asyncio loop responsive
-
-    logger.info("Asyncio loop stopping (stop_flag is True).")
-
-    if current_task and not current_task.done():
-        logger.info("main_async: Waiting for connection_task cancellation/cleanup to complete...")
-        try:
-            await current_task # Wait for the task to finish its cleanup after cancellation
-            logger.info("main_async: connection_task completed its run after stop signal.")
-        except asyncio.CancelledError:
-            logger.info("main_async: connection_task finished handling cancellation.")
-        except Exception as e:
-            logger.error(f"main_async: Error occurred while awaiting connection_task finalization: {e}", exc_info=True)
-    else:
-        logger.info("main_async: No active connection_task or task already done upon exit.")
-
-    logger.info("main_async function finished.")
 
 
 # --- PyQt6 Main Application Window ---
@@ -2585,23 +2525,22 @@ class LEDWidget(QWidget):
         rect = self.rect(); diameter = min(rect.width(), rect.height()) - 4
         painter.drawEllipse(rect.center(), diameter // 2, diameter // 2)
 
-
 class MainWindow(QMainWindow):
-    # Signal to request an update (can be triggered by timer or other events)
+    # Signal to request an update
     request_plot_update_signal = pyqtSignal()
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Modular BLE Data GUI") # Updated title
+        self.setWindowTitle("Modular BLE Data GUI")
         self.setGeometry(100, 100, 1400, 950)
 
         # --- Capture State ---
+        self._shutting_down = False 
         self.is_capturing = False
         self.capture_start_relative_time: Optional[float] = None
         self.capture_t0_absolute: Optional[datetime.datetime] = None
         self.capture_output_base_dir: Optional[str] = None
         self.capture_timestamp: Optional[str] = None
-
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.main_layout = QVBoxLayout(self.central_widget)
@@ -2623,14 +2562,13 @@ class MainWindow(QMainWindow):
         self.scan_button = QPushButton("Start Scan"); self.scan_button.clicked.connect(self.toggle_scan); self.button_layout.addWidget(self.scan_button)
         self.pause_resume_button = QPushButton("Pause Plotting"); self.pause_resume_button.setEnabled(False); self.pause_resume_button.clicked.connect(self.toggle_pause_resume); self.button_layout.addWidget(self.pause_resume_button)
         self.capture_button = QPushButton("Start Capture"); self.capture_button.setEnabled(False); self.capture_button.clicked.connect(self.toggle_capture); self.button_layout.addWidget(self.capture_button)
-        self.clear_button = QPushButton("Clear GUI"); self.clear_button.clicked.connect(self.clear_gui_action); self.button_layout.addWidget(self.clear_button) # Renamed slightly
+        self.clear_button = QPushButton("Clear GUI"); self.clear_button.clicked.connect(self.clear_gui_action); self.button_layout.addWidget(self.clear_button)
         self.status_label = QLabel("On Standby"); self.status_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter); self.status_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred); self.button_layout.addWidget(self.status_label)
         self.main_layout.addWidget(self.button_bar)
 
         # --- Tab Area (Managed by GuiManager) ---
         self.tab_widget = QTabWidget()
         self.tab_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        # Instantiate the new GuiManager
         self.gui_manager = GuiManager(self.tab_widget, tab_configs, data_buffers, device_config)
         self.main_layout.addWidget(self.tab_widget)
 
@@ -2666,47 +2604,34 @@ class MainWindow(QMainWindow):
 
         # --- Timers and Signals ---
         self.plot_update_timer = QTimer(self)
-        self.plot_update_timer.setInterval(50) # ~20 FPS
-        self.plot_update_timer.timeout.connect(self.trigger_gui_update) # Renamed target slot
+        self.plot_update_timer.setInterval(50)
+        self.plot_update_timer.timeout.connect(self.trigger_gui_update)
         self.plot_update_timer.start()
-
         self.scan_throbber_timer = QTimer(self)
         self.scan_throbber_timer.setInterval(150)
         self.scan_throbber_timer.timeout.connect(self.animate_scan_throbber)
         self.throbber_chars = ["|", "/", "-", "\\"]
         self.throbber_index = 0
-
-        # Connect signals from GuiEmitter
         gui_emitter.state_change_signal.connect(self.handle_state_change)
         gui_emitter.scan_throbber_signal.connect(self.update_scan_status)
         gui_emitter.connection_status_signal.connect(self.update_connection_status)
         gui_emitter.show_error_signal.connect(self.show_message_box)
-        # Connect the missing UUIDs signal to the GuiManager's slot
         gui_emitter.missing_uuids_signal.connect(self.gui_manager.notify_missing_uuids)
-        # Connect internal request signal to the actual update slot
         self.request_plot_update_signal.connect(self._update_gui_now)
+        self.handle_state_change("idle")
 
-        self.handle_state_change("idle") # Initialize state
-
-    # --- Slot to Append Log Messages ---
     def append_log_message(self, message):
         self.log_text_box.append(message)
 
-    # --- GUI Update Triggering ---
     def trigger_gui_update(self):
-        """Slot called by the timer."""
         self.request_plot_update_signal.emit()
 
     def _update_gui_now(self):
-        """Slot that performs the actual GUI component update."""
-        if start_time is not None: # Check if connection established and data received
+        if start_time is not None:
             current_relative = (datetime.datetime.now() - start_time).total_seconds()
             is_flowing = self.flowing_mode_check.isChecked()
-            # Delegate update to the GuiManager
             self.gui_manager.update_all_components(current_relative, is_flowing)
-        # No else needed: GuiManager.update_all_components checks plotting_paused internally
 
-    # --- Scan Animation ---
     def animate_scan_throbber(self):
         if state == "scanning":
             text = "Scanning... " + self.throbber_chars[self.throbber_index]
@@ -2715,66 +2640,48 @@ class MainWindow(QMainWindow):
         else:
             self.scan_throbber_timer.stop()
 
-    # --- GUI Action Slots ---
-
-    # --- Handler for Device Dropdown ---
     def update_target_device(self, selected_name: str):
-        global device_config # Need to modify the global object
+        global device_config
         if device_config.name != selected_name:
             logger.info(f"Target device changed via GUI: {selected_name}")
-            # Update the name in the global device_config object
             device_config.update_name(selected_name)
             logger.info("Device config name updated.")
-            # If connected, changing device implies disconnect/rescan needed.
-            # update the config; user needs to manually restart scan.
 
-    # State Change Handling
     def handle_state_change(self, new_state: str):
-        global state, plotting_paused, start_time # Added start_time reset
+        global state, plotting_paused, start_time
         logger.info(f"GUI received state change: {new_state}")
         previous_state = state
-        state = new_state # Update global state
-
+        state = new_state
         if new_state != "scanning" and self.scan_throbber_timer.isActive():
             self.scan_throbber_timer.stop()
-
         is_idle = (new_state == "idle")
-        self.device_combo.setEnabled(is_idle) # Can only change device when idle
-        self.scan_button.setEnabled(True) # Scan/Disconnect always enabled except during disconnect transition
-
+        self.device_combo.setEnabled(is_idle)
+        self.scan_button.setEnabled(True)
         if new_state == "idle":
             self.scan_button.setText("Start Scan")
             self.led_indicator.set_color("red"); self.status_label.setText("On Standby")
             self.pause_resume_button.setEnabled(False); self.pause_resume_button.setText("Pause Plotting")
             self.capture_button.setEnabled(False); self.capture_button.setText("Start Capture")
-            plotting_paused = True # Set plots to paused state logically
-
-            # Automatically clear GUI/state when becoming idle
-            logger.info("State changed to idle. Automatically clearing GUI and state.")
-            self.clear_gui_action(confirm=False) # Handles GUI components, buffers, start_time, missing_uuids
-
-            if self.is_capturing: # Should be false if clear_gui_action ran correctly
+            plotting_paused = True
+            if previous_state != "disconnecting": 
+                logger.info("State changed to idle. Automatically clearing GUI and state.")
+                self.clear_gui_action(confirm=False)
+            if self.is_capturing:
                  logger.warning("Capture was active when state became idle (likely disconnect). Files were NOT generated automatically by clear.")
-
         elif new_state == "scanning":
             self.scan_button.setText("Stop Scan")
             self.led_indicator.set_color("orange"); self.throbber_index = 0
             if not self.scan_throbber_timer.isActive(): self.scan_throbber_timer.start()
             self.pause_resume_button.setEnabled(False)
             self.capture_button.setEnabled(False)
-            # Clearing state now happens in toggle_scan before starting scan
-
         elif new_state == "connected":
-            # Use the name from the *current* global device_config
             self.scan_button.setText("Disconnect")
             self.led_indicator.set_color("lightgreen"); self.status_label.setText(f"Connected to: {device_config.name}")
-            # Enable pause/resume ONLY IF NOT currently capturing
             if not self.is_capturing:
                 self.pause_resume_button.setEnabled(True)
-            self.pause_resume_button.setText("Pause Plotting") # Set text regardless
-            self.capture_button.setEnabled(True) # Capture can always be started if connected
-            plotting_paused = False # Resume on connect
-
+            self.pause_resume_button.setText("Pause Plotting")
+            self.capture_button.setEnabled(True)
+            plotting_paused = False
         elif new_state == "disconnecting":
             self.scan_button.setText("Disconnecting..."); self.scan_button.setEnabled(False)
             self.led_indicator.set_color("red"); self.status_label.setText("Status: Disconnecting...")
@@ -2782,7 +2689,6 @@ class MainWindow(QMainWindow):
             self.capture_button.setEnabled(False)
             plotting_paused = True
 
-    # Scan/Connection Status Updates
     def update_scan_status(self, text: str):
          if state == "scanning": self.status_label.setText(text)
     def update_connection_status(self, text: str):
@@ -2790,74 +2696,62 @@ class MainWindow(QMainWindow):
     def show_message_box(self, title: str, message: str):
         QMessageBox.warning(self, title, message)
 
-    # Scan/Connect/Disconnect Logic (clear GUI/state on start)
-    def toggle_scan(self):
-        global current_task, loop, state, data_buffers, start_time
-        if state == "idle":
-            if loop and loop.is_running():
-                # Clear GUI, buffers, state BEFORE starting scan
-                logger.info("Clearing state before starting scan...")
-                self.clear_gui_action(confirm=False) # Ensures everything is reset
+    @qasync.asyncSlot()
+    async def toggle_scan(self):
+        global current_task, state, data_buffers, start_time
+        if self._shutting_down: return
 
+        if state == "idle":
+            event_loop = asyncio.get_event_loop()
+            if event_loop and event_loop.is_running():
+                logger.info("Clearing state before starting scan...")
+                self.clear_gui_action(confirm=False)
                 self.handle_state_change("scanning")
-                current_task = loop.create_task(connection_task()) # Uses global device_config implicitly
-            else: logger.error("Asyncio loop not running!"); self.show_message_box("Error", "Asyncio loop is not running.")
+                current_task = asyncio.create_task(connection_task())
+            else:
+                logger.error("Asyncio loop not running!")
+                self.show_message_box("Error", "Asyncio loop is not running.")
         elif state == "scanning":
-            # Request cancellation, state change handled via callback/finally block
             if current_task and not current_task.done():
                 logger.info("Requesting scan cancellation...")
-                # Ensure cancellation is requested in the loop's thread
-                future = asyncio.run_coroutine_threadsafe(self.cancel_and_wait_task(current_task), loop)
-                try:
-                    future.result(timeout=0.1) # Brief wait for initiation
-                except TimeoutError: pass # Ignore timeout, cancellation sent
-                except Exception as e: logger.error(f"Error initiating task cancel: {e}")
-                # GUI state will change to idle via the task's cleanup calling emit_state_change("idle")
+                self.scan_button.setEnabled(False) 
+                await self.cancel_and_wait_task(current_task)
+                self.scan_button.setEnabled(True)
+                if state == "scanning": 
+                    self.handle_state_change("idle")
             else:
                 logger.warning("Stop scan requested, but no task was running/done.")
-                self.handle_state_change("idle") # Force idle if no task
-            current_task = None # Clear reference after requesting cancel
+                self.handle_state_change("idle")
+            current_task = None
         elif state == "connected":
-            # Request disconnect, state change handled via callback/finally block
-            if loop and client and client.is_connected:
+            self.handle_state_change("disconnecting") 
+            if client and client.is_connected:
                 logger.info("Requesting disconnection via disconnected_event...")
-                loop.call_soon_threadsafe(disconnected_event.set)
-                # GUI state change will happen via connection_task cleanup
-            elif loop and current_task and not current_task.done():
+                disconnected_event.set() 
+            elif current_task and not current_task.done():
                 logger.info("Requesting disconnect via task cancellation...")
-                future = asyncio.run_coroutine_threadsafe(self.cancel_and_wait_task(current_task), loop)
-                try: future.result(timeout=0.1)
-                except TimeoutError: pass
-                except Exception as e: logger.error(f"Error initiating task cancel for disconnect: {e}")
-                 # GUI state change will happen via connection_task cleanup
+                await self.cancel_and_wait_task(current_task) 
             else:
                 logger.warning("Disconnect requested but no active connection/task found.")
-                self.handle_state_change("idle") # Force idle
+                self.handle_state_change("idle") 
 
-    # Pause/Resume Plotting (global flag logic)
     def toggle_pause_resume(self):
         global plotting_paused
         if not self.pause_resume_button.isEnabled():
             logger.warning("Pause/Resume toggled while button disabled. Ignoring.")
             return
-
         plotting_paused = not plotting_paused
         self.pause_resume_button.setText("Resume Plotting" if plotting_paused else "Pause Plotting")
         logger.info(f"Plotting {'paused' if plotting_paused else 'resumed'}")
-        # If resuming, trigger an immediate GUI update
         if not plotting_paused:
             self.trigger_gui_update()
 
-    # --- Capture Start/Stop Logic (uses global start_time) ---
     def toggle_capture(self):
         global start_time
         if not self.is_capturing:
-            # Start Capture
             if state != "connected" or start_time is None:
                 self.show_message_box("Capture Error", "Must be connected and receiving data.")
                 return
-
-            # --- Create directory FIRST ---
             self.capture_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             base_log_dir = "Logs"
             self.capture_output_base_dir = os.path.join(base_log_dir, self.capture_timestamp)
@@ -2868,111 +2762,78 @@ class MainWindow(QMainWindow):
                 logger.error(f"Failed to create capture dir: {e}")
                 self.show_message_box("Capture Error", f"Failed to create directory:\n{e}")
                 self.capture_output_base_dir = None; self.capture_timestamp = None
-                return # Don't proceed
-
-            # --- Set capture state variables ---
+                return
             self.is_capturing = True
             self.capture_button.setText("Stop Capture && Export")
             self.capture_t0_absolute = datetime.datetime.now()
-            # Calculate start relative to the session's absolute start_time
             self.capture_start_relative_time = (self.capture_t0_absolute - start_time).total_seconds()
-
-            # --- Disable Pause/Resume Button ---
             self.pause_resume_button.setEnabled(False)
             logger.info("Pause/Resume plotting disabled during capture.")
-
             logger.info(f"Capture started. Abs t0: {self.capture_t0_absolute}, Rel t0: {self.capture_start_relative_time:.3f}s.")
-
         else:
-            # Stop Capture and Generate
             self.stop_and_generate_files()
 
-    # --- Stop Capture & File Generation Helper ---
     def stop_and_generate_files(self):
-        if not self.is_capturing or start_time is None: # Also check start_time exists
+        if not self.is_capturing or start_time is None:
             logger.warning("stop_and_generate called but capture inactive or start_time missing.")
             if state == "connected": self.pause_resume_button.setEnabled(True)
             else: self.pause_resume_button.setEnabled(False)
-            # Reset state just in case
             self.is_capturing = False
             self.capture_button.setText("Start Capture")
             self.capture_button.setEnabled(state == "connected")
             return
-
         logger.info("Stopping capture, generating PDF & CSV.")
         output_dir = self.capture_output_base_dir
         start_rel_time = self.capture_start_relative_time
-        # Calculate end relative to the session's absolute start_time
         capture_end_relative_time = (datetime.datetime.now() - start_time).total_seconds()
-
-        # --- Reset capture state FIRST ---
         self.is_capturing = False
         self.capture_button.setText("Start Capture")
-        self.capture_button.setEnabled(state == "connected") # Enable only if still connected
-
-        # --- Re-enable Pause/Resume Button ONLY if connected ---
+        self.capture_button.setEnabled(state == "connected")
         if state == "connected":
             self.pause_resume_button.setEnabled(True)
             logger.info("Pause/Resume plotting re-enabled after capture (still connected).")
         else:
             self.pause_resume_button.setEnabled(False)
             logger.info("Pause/Resume plotting remains disabled after capture (not connected).")
-
-
-        # --- File Generation Logic ---
-        if output_dir and start_rel_time is not None: # End time calculated above
+        if output_dir and start_rel_time is not None:
             if not data_buffers:
                  logger.warning("No data captured during the active period. Skipping PDF/CSV generation.")
-                 # Reset vars even if generation skipped
                  self.capture_output_base_dir = None; self.capture_start_relative_time = None
                  self.capture_t0_absolute = None; self.capture_timestamp = None
-                 return # Skip generation
-
+                 return
             pdf_subdir = os.path.join(output_dir, "pdf_plots")
             csv_subdir = os.path.join(output_dir, "csv_files")
             try: os.makedirs(pdf_subdir, exist_ok=True); os.makedirs(csv_subdir, exist_ok=True)
             except Exception as e:
                 logger.error(f"Failed to create PDF/CSV subdirs: {e}")
                 self.show_message_box("File Gen Error", f"Could not create output subdirs:\n{e}")
-                # Reset vars on failure
                 self.capture_output_base_dir = None; self.capture_start_relative_time = None
                 self.capture_t0_absolute = None; self.capture_timestamp = None
                 return
-
             gen_errors = []
             try:
-                # Pass necessary info: output dir, start rel time (for filtering/offset)
                 self.generate_pdf_plots_from_buffer(pdf_subdir, start_rel_time)
             except Exception as e: logger.error(f"PDF generation failed: {e}", exc_info=True); gen_errors.append(f"PDF: {e}")
             try:
-                # Pass necessary info: output dir, start/end rel time (for filtering), start rel time (for offset)
                 self.generate_csv_files_from_buffer(csv_subdir, start_rel_time, capture_end_relative_time, start_rel_time)
             except Exception as e: logger.error(f"CSV generation failed: {e}", exc_info=True); gen_errors.append(f"CSV: {e}")
-
             if not gen_errors: self.show_message_box("Generation Complete", f"Files generated in:\n{output_dir}")
             else: self.show_message_box("Generation Errors", f"Completed with errors in:\n{output_dir}\n\n" + "\n".join(gen_errors))
-
         else:
              reason = ""
              if not output_dir: reason += " Output dir missing."
              if start_rel_time is None: reason += " Start time missing."
              logger.error(f"Cannot generate files:{reason}")
              self.show_message_box("File Gen Error", f"Internal error:{reason}")
-
-        # --- Final reset of capture vars ---
         self.capture_output_base_dir = None
         self.capture_start_relative_time = None
         self.capture_t0_absolute = None
         self.capture_timestamp = None
 
-
-    # --- PDF Generation (Uses GuiManager components, checks UUIDs) ---
     def generate_pdf_plots_from_buffer(self, pdf_dir: str, capture_start_relative_time: float):
-        global data_buffers # Uses data_buffers
-
+        global data_buffers
         logger.info(f"Generating PDF plots (t=0 at capture start, t_offset={capture_start_relative_time:.3f}s). Dir: {pdf_dir}")
         if not data_buffers: logger.warning("Data buffer empty, skipping PDF generation."); return
-
         try:
             plt.style.use('science')
             plt.rcParams.update({'text.usetex': False, 'figure.figsize': [5.5, 3.5], 'legend.fontsize': 9,
@@ -2980,34 +2841,23 @@ class MainWindow(QMainWindow):
         except Exception as style_err:
             logger.warning(f"Could not apply 'science' style: {style_err}. Using default.")
             plt.rcParams.update({'figure.figsize': [6.0, 4.0]})
-
         gen_success = False
-        # Iterate through components managed by GuiManager
         for component in self.gui_manager.all_components:
-            # Only generate PDF for TimeSeriesPlotComponent instances
             if not isinstance(component, TimeSeriesPlotComponent):
                 continue
-
-            plot_config = component.config # Get the config for this plot instance
+            plot_config = component.config
             plot_title = plot_config.get('title', 'UntitledPlot')
             datasets = plot_config.get('datasets', [])
             if not datasets: continue
-
-            # Check if any required UUIDs for *this plot* were missing during connection
             required_uuids_for_plot = set()
             required_types = component.get_required_data_types()
             for dtype in required_types:
                 uuid = self.gui_manager.device_config_ref.get_uuid_for_data_type(dtype)
                 if uuid: required_uuids_for_plot.add(uuid)
-
-            # Use the currently stored missing UUIDs from GuiManager
             missing_uuids_for_this_plot = required_uuids_for_plot.intersection(self.gui_manager.active_missing_uuids)
-
             if missing_uuids_for_this_plot:
                 logger.warning(f"Skipping PDF for plot '{plot_title}' as it depends on missing UUID(s): {missing_uuids_for_this_plot}")
-                continue # Skip this plot
-
-            # --- Plotting logic (using component's config) ---
+                continue
             fig, ax = plt.subplots()
             ax.set_title(plot_config.get('title', 'Plot'));
             ax.set_xlabel(plot_config.get('xlabel', 'Time [s]'));
@@ -3017,7 +2867,6 @@ class MainWindow(QMainWindow):
                 data_type = dataset['data_type']
                 if data_type in data_buffers and data_buffers[data_type]:
                     full_data = data_buffers[data_type]
-                    # Filter data based on capture start time *relative to session start*
                     plot_data = [(item[0] - capture_start_relative_time, item[1])
                                     for item in full_data if item[0] >= capture_start_relative_time]
                     if plot_data:
@@ -3027,131 +2876,91 @@ class MainWindow(QMainWindow):
                             ax.plot(times_rel_capture, values, label=dataset.get('label', data_type), color=dataset.get('color', 'k'), linewidth=1.2)
                             plot_created = True
                         except Exception as plot_err: logger.error(f"Error plotting {data_type} for PDF '{plot_title}': {plot_err}")
-
             if plot_created:
                 ax.legend(); ax.grid(True, linestyle='--', alpha=0.6); fig.tight_layout(pad=0.5)
-                # Use the plot component's method to get a safe filename suffix
-                safe_suffix = component.get_log_filename_suffix() # This is already cleaned
+                safe_suffix = component.get_log_filename_suffix()
                 prefix = f"{self.capture_timestamp}_" if self.capture_timestamp else ""
-                # Adjust filename to use the suffix from component
                 pdf_filename = f"{prefix}{safe_suffix}.pdf"
                 pdf_filepath = os.path.join(pdf_dir, pdf_filename)
                 try: fig.savefig(pdf_filepath, bbox_inches='tight'); logger.info(f"Saved PDF: {pdf_filename}"); gen_success = True
                 except Exception as save_err: logger.error(f"Error saving PDF {pdf_filename}: {save_err}"); raise RuntimeError(f"Save PDF failed: {save_err}") from save_err
             else: logger.info(f"Skipping PDF '{plot_title}' (no data in capture window).")
-            plt.close(fig) # Close the figure to release memory
-
+            plt.close(fig)
         if gen_success: logger.info(f"PDF generation finished. Dir: {pdf_dir}")
         else: logger.warning("PDF done, but no plots saved (no data / missing UUIDs / no plot components?).")
 
-
-    # --- CSV Generation (NEW logic for any loggable component) ---
     def generate_csv_files_from_buffer(self, csv_dir: str, filter_start_rel_time: float, filter_end_rel_time: float, time_offset: float):
-        global data_buffers # Uses data_buffers and GuiManager components
-
+        global data_buffers
         logger.info(f"Generating CSVs (data {filter_start_rel_time:.3f}s-{filter_end_rel_time:.3f}s rel session, t=0 at capture start offset={time_offset:.3f}s). Dir: {csv_dir}")
         if not data_buffers: logger.warning("Data buffer empty, skipping CSV generation."); return
-
         def get_series(dt, start, end):
-             # Exclude series if its source UUID was missing during the connection
              uuid = self.gui_manager.device_config_ref.get_uuid_for_data_type(dt)
-             # Use the currently stored missing UUIDs from GuiManager
              if uuid and uuid in self.gui_manager.active_missing_uuids:
                  logger.debug(f"Excluding series '{dt}' from CSV (UUID {uuid} was missing).")
                  return None
-
              if dt in data_buffers and data_buffers[dt]:
-                 # Filter data based on time relative to the *session* start
                  filt = [item for item in data_buffers[dt] if start <= item[0] <= end]
                  if filt:
                      try:
-                         # Index is still relative to session start for alignment
                          return pd.Series([i[1] for i in filt], index=pd.Index([i[0] for i in filt], name='TimeRelSession'), name=dt)
                      except Exception as e:
                          logger.error(f"Error creating Pandas Series for {dt}: {e}")
-             return None # Return None if no data in range or buffer empty/missing
-
-        # --- Generate Individual CSV per Loggable Component ---
+             return None
         indiv_gen = False
         for component in self.gui_manager.all_components:
             if not component.is_loggable:
-                continue # Skip components not marked for logging
-
+                continue
             loggable_data_types = component.get_loggable_data_types()
             log_filename_suffix = component.get_log_filename_suffix()
-
             if not loggable_data_types or not log_filename_suffix:
                 logger.warning(f"Skipping individual CSV for component {type(component).__name__} (ID: {id(component)}): No loggable types or filename suffix.")
                 continue
-
             logger.info(f"Processing Individual CSV for component: {log_filename_suffix}")
-
-            # Get only series relevant to this specific component
             series_list = [s for dt in sorted(list(loggable_data_types)) if (s := get_series(dt, filter_start_rel_time, filter_end_rel_time)) is not None]
             if not series_list:
                 logger.warning(f"Skipping Individual CSV '{log_filename_suffix}': No valid series data found in window or UUIDs missing.")
                 continue
-
             try:
-                # Concatenate using the TimeRelSession index for alignment
                 component_df = pd.concat(series_list, axis=1, join='outer').sort_index()
-                # Insert adjusted time column (relative to capture start)
                 component_df.insert(0, 'Time (s)', component_df.index - time_offset)
                 prefix = f"{self.capture_timestamp}_" if self.capture_timestamp else ""
-                # Use the suffix provided by the component
                 csv_fname = f"{prefix}{log_filename_suffix}.csv"
                 csv_fpath = os.path.join(csv_dir, csv_fname)
-                component_df.to_csv(csv_fpath, index=False, float_format='%.6f') # Don't write the TimeRelSession index
+                component_df.to_csv(csv_fpath, index=False, float_format='%.6f')
                 logger.info(f"Saved Individual CSV: {csv_fname}"); indiv_gen = True
             except Exception as e:
                 logger.error(f"Error generating Individual CSV '{log_filename_suffix}': {e}", exc_info=True)
                 raise RuntimeError(f"Individual CSV generation failed: {e}") from e
-
-        # --- Generate Master CSV per Tab ---
         master_gen = False
-        for tab_index, tab_config in enumerate(self.gui_manager.tab_configs): # Iterate through original tab configs for structure
+        for tab_index, tab_config in enumerate(self.gui_manager.tab_configs):
             tab_title = tab_config.get('tab_title', f"Tab_{tab_index}")
             logger.info(f"Processing Master CSV for tab: '{tab_title}'")
-
-            # Collect all unique *loggable* data types from *all* loggable components within this tab
             tab_loggable_types = set()
             components_in_tab = [comp for comp in self.gui_manager.all_components if comp.tab_index == tab_index and comp.is_loggable]
-
             if not components_in_tab:
                  logger.warning(f"Skipping Master CSV '{tab_title}': No loggable components found in this tab."); continue
-
             for component in components_in_tab:
                 tab_loggable_types.update(component.get_loggable_data_types())
-
             if not tab_loggable_types:
                 logger.warning(f"Skipping Master CSV '{tab_title}': No loggable data types found among loggable components in this tab."); continue
-
-            # Get series for all loggable types in this tab
             series_list = [s for dt in sorted(list(tab_loggable_types)) if (s := get_series(dt, filter_start_rel_time, filter_end_rel_time)) is not None]
             if not series_list:
                 logger.warning(f"Skipping Master CSV '{tab_title}': No valid series data found for loggable types in window or UUIDs missing."); continue
-
             try:
-                # Concatenate using the TimeRelSession index for alignment
                 master_df = pd.concat(series_list, axis=1, join='outer').sort_index()
-                # Insert the adjusted time column (relative to capture start)
                 master_df.insert(0, 'Master Time (s)', master_df.index - time_offset)
                 safe_t_title = re.sub(r'[^\w\-]+', '_', tab_title).strip('_')
                 prefix = f"{self.capture_timestamp}_" if self.capture_timestamp else ""
                 csv_fname = f"{prefix}master_tab_{safe_t_title}.csv"
                 csv_fpath = os.path.join(csv_dir, csv_fname)
-                master_df.to_csv(csv_fpath, index=False, float_format='%.6f') # Don't write the TimeRelSession index
+                master_df.to_csv(csv_fpath, index=False, float_format='%.6f')
                 logger.info(f"Saved Master CSV: {csv_fname}"); master_gen = True
             except Exception as e:
                 logger.error(f"Error generating Master CSV '{tab_title}': {e}", exc_info=True)
                 raise RuntimeError(f"Master CSV generation failed: {e}") from e
-
-
         if master_gen or indiv_gen: logger.info(f"CSV generation finished. Dir: {csv_dir}")
         else: logger.warning("CSV generation done, but no files were saved (no loggable components / no valid data?).")
 
-
-    # --- Clear GUI Action ---
     def clear_gui_action(self, confirm=True):
         global data_buffers, start_time
         logger.info("Attempting to clear GUI components and data.")
@@ -3160,37 +2969,26 @@ class MainWindow(QMainWindow):
             question = "Clear all displayed data, reset UUID status, and clear internal buffers?"
             if self.is_capturing:
                 question = "Capture is active. Clear all data (stopping capture WITHOUT exporting)?\nAlso resets UUID status and clears buffers."
-
             reply = QMessageBox.question(self, 'Clear GUI & Data', question,
                                          QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                          QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.Yes: do_clear = True
-        else: do_clear = True # Clear without confirm (used internally)
-
+        else: do_clear = True
         if do_clear:
             logger.info("Confirmed clearing GUI, data buffers, resetting start time, and UUID status.")
-
-            # --- Stop capture if active ---
             if self.is_capturing:
                  logger.warning("Capture active during clear. Stopping capture WITHOUT generating files.")
                  self.is_capturing = False
                  self.capture_button.setText("Start Capture")
-                 self.capture_button.setEnabled(state == "connected") # Update button state
-                 # Also reset pause/resume button state appropriately
+                 self.capture_button.setEnabled(state == "connected")
                  if state == "connected": self.pause_resume_button.setEnabled(True)
                  else: self.pause_resume_button.setEnabled(False)
-                 # Clear capture temp vars
                  self.capture_output_base_dir = None; self.capture_start_relative_time = None
                  self.capture_t0_absolute = None; self.capture_timestamp = None
-
-            # --- Clear data and state ---
             data_buffers.clear()
             start_time = None
-            # Delegate clearing visual components and their UUID state to GuiManager
             self.gui_manager.clear_all_components()
 
-
-    # --- Apply Interval ---
     def apply_interval(self):
         global flowing_interval
         try:
@@ -3198,133 +2996,138 @@ class MainWindow(QMainWindow):
             if new_interval > 0:
                 flowing_interval = new_interval
                 logger.info(f"Flowing interval updated to {new_interval}s")
-                # Trigger GUI update immediately if flowing mode is active
                 if self.flowing_mode_check.isChecked():
                     self._update_gui_now()
             else: self.show_message_box("Invalid Input", "Interval must be positive.")
         except ValueError: self.show_message_box("Invalid Input", "Please enter a valid number for the interval.")
 
-    # --- Toggle Data Logging ---
     def toggle_data_log(self, check_state_value):
-        # Qt6: Pass the integer value of the check state enum
         is_checked = (check_state_value == Qt.CheckState.Checked.value)
         if is_checked:
             data_console_handler.setLevel(logging.INFO)
             logger.info("Raw data logging (INFO level) to console enabled.")
         else:
-            data_console_handler.setLevel(logging.WARNING) # Set level higher to effectively disable INFO logs
+            data_console_handler.setLevel(logging.WARNING)
             logger.info("Raw data logging (INFO level) to console disabled.")
+    
 
     # --- Close Event Handling ---
+
     def closeEvent(self, event):
-        global stop_flag, current_task, loop, asyncio_thread
+        global stop_flag
+        if self._shutting_down:
+            event.accept()
+            return
 
-        logger.info("Close event triggered. Shutting down...")
-        stop_flag = True # Signal asyncio loop FIRST
+        logger.info("Close event triggered. Initiating asynchronous shutdown.")
+        self._shutting_down = True
+        stop_flag = True 
+        event.ignore()  
+        asyncio.create_task(self.async_shutdown_operations())
 
-        # --- Cancel asyncio task and wait for thread ---
-        task_cancelled = False
+    async def async_shutdown_operations(self):
+        global current_task, client
+        logger.info("Async shutdown: Starting...")
         if current_task and not current_task.done():
-             if loop and loop.is_running():
-                logger.info("Requesting cancellation of active asyncio task...")
-                if not current_task.cancelled():
-                    future = asyncio.run_coroutine_threadsafe(self.cancel_and_wait_task(current_task), loop)
-                    try:
-                        future.result(timeout=1.0) # Wait briefly for cancellation to be processed
-                        task_cancelled = True
-                        logger.info("Asyncio task cancellation initiated.")
-                    except asyncio.TimeoutError: logger.warning("Timeout waiting for async task cancellation confirmation.")
-                    except Exception as e: logger.error(f"Error during async task cancellation: {e}")
-                else: logger.info("Asyncio task was already cancelled.")
-             else: logger.warning("Asyncio loop not running, cannot cancel task.")
-        else: logger.info("No active asyncio task or task already done.")
-
-        # --- Wait for asyncio thread to finish cleanly ---
-        if asyncio_thread and asyncio_thread.is_alive():
-            logger.info("Waiting for asyncio thread to finish (max 5s)...")
-            asyncio_thread.join(timeout=5.0)
-            if asyncio_thread.is_alive(): logger.warning("Asyncio thread did not terminate cleanly within the timeout.")
-            else: logger.info("Asyncio thread finished.")
-        else: logger.info("Asyncio thread not running or already finished.")
-
-        # --- Now perform GUI/Synchronous cleanup ---
-        logger.info("Performing GUI cleanup...")
-
-        # Stop GUI timers
+            logger.info("Async shutdown: Requesting cancellation of active BLE task...")
+            if not current_task.cancelled():
+                await self.cancel_and_wait_task(current_task)
+                logger.info("Async shutdown: BLE task cancellation completed.")
+            else:
+                logger.info("Async shutdown: BLE task was already cancelled.")
+        else:
+            logger.info("Async shutdown: No active BLE task or task already done.")
+        
+        current_client_ref = client 
+        if current_client_ref and current_client_ref.is_connected:
+            logger.info("Async shutdown: Attempting to disconnect client explicitly...")
+            try:
+                await current_client_ref.disconnect()
+                logger.info("Async shutdown: Client disconnected successfully.")
+            except Exception as e:
+                logger.error(f"Async shutdown: Error during explicit client disconnect: {e}")
+        
+        logger.info("Async shutdown: Performing GUI cleanup...")
         self.plot_update_timer.stop()
         self.scan_throbber_timer.stop()
-
-        # Remove Log Handler
         if self.log_handler:
-            logger.info("Removing GUI log handler...")
-            try:
-                if self.log_handler in logging.getLogger().handlers: logging.getLogger().removeHandler(self.log_handler)
-                self.log_handler.close(); self.log_handler = None
-                logger.info("GUI log handler removed and closed.")
-            except Exception as e: logging.error(f"Error removing/closing GUI log handler: {e}", exc_info=True)
-
-        # Clear GUI Components (Optional but good practice)
-        logger.info("Clearing GUI components before closing window...")
+            logger.info("Async shutdown: Removing GUI log handler...")
+            root_logger = logging.getLogger()
+            if self.log_handler in root_logger.handlers:
+                root_logger.removeHandler(self.log_handler)
+            self.log_handler.close() 
+            self.log_handler = None 
+            logger.info("Async shutdown: GUI log handler removed and closed.")
+        
+        logger.info("Async shutdown: Clearing GUI components...")
         try:
-            self.clear_gui_action(confirm=False) # Use the new clear method
-        except Exception as e: logger.error(f"Error clearing GUI during closeEvent: {e}", exc_info=True)
+            self.clear_gui_action(confirm=False)
+        except Exception as e:
+            logger.error(f"Async shutdown: Error clearing GUI: {e}", exc_info=True)
 
-        # Handle final capture state (Likely redundant if clear_gui_action worked)
         if self.is_capturing:
-            logger.warning("Capture still marked active during final shutdown phase. Attempting generation.")
-            try: self.stop_and_generate_files()
-            except Exception as e: logger.error(f"Error generating files on close: {e}", exc_info=True)
-            self.is_capturing = False # Ensure reset
-
-        logger.info("Exiting application.")
-        event.accept() # Allow the window and application to close
-
-    # Helper coroutine for closeEvent
-    async def cancel_and_wait_task(self, task):
-        if task and not task.done():
-            task.cancel()
+            logger.warning("Async shutdown: Capture still active. Generating files.")
             try:
-                await task # Wait for the cancellation to be processed
+                self.stop_and_generate_files()
+            except Exception as e:
+                logger.error(f"Async shutdown: Error generating files on close: {e}", exc_info=True)
+            self.is_capturing = False
+
+        logger.info("Async shutdown: All cleanup done. Quitting application.")
+        QApplication.instance().quit()
+
+    async def cancel_and_wait_task(self, task_to_cancel):
+        if task_to_cancel and not task_to_cancel.done():
+            if not task_to_cancel.cancelled(): 
+                 task_to_cancel.cancel()
+            try:
+                await task_to_cancel
             except asyncio.CancelledError:
                 logger.info("Async task successfully cancelled and awaited.")
-            except Exception as e:
-                logger.error(f"Exception while awaiting cancelled task: {e}", exc_info=True)
-
-# --- END OF MainWindow CLASS DEFINITION ---
-
-
-# --- Asyncio Thread Setup ---
-def run_asyncio_loop():
-    global loop
-    try: asyncio.run(main_async())
-    except Exception as e: logging.critical(f"Fatal exception in asyncio loop: {e}", exc_info=True)
-    finally: logging.info("Asyncio thread function finished.")
+            except Exception as e: 
+                logger.error(f"Exception while awaiting cancelled task (e.g. BleakError during disconnect): {e}", exc_info=False)
 
 
 # --- Main Execution ---
 if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    qasync_loop = qasync.QEventLoop(app)
+    asyncio.set_event_loop(qasync_loop)
+    main_window = MainWindow()
+    main_window.show()
+    exit_code = 0 
     try:
-        app = QApplication(sys.argv)
-        main_window = MainWindow()
-        main_window.show()
+        logger.info("Starting qasync event loop (integrates Qt and asyncio)...")
+        with qasync_loop:
+            qasync_loop.run_forever()
+        exit_code = 0 
+        logger.info("qasync event loop finished.")
+    except KeyboardInterrupt:
+        logger.info("Application interrupted by user (KeyboardInterrupt).")
+        if not main_window._shutting_down:
+            stop_flag = True 
+            if qasync_loop.is_running():
+                 asyncio.run_coroutine_threadsafe(main_window.async_shutdown_operations(), qasync_loop)
+            else: 
+                logger.warning("KeyboardInterrupt after loop stopped. May not clean up fully.")
 
-        logger.info("Starting asyncio thread...")
-        asyncio_thread = threading.Thread(target=run_asyncio_loop, daemon=True)
-        asyncio_thread.start()
-
-        logger.info("Starting PyQt application event loop...")
-        exit_code = app.exec()
-        logger.info(f"PyQt application finished with exit code {exit_code}.")
-
-        stop_flag = True # Ensure flag is set even if GUI closed abnormally
-        if asyncio_thread.is_alive():
-            # Give the thread a chance to finish after loop stop signal
-            asyncio_thread.join(timeout=2.0)
-            if asyncio_thread.is_alive(): logger.warning("Asyncio thread still alive after final join.")
-
-        sys.exit(exit_code)
+    except SystemExit: 
+        logger.info("SystemExit caught, application quitting.")
+        exit_code = 0 
+    except Exception as e:
+        logger.critical(f"Unhandled exception in main execution: {e}", exc_info=True)
+        exit_code = 1 
     finally:
-        try: plt.style.use('default'); logger.debug("Reset matplotlib style.")
-        except Exception as e: logger.warning(f"Could not reset matplotlib style: {e}")
+        stop_flag = True
+        logger.info("Performing final application cleanup...")
+        try:
+            plt.style.use('default')
+            logger.debug("Reset matplotlib style.")
+        except Exception as e:
+            logger.warning(f"Could not reset matplotlib style: {e}")
+        
+        logging.shutdown()
+        logger.info(f"Application exiting with code {exit_code}.")
+        sys.exit(exit_code)
 
 # <<< END OF FILE >>>
