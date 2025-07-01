@@ -1,6 +1,6 @@
 ##################################################################################
 #
-#         ***Modular BLE Sensor Data Acquisition GUI***
+#                   *** BLE Sensor Data Acquisition GUI***
 #
 ##################################################################################
 # Author:    Arvin Parvizinia
@@ -8,19 +8,33 @@
 # Version:   1.0 
 #
 # Description:
-#   This Python application provides a modular GUI for connecting to
-#   Bluetooth Low Energy (BLE) devices, primarily for sensor data acquisition.
-#   It features real-time data plotting (time-series, heatmaps, 3D IMU,
-#   Nyquist), data logging to CSV files, and PDF export of plots.
-#   The application is designed to be customizable for different BLE devices
-#   and sensor types through configuration of data handlers, device profiles,
-#   and GUI layouts.
+#   Provides a modular GUI for connecting to Bluetooth Low Energy (BLE)
+#   devices for sensor data acquisition. Features:
+#     - Real-time plotting: time-series, heat/pressuremaps, 3D IMU, Impedance
+#     - Data logging to CSV
+#     - PDF export of plots
+#     - Customizable device profiles, data handlers, GUI layouts
+################################################################################
+# Dependencies:
+#   pip install qasync bleak pandas numpy matplotlib scienceplots \
+#               PyQt6 pyqtgraph superqt
+################################################################################
+# License (MIT):
+#   Copyright (c) 2025 Arvin Parvizinia
 #
-# License: 
-##################################################################################
-# To run this script, ensure you have the required libraries installed:
-# pip install qasync bleak pandas numpy matplotlib scienceplots PyQt6 pyqtgraph superqt
-
+# Permission is granted to use, copy, modify, merge, publish, distribute,
+# sublicense, and/or sell copies of the Software, subject to the following:
+#
+# The above copyright notice and this permission notice shall be included
+# in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM THE SOFTWARE OR
+# ITS USE.
+################################################################################
 
 import asyncio
 import qasync
@@ -41,6 +55,8 @@ import bisect
 import numpy as np # needed for pyqtgraph AND heatmap
 import re # For cleaning filenames
 import math # Needed for heatmap CoP
+from pathlib import Path # For easier path manipulation in PDF export
+
 
 # --- Matplotlib Imports (used ONLY for PDF export AND heatmap colormaps) ---
 import matplotlib # Use Agg backend to avoid GUI conflicts if possible
@@ -1108,7 +1124,7 @@ device_config = DeviceConfig(
         CharacteristicConfig(uuid="19B10020-E8F2-537E-4F6C-D104768A1214", handler=handle_quaternion_data,
                      produces_data_types=['quat_w', 'quat_x', 'quat_y', 'quat_z']),
     ],
-    find_timeout=5.0,
+    find_timeout=10.0,
     data_timeout=1.0
 )
 
@@ -1294,43 +1310,55 @@ class TimeSeriesPlotComponent(BaseGuiComponent):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.plot_widget)
 
+
+
         # --- Replay Slider Controls ---
-        self.replay_slider_widget = QWidget()
-        slider_controls_layout = QHBoxLayout(self.replay_slider_widget)
-        slider_controls_layout.setContentsMargins(5,0,5,0) # Add some horizontal margin
+        self.replay_controls_container = QWidget() # Main container for slider and export button
+        replay_controls_main_layout = QVBoxLayout(self.replay_controls_container)
+        replay_controls_main_layout.setContentsMargins(0,0,0,0)
+        replay_controls_main_layout.setSpacing(3) # Small spacing between slider row and button
 
-        self.min_time_textbox = QLineEdit("0.00")
-        self.min_time_textbox.setFixedWidth(60)
-        self.min_time_textbox.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.min_time_validator = QDoubleValidator(0.0, 9999.0, 2, self) # Initial broad range, will be updated
-        self.min_time_validator.setNotation(QDoubleValidator.Notation.StandardNotation)
-        self.min_time_textbox.setValidator(self.min_time_validator)
+        self.replay_slider_widget = QWidget() # Widget for the slider and its labels
+        slider_labels_layout = QHBoxLayout(self.replay_slider_widget)
+        slider_labels_layout.setContentsMargins(5,0,5,0) 
+
+        self.min_time_display = QLabel("0.00") # Changed from QLineEdit to QLabel
+        self.min_time_display.setFixedWidth(50) # Adjusted width
+        self.min_time_display.setAlignment(Qt.AlignmentFlag.AlignCenter)
         
-        # Rename export_slider to replay_time_slider for clarity
         self.replay_time_slider = QRangeSlider(Qt.Orientation.Horizontal)
-        self.replay_time_slider.setRange(0, 0) # Initial empty range
+        self.replay_time_slider.setRange(0, 0) 
 
-        self.max_time_textbox = QLineEdit("0.00")
-        self.max_time_textbox.setFixedWidth(60)
-        self.max_time_textbox.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.max_time_validator = QDoubleValidator(0.0, 9999.0, 2, self) # Initial broad range
-        self.max_time_validator.setNotation(QDoubleValidator.Notation.StandardNotation)
-        self.max_time_textbox.setValidator(self.max_time_validator)
+        self.max_time_display = QLabel("0.00") # Changed from QLineEdit to QLabel
+        self.max_time_display.setFixedWidth(50) # Adjusted width
+        self.max_time_display.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        slider_controls_layout.addWidget(QLabel("View:"))
-        slider_controls_layout.addWidget(self.min_time_textbox)
-        slider_controls_layout.addWidget(self.replay_time_slider)
-        slider_controls_layout.addWidget(self.max_time_textbox)
-        slider_controls_layout.addWidget(QLabel("s"))
+        slider_labels_layout.addWidget(QLabel("View:"))
+        slider_labels_layout.addWidget(self.min_time_display)
+        slider_labels_layout.addWidget(self.replay_time_slider)
+        slider_labels_layout.addWidget(self.max_time_display)
+        slider_labels_layout.addWidget(QLabel("s"))
+        
+        replay_controls_main_layout.addWidget(self.replay_slider_widget)
 
-        self.replay_slider_widget.setVisible(False) # Initially hidden, shown in non-flowing mode
-        layout.addWidget(self.replay_slider_widget)
+        # --- Export Button for Replay ---
+        self.export_replay_pdf_button = QPushButton("Export Visible Plot to PDF")
+        self.export_replay_pdf_button.clicked.connect(self._request_replay_pdf_export)
+        # Center the button
+        export_button_layout = QHBoxLayout()
+        export_button_layout.addStretch()
+        export_button_layout.addWidget(self.export_replay_pdf_button)
+        export_button_layout.addStretch()
+        replay_controls_main_layout.addLayout(export_button_layout)
+
+
+        self.replay_controls_container.setVisible(False) # Initially hidden
+        layout.addWidget(self.replay_controls_container)
         self.setLayout(layout)
 
         # --- Connect Signals ---
         self.replay_time_slider.valueChanged.connect(self._on_replay_slider_changed)
-        self.min_time_textbox.editingFinished.connect(self._update_slider_from_textboxes)
-        self.max_time_textbox.editingFinished.connect(self._update_slider_from_textboxes)
+        # Removed connections for min/max_time_textbox.editingFinished
 
 
     def get_widget(self) -> QWidget:
@@ -1425,26 +1453,15 @@ class TimeSeriesPlotComponent(BaseGuiComponent):
         filter_max_time_float: float
 
         if is_flowing:
+
             filter_min_time_float = max(0, current_relative_time - flowing_interval)
             filter_max_time_float = current_relative_time
-            self.replay_slider_widget.setVisible(False)
+            self.replay_controls_container.setVisible(False) # Hide the whole replay controls container
             self.plot_item.setXRange(filter_min_time_float, filter_max_time_float, padding=0.02)
 
-
-            # Check if overlay indicates CSV data is missing
-            is_csv_data_missing_for_plot = False
-            if self.uuid_missing_overlay and self.uuid_missing_overlay.isVisible() and "CSV" in self.uuid_missing_overlay.text():
-                 # Check if any of *this plot's* required data types are actually missing from buffers
-                 for dt_check in self.get_required_data_types():
-                     if dt_check not in self.data_buffers_ref or not self.data_buffers_ref[dt_check]:
-                         is_csv_data_missing_for_plot = True
-                         break
-            
-            if is_csv_data_missing_for_plot:
-                self.replay_slider_widget.setVisible(False) # Hide slider if data not loaded
-
         else:  # Not flowing mode: use slider to control view
-            self.replay_slider_widget.setVisible(True)
+            self.replay_controls_container.setVisible(True) # Show the whole replay controls container
+
 
             actual_min_data_time_float = float('inf')
             actual_max_data_time_float = 0.0 
@@ -1489,26 +1506,26 @@ class TimeSeriesPlotComponent(BaseGuiComponent):
                 range_changed = True
             self.replay_time_slider.blockSignals(False)
 
-            # Update text box validators based on the new overall data range
-            self.min_time_validator.setRange(actual_min_data_time_float, actual_max_data_time_float)
-            self.max_time_validator.setRange(actual_min_data_time_float, actual_max_data_time_float)
-
             # Get current slider selection (scaled integers)
             selected_min_int, selected_max_int = self.replay_time_slider.value()
             filter_min_time_float = float(selected_min_int) / self.SLIDER_FLOAT_PRECISION_FACTOR
             filter_max_time_float = float(selected_max_int) / self.SLIDER_FLOAT_PRECISION_FACTOR
 
-            # If the overall range changed, textboxes need update from slider's new full range
-            # Also, ensure textboxes are in sync if they weren't the source of a change
+            # If the overall range changed, text displays need update from slider's new full range
+            # Also, ensure text displays are in sync if they weren't the source of a change
+            # Convert current label text to float for comparison, handle potential errors if label is not a number
+            try:
+                min_label_val = float(self.min_time_display.text())
+                max_label_val = float(self.max_time_display.text())
+            except ValueError: # If labels contain non-numeric text (e.g. "--"), force update
+                min_label_val = -1.0 
+                max_label_val = -1.0
+
             if range_changed or \
-               abs(float(self.min_time_textbox.text()) - filter_min_time_float) > 1e-3 or \
-               abs(float(self.max_time_textbox.text()) - filter_max_time_float) > 1e-3:
-                self.min_time_textbox.blockSignals(True)
-                self.max_time_textbox.blockSignals(True)
-                self.min_time_textbox.setText(f"{filter_min_time_float:.2f}")
-                self.max_time_textbox.setText(f"{filter_max_time_float:.2f}")
-                self.min_time_textbox.blockSignals(False)
-                self.max_time_textbox.blockSignals(False)
+               abs(min_label_val - filter_min_time_float) > 1e-3 or \
+               abs(max_label_val - filter_max_time_float) > 1e-3:
+                self.min_time_display.setText(f"{filter_min_time_float:.2f}")
+                self.max_time_display.setText(f"{filter_max_time_float:.2f}")
             
             self.plot_item.setXRange(filter_min_time_float, filter_max_time_float, padding=0.02)
 
@@ -1594,23 +1611,21 @@ class TimeSeriesPlotComponent(BaseGuiComponent):
         self.plot_item.setYRange(-1, 1, padding=0.1) 
         self.plot_item.enableAutoRange(axis='y', enable=True)
 
+
         # --- Explicitly hide and reset replay slider components ---
-        if hasattr(self, 'replay_slider_widget'):
-            self.replay_slider_widget.setVisible(False)
+        if hasattr(self, 'replay_controls_container'): # Check for the new container
+            self.replay_controls_container.setVisible(False)
         if hasattr(self, 'replay_time_slider'):
             self.replay_time_slider.blockSignals(True)
-            self.replay_time_slider.setRange(0,0) # Reset range
-            self.replay_time_slider.setValue((0,0)) # Reset values
+            self.replay_time_slider.setRange(0,0) 
+            self.replay_time_slider.setValue((0,0)) 
             self.replay_time_slider.blockSignals(False)
-        if hasattr(self, 'min_time_textbox'):
-            self.min_time_textbox.blockSignals(True)
-            self.min_time_textbox.setText("0.00")
-            self.min_time_textbox.blockSignals(False)
-        if hasattr(self, 'max_time_textbox'):
-            self.max_time_textbox.blockSignals(True)
-            self.max_time_textbox.setText("0.00") # Or a default like str(flowing_interval)
-            self.max_time_textbox.blockSignals(False)
+        if hasattr(self, 'min_time_display'): # Changed from textbox to display
+            self.min_time_display.setText("0.00")
+        if hasattr(self, 'max_time_display'): # Changed from textbox to display
+            self.max_time_display.setText("0.00") # Or a default like str(flowing_interval)
         
+
         # Reset validators to a broad initial range if necessary,
         # or let update_component handle it when new data comes in live.
         # For now, just resetting text is probably fine.
@@ -1628,79 +1643,50 @@ class TimeSeriesPlotComponent(BaseGuiComponent):
         # Ensure t0 is not greater than t1 if slider handles cross (shouldn't happen with QRangeSlider)
         t0_float = min(t0_float, t1_float)
 
-        # Update text boxes without triggering their editingFinished signal back to slider
-        self.min_time_textbox.blockSignals(True)
-        self.max_time_textbox.blockSignals(True)
-        self.min_time_textbox.setText(f"{t0_float:.2f}")
-        self.max_time_textbox.setText(f"{t1_float:.2f}")
-        self.min_time_textbox.blockSignals(False)
-        self.max_time_textbox.blockSignals(False)
+
+        # Update text displays
+        self.min_time_display.setText(f"{t0_float:.2f}")
+        self.max_time_display.setText(f"{t1_float:.2f}")
+
 
         logger.debug(f"Replay slider changed for '{self.config.get('title', 'Plot')}': [{t0_float:.2f}s, {t1_float:.2f}s]")
         
         # Request GUI update to refresh the plot based on the new slider range
         self._request_gui_update_for_yrange()
 
-    def _update_slider_from_textboxes(self):
-        try:
-            min_val_text = float(self.min_time_textbox.text())
-            max_val_text = float(self.max_time_textbox.text())
-        except ValueError:
-            logger.warning("Invalid input in time textboxes. Reverting to slider values.")
-            # Revert textboxes to current slider values if input is bad
-            current_slider_min_int, current_slider_max_int = self.replay_time_slider.value()
-            self.min_time_textbox.setText(f"{float(current_slider_min_int) / self.SLIDER_FLOAT_PRECISION_FACTOR:.2f}")
-            self.max_time_textbox.setText(f"{float(current_slider_max_int) / self.SLIDER_FLOAT_PRECISION_FACTOR:.2f}")
+    def _request_replay_pdf_export(self):
+        if not self.replay_time_slider.isVisible(): # Should only be callable when slider is visible
+            logger.warning("Replay PDF export requested but slider is not visible.")
             return
 
-        # Validate: min <= max
-        if min_val_text > max_val_text:
-            logger.warning("Min time in textbox cannot be greater than max time. Adjusting.")
-            # Option 1: swap them if min > max
-            # min_val_text, max_val_text = max_val_text, min_val_text 
-            # self.min_time_textbox.setText(f"{min_val_text:.2f}")
-            # self.max_time_textbox.setText(f"{max_val_text:.2f}")
-            # Option 2: set min to max or max to min - simpler, set min to what max is
-            min_val_text = max_val_text 
-            self.min_time_textbox.setText(f"{min_val_text:.2f}")
+        min_t_int, max_t_int = self.replay_time_slider.value()
+        min_t_float = float(min_t_int) / self.SLIDER_FLOAT_PRECISION_FACTOR
+        max_t_float = float(max_t_int) / self.SLIDER_FLOAT_PRECISION_FACTOR
 
-
-        # Get overall min/max for slider range to clamp textbox input
-        slider_overall_min_int = self.replay_time_slider.minimum()
-        slider_overall_max_int = self.replay_time_slider.maximum()
+        # Try to find the MainWindow instance to call its export handler
+        # This assumes the component is eventually parented to MainWindow
+        main_window_instance = self.window() 
+        if not isinstance(main_window_instance, MainWindow):
+            # Fallback search if self.window() is not directly MainWindow (e.g., if nested in complex ways)
+            for widget in QApplication.topLevelWidgets():
+                if isinstance(widget, MainWindow):
+                    main_window_instance = widget
+                    break
+            else: # If loop finishes without break
+                main_window_instance = None
         
-        overall_min_float = float(slider_overall_min_int) / self.SLIDER_FLOAT_PRECISION_FACTOR
-        overall_max_float = float(slider_overall_max_int) / self.SLIDER_FLOAT_PRECISION_FACTOR
+        if isinstance(main_window_instance, MainWindow):
+            logger.info(f"Requesting PDF export for '{self.config.get('title', 'Plot')}' "
+                        f"from {min_t_float:.2f}s to {max_t_float:.2f}s.")
+            main_window_instance.handle_component_replay_export(self, min_t_float, max_t_float)
+        else:
+            logger.error("Could not find MainWindow instance to handle replay PDF export.")
+            QMessageBox.critical(self, "Export Error", "Could not find main application window to handle export request.")
 
-        # Clamp textbox values to the slider's possible range
-        min_val_text = max(overall_min_float, min(min_val_text, overall_max_float))
-        max_val_text = max(overall_min_float, min(max_val_text, overall_max_float))
-        
-        # Ensure min is still not greater than max after clamping
-        min_val_text = min(min_val_text, max_val_text)
-
-
-        # Scale float values from textboxes to integers for the slider
-        target_slider_min_int = int(round(min_val_text * self.SLIDER_FLOAT_PRECISION_FACTOR))
-        target_slider_max_int = int(round(max_val_text * self.SLIDER_FLOAT_PRECISION_FACTOR))
-        
-        # Update slider (this will trigger _on_replay_slider_changed, which updates plot)
-        self.replay_time_slider.blockSignals(True) # Block to prevent immediate loop from setValue
-        self.replay_time_slider.setValue((target_slider_min_int, target_slider_max_int))
-        self.replay_time_slider.blockSignals(False)
-
-        # Refresh textboxes to reflect potentially clamped/rounded values
-        self.min_time_textbox.blockSignals(True)
-        self.max_time_textbox.blockSignals(True)
-        self.min_time_textbox.setText(f"{float(target_slider_min_int) / self.SLIDER_FLOAT_PRECISION_FACTOR:.2f}")
-        self.max_time_textbox.setText(f"{float(target_slider_max_int) / self.SLIDER_FLOAT_PRECISION_FACTOR:.2f}")
-        self.min_time_textbox.blockSignals(False)
-        self.max_time_textbox.blockSignals(False)
-        
-        logger.debug(f"Slider updated from textboxes to: [{min_val_text:.2f}s, {max_val_text:.2f}s]")
-        # Manually trigger plot update as slider's valueChanged might not fire if values are identical
-        # after rounding, or if we want immediate feedback.
-        self._request_gui_update_for_yrange()
+    # def _update_slider_from_textboxes(self):
+    #     # This method is no longer needed as text displays are not editable.
+    #     # If it were to be kept for programmatic updates, it would need significant changes.
+    #     pass
 
 # --- HEATMAP COMPONENT ---
 
@@ -3385,7 +3371,18 @@ class IMUVisualizerComponent(BaseGuiComponent):
     SLIDER_FLOAT_PRECISION_FACTOR_IMU = 100 # For 0.01s resolution
 
 
-    BOX_SIZE = (1.5, 3, 0.5)
+    # STL and Box rendering constants
+    _DEFAULT_BOX_SIZE = (1.5, 3, 0.5)
+    _DEFAULT_BOX_EDGE_COLOR = (0.5, 0.5, 0.5, 1.0)
+    _DEFAULT_BOX_FACE_COLORS = np.array([ # RGBA (0-1) for 6 faces
+        (0.6, 0.6, 0.6, 1.0), (0.9, 0.9, 0.9, 1.0), (0.8, 0.2, 0.2, 1.0),
+        (0.8, 0.5, 0.2, 1.0), (0.2, 0.8, 0.2, 1.0), (0.2, 0.2, 0.8, 1.0)
+    ], dtype=np.float32)
+    _STL_DEFAULT_FACE_COLOR = (0.7, 0.7, 0.7, 1.0) # Default if STL has no color and none configured
+
+
+
+    # Axis and Grid constants (can remain as they are if not needing changes)
     AXIS_LENGTH = 3.0
     AXIS_RADIUS = 0.03
     ARROW_RADIUS = 0.08
@@ -3394,12 +3391,8 @@ class IMUVisualizerComponent(BaseGuiComponent):
     GLVIEW_BACKGROUND_COLOR = QColor(200, 200, 200)
     GRID_COLOR = QColor(0, 0, 0, 100) # R, G, B, Alpha (0-255)
     GRID_SCALE = 5
-    BOX_EDGE_COLOR = (0.5, 0.5, 0.5, 1.0)
-    BOX_COLORS = [ # RGBA (0-1)
-        (0.6, 0.6, 0.6, 1.0), (0.9, 0.9, 0.9, 1.0), (0.8, 0.2, 0.2, 1.0),
-        (0.8, 0.5, 0.2, 1.0), (0.2, 0.8, 0.2, 1.0), (0.2, 0.2, 0.8, 1.0)
-    ]
     SNAPSHOT_DIR_DEFAULT = "IMU_Snapshots"
+
 
     def __init__(self, config: Dict[str, Any], data_buffers_ref: Dict[str, List[Tuple[float, float]]], device_config_ref: DeviceConfig, parent: Optional[QWidget] = None):
         super().__init__(config, data_buffers_ref, device_config_ref, parent)
@@ -3410,9 +3403,27 @@ class IMUVisualizerComponent(BaseGuiComponent):
         self.snapshot_dir = self.config.get('snapshot_dir', self.SNAPSHOT_DIR_DEFAULT)
         os.makedirs(self.snapshot_dir, exist_ok=True)
 
+        # --- STL/Mesh Configuration ---
+        self.stl_filename = self.config.get("stl_filename", None)
+        self.mirror_x = self.config.get("mirror_x", False)
+        self.mirror_y = self.config.get("mirror_y", False)
+        self.mirror_z = self.config.get("mirror_z", False)
+        self.stl_scale = self.config.get("stl_scale", 1.0)
+
+        self.stl_config_color = self.config.get("stl_color", None) # User-defined color for the whole STL
+        self.use_stl_attributes_for_color = self.config.get("use_stl_attributes_for_color", False) # << NEW
+        self.stl_draw_edges = self.config.get("stl_draw_edges", False)
+        self.stl_edge_color = self.config.get("stl_edge_color", (0.2, 0.2, 0.2, 1.0))
+
+        self.mesh_data_item: Optional[gl.MeshData] = None # To store loaded MeshData
+        self.object_mesh: Optional[gl.GLMeshItem] = None  # The GLMeshItem for STL or box
+
         self._setup_internal_ui()
+        self._load_and_prepare_mesh_data() # Load mesh data before setting up scene elements
         self._setup_scene_elements()
         self.clear_component()
+
+
 
     def _setup_internal_ui(self):
         main_layout = QVBoxLayout(self)
@@ -3471,6 +3482,118 @@ class IMUVisualizerComponent(BaseGuiComponent):
         controls_widget.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         main_layout.addWidget(controls_widget)
         self.setLayout(main_layout)
+
+    def _load_and_prepare_mesh_data(self):
+        """
+        Loads mesh data from an STL file if specified, or creates default box data.
+        Applies configured scaling and mirroring to STL data.
+        Sets self.mesh_data_item with the pyqtgraph.opengl.MeshData.
+        """
+        logger.info("IMUVisualizer: Preparing mesh data...")
+        use_stl = False
+        if self.stl_filename:
+            if not os.path.exists(self.stl_filename):
+                logger.error(f"IMUVisualizer: STL file '{self.stl_filename}' not found. Falling back to default box.")
+            else:
+                try:
+                    from stl import mesh as stl_mesh # Import here to catch ImportError if not installed
+                    
+                    stl_mesh_obj = stl_mesh.Mesh.from_file(self.stl_filename)
+                    num_faces = stl_mesh_obj.vectors.shape[0]
+                    if num_faces == 0:
+                        logger.warning(f"IMUVisualizer: STL file '{self.stl_filename}' contains no faces. Falling back to default box.")
+                    else:
+                        # Each face has 3 vertices, each vertex has 3 coordinates
+                        # stl_mesh_obj.vectors is (num_faces, 3_vertices_per_face, 3_coords_per_vertex)
+                        # We want a flat list of vertices for each triangle for per-face coloring (N*3, 3)
+                        vertices = stl_mesh_obj.vectors.reshape(num_faces * 3, 3).astype(np.float32)
+                        
+                        # Faces will simply index these flattened vertices: [[0,1,2], [3,4,5], ...]
+                        faces = np.arange(num_faces * 3, dtype=np.uint32).reshape(num_faces, 3)
+
+                        # Apply scaling FIRST
+                        if self.stl_scale != 1.0:
+                            vertices *= float(self.stl_scale) # Apply scale directly to the vertices array
+                            logger.info(f"IMUVisualizer: STL vertices scaled by {self.stl_scale}")
+                        
+                        # Then apply mirroring to the (potentially already scaled) vertices
+                        num_mirrors = 0
+                        if self.mirror_x: vertices[:, 0] *= -1; num_mirrors += 1
+                        if self.mirror_y: vertices[:, 1] *= -1; num_mirrors += 1
+                        if self.mirror_z: vertices[:, 2] *= -1; num_mirrors += 1
+                        
+                        if num_mirrors % 2 != 0: # Odd number of mirrors, reverse face winding for correct normals
+                            faces = faces[:, [0, 2, 1]]
+                        
+                        # Handle face colors
+                        face_colors_array = None
+                        if self.use_stl_attributes_for_color and hasattr(stl_mesh_obj, 'attr') and stl_mesh_obj.attr is not None and stl_mesh_obj.attr.shape[0] == num_faces:
+                            parsed_stl_colors = []
+                            colors_from_attr = 0
+                            for i in range(num_faces):
+                                attr_val = stl_mesh_obj.attr[i, 0]
+                                if attr_val != 0:
+                                    r = ((attr_val & 0xF800) >> 11) / 31.0
+                                    g = ((attr_val & 0x07E0) >> 5)  / 63.0
+                                    b = (attr_val & 0x001F)       / 31.0
+                                    parsed_stl_colors.append((r, g, b, 1.0))
+                                    colors_from_attr +=1
+                                else: 
+                                    parsed_stl_colors.append(self.stl_config_color if self.stl_config_color else self._STL_DEFAULT_FACE_COLOR)
+                            if colors_from_attr > 0:
+                                face_colors_array = np.array(parsed_stl_colors, dtype=np.float32)
+                                logger.info(f"IMUVisualizer: Applied colors from STL attributes for {colors_from_attr}/{num_faces} faces.")
+                        
+                        if face_colors_array is None: 
+                            if self.stl_config_color:
+                                logger.info(f"IMUVisualizer: Using configured 'stl_color' for all STL faces.")
+                                color_to_tile = np.array(self.stl_config_color, dtype=np.float32)
+                            else:
+                                logger.info(f"IMUVisualizer: Using default color for all STL faces.")
+                                color_to_tile = np.array(self._STL_DEFAULT_FACE_COLOR, dtype=np.float32)
+                            face_colors_array = np.tile(color_to_tile, (num_faces, 1))
+                        
+                        # Create MeshData with the processed (scaled and mirrored) vertices
+                        self.mesh_data_item = gl.MeshData(vertexes=vertices, faces=faces, faceColors=face_colors_array)
+                        logger.info(f"IMUVisualizer: Successfully loaded and prepared STL '{self.stl_filename}'.")
+                        use_stl = True
+
+                except ImportError:
+                    logger.error("IMUVisualizer: 'numpy-stl' library is not installed. Please install it: pip install numpy-stl. Falling back to default box.")
+                except Exception as e:
+                    logger.error(f"IMUVisualizer: Failed to load or process STL file '{self.stl_filename}': {e}. Falling back to default box.", exc_info=True)
+        
+        if not use_stl: # Fallback to default box
+            logger.info("IMUVisualizer: Using default box model.")
+            width, height, depth = self._DEFAULT_BOX_SIZE
+            w2, h2, d2 = width / 2, height / 2, depth / 2
+            
+            # Apply configured scale to the default box as well
+            scaled_w2, scaled_h2, scaled_d2 = w2 * self.stl_scale, h2 * self.stl_scale, d2 * self.stl_scale
+            if self.stl_scale != 1.0:
+                logger.info(f"IMUVisualizer: Default box scaled by {self.stl_scale}")
+
+            box_vertices = np.array([
+                [-scaled_w2, -scaled_h2, -scaled_d2], [ scaled_w2, -scaled_h2, -scaled_d2], 
+                [ scaled_w2,  scaled_h2, -scaled_d2], [-scaled_w2,  scaled_h2, -scaled_d2],
+                [-scaled_w2, -scaled_h2,  scaled_d2], [ scaled_w2, -scaled_h2,  scaled_d2], 
+                [ scaled_w2,  scaled_h2,  scaled_d2], [-scaled_w2,  scaled_h2,  scaled_d2]
+            ], dtype=np.float32)
+            
+            box_faces_quads = np.array([ 
+                [0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4],
+                [2, 3, 7, 6], [1, 2, 6, 5], [0, 4, 7, 3] 
+            ], dtype=np.uint32)
+
+            box_faces_triangles = []
+            for quad in box_faces_quads:
+                box_faces_triangles.append([quad[0], quad[1], quad[2]])
+                box_faces_triangles.append([quad[0], quad[2], quad[3]])
+            box_faces_triangles = np.array(box_faces_triangles, dtype=np.uint32)
+
+            box_triangle_colors = np.repeat(self._DEFAULT_BOX_FACE_COLORS, 2, axis=0)
+            
+            self.mesh_data_item = gl.MeshData(vertexes=box_vertices, faces=box_faces_triangles, faceColors=box_triangle_colors)
 
     @staticmethod
     def _create_cylinder_mesh_data(radius: float, length: float, sections: int = 20) -> Tuple[np.ndarray, np.ndarray]:
@@ -3541,23 +3664,24 @@ class IMUVisualizerComponent(BaseGuiComponent):
         tr_arrow_z = pg.Transform3D(); tr_arrow_z.translate(0, 0, self.AXIS_LENGTH); z_arrow_mesh.setTransform(tr_arrow_z)
         self.view.addItem(z_arrow_mesh)
 
-        # Box
-        width, height, depth = self.BOX_SIZE
-        w2, h2, d2 = width / 2, height / 2, depth / 2
-        box_vertices = np.array([
-            [-w2, -h2, -d2], [ w2, -h2, -d2], [ w2,  h2, -d2], [-w2,  h2, -d2],
-            [-w2, -h2,  d2], [ w2, -h2,  d2], [ w2,  h2,  d2], [-w2,  h2,  d2]], dtype=np.float32)
-        box_faces = np.array([
-            [0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7], [0, 4, 7], [0, 7, 3],
-            [1, 5, 6], [1, 6, 2], [0, 1, 5], [0, 5, 4], [3, 2, 6], [3, 6, 7]], dtype=np.uint32)
-        
-        face_colors_rgba = np.array(self.BOX_COLORS, dtype=np.float32) # Ensure it's (N,4)
-        triangle_colors = np.repeat(face_colors_rgba, 2, axis=0)
 
-        self.box_mesh = gl.GLMeshItem(
-            vertexes=box_vertices, faces=box_faces, faceColors=triangle_colors,
-            drawEdges=True, edgeColor=self.BOX_EDGE_COLOR, smooth=False, computeNormals=True)
-        self.view.addItem(self.box_mesh)
+
+        # Object Mesh (STL or default box)
+        if self.mesh_data_item:
+            is_stl_loaded = bool(self.stl_filename and os.path.exists(self.stl_filename)) # Approx check if STL was intended
+
+            self.object_mesh = gl.GLMeshItem(
+                meshdata=self.mesh_data_item,
+                smooth=False,  # Important for per-face colors from STL/Box to not be interpolated
+                drawEdges=self.stl_draw_edges if is_stl_loaded else True, # Default box always draws edges
+                edgeColor=self.stl_edge_color if is_stl_loaded else self._DEFAULT_BOX_EDGE_COLOR,
+                computeNormals=True # Recompute normals, especially after mirroring/scaling
+            )
+            self.view.addItem(self.object_mesh)
+
+        else:
+            logger.error("IMUVisualizer: Mesh data was not loaded. Cannot create object mesh.")
+
 
     def update_component(self, current_relative_time: float, is_flowing: bool):
 
@@ -3641,8 +3765,8 @@ class IMUVisualizerComponent(BaseGuiComponent):
 
             transform = pg.Transform3D()
             transform.rotate(relative_quat)
-            if hasattr(self, 'box_mesh'):
-                self.box_mesh.setTransform(transform)
+            if self.object_mesh: # Check if mesh item exists
+                self.object_mesh.setTransform(transform)
 
 
     def _get_euler_angles_from_qt_quaternion(self, q: QQuaternion) -> Tuple[float, float, float]:
@@ -3659,9 +3783,10 @@ class IMUVisualizerComponent(BaseGuiComponent):
         identity_quat = QQuaternion(1,0,0,0)
         transform = pg.Transform3D()
         transform.rotate(identity_quat)
-        if hasattr(self, 'box_mesh'):
-            self.box_mesh.setTransform(transform)
+        if self.object_mesh: # Check if mesh item exists
+            self.object_mesh.setTransform(transform)
         
+
         yaw, pitch, roll = self._get_euler_angles_from_qt_quaternion(identity_quat)
         self.orientation_status_label.setText(f"Yaw: {yaw:6.1f}°  Pitch: {pitch:6.1f}°  Roll: {roll:6.1f}°")
 
@@ -3689,8 +3814,6 @@ class IMUVisualizerComponent(BaseGuiComponent):
     def _take_snapshot_action(self):
         if not hasattr(self, 'view'): return
 
-
-
         is_paused_or_replaying_imu = plotting_paused or (state == "replay_active")
         if is_paused_or_replaying_imu and self.scrub_time_widget_imu.isVisible():
             current_slider_int_value_imu = self.time_slider_imu.value()
@@ -3702,37 +3825,41 @@ class IMUVisualizerComponent(BaseGuiComponent):
             logger.info("IMU snapshot: Using live/latest orientation data (not from slider).")
             # For live data, the view should be current from update_component.
 
-
         try:
-            size = self.view.size()
-            width, height = size.width(), size.height()
-            if width <= 0 or height <= 0:
-                logger.warning("IMU Snapshot: View size is invalid, cannot take snapshot.")
-                return
-
-            image = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
-            image.fill(Qt.GlobalColor.transparent) # Fill with transparent before rendering
+            # *** THE FIX IS HERE: Use grabFramebuffer() directly ***
+            image = self.view.grabFramebuffer()
             
-            painter = QPainter(image)
-            # self.view.render(painter) # This renders GL content
-            # For full snapshot including controls if they overlay, grab widget:
-            # self.view.grabFramebuffer().save(os.path.join(self.snapshot_dir, f"snapshot_glview_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]}.png"))
-
+            if image.isNull():
+                logger.warning("IMU Snapshot: grabFramebuffer returned a null image. Cannot save.")
+                return
 
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
             filename = os.path.join(self.snapshot_dir, f"snapshot_{timestamp}.png")
             
-            # Render the GLViewWidget content to the QImage
-            self.view.render(painter) # painter operates on 'image'
-            painter.end() # Crucial to end painting before saving
+            # *** THE FIX IS HERE: Use grabFramebuffer() directly ***
+            image = self.view.grabFramebuffer()
+            
+            if image.isNull():
+                logger.warning("IMU Snapshot: grabFramebuffer returned a null image. Cannot save.")
+                return
 
-            if image.save(filename, "PNG", 100):
-                logger.info(f"IMU Snapshot saved as {filename}")
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            
+            # *** Save as JPEG for smaller size ***
+            # Use '.jpg' extension and specify "JPG" format with a quality (e.g., 85)
+            filename = os.path.join(self.snapshot_dir, f"snapshot_{timestamp}.jpg")
+            quality = 85 # Adjust quality (0-100) for filesize vs detail trade-off
+            
+            if image.save(filename, "JPG", quality):
+                logger.info(f"IMU Snapshot saved as {filename} with JPG quality {quality}.")
             else:
-                logger.error(f"IMU Snapshot: Failed to save QImage to {filename}")
+                logger.error(f"IMU Snapshot: Failed to save QImage to {filename} as JPG.")
 
         except Exception as e:
             logger.error(f"IMU Snapshot failed: {e}", exc_info=True)
+
+
+
 
     def _reset_orientation_action(self):
         self.baseline_quaternion = QQuaternion(
@@ -3780,9 +3907,8 @@ class IMUVisualizerComponent(BaseGuiComponent):
 
         transform = pg.Transform3D()
         transform.rotate(relative_quat_hist)
-        if hasattr(self, 'box_mesh'):
-            self.box_mesh.setTransform(transform)
-
+        if self.object_mesh: # Check if mesh item exists
+            self.object_mesh.setTransform(transform)
 
     def get_widget(self) -> QWidget:
         return self
@@ -3846,7 +3972,7 @@ tab_configs = [
                      'initial_gaussian_sigma': 110, # Example override
                     # 'initial_colormap': 'turbo',
                     # ... other config options, check component class for details
-                    'grid_resolution': 12, # in pixels, default is 10
+                    'grid_resolution': 20, # in pixels, default is 10 (higher values means bigger pixels)
                     'enable_logging': True # Log the 11 FSR pressure values (keys from HEATMAP_KEYS)
                 }
             },
@@ -3870,11 +3996,22 @@ tab_configs = [
                 'row': 0, 'col': 0, 'rowspan':1, 'colspan':1,
                 'config': {
                     'title': 'IMU Orientation Visualizer',
-                    'enable_logging': True, # Logs quat_w, quat_x, quat_y, quat_z
+                    'enable_logging': True, 
+                    # --- New STL configurations ---
+                    'stl_filename': "Sohle1V2_MIR.stl",  # Optional: Path to your .stl file
+                    'stl_scale': 0.02, # Example if STL is in mm and you want meters for display
+                    'use_stl_attributes_for_color': False,  # << SET TO FALSE
+                    'stl_color': (0.5, 0.5, 0.5, 0),    # << SET YOUR DESIRED GREY COLOR
+                    'mirror_x': False,                         # Optional: True to mirror on X
+                    'mirror_y': False,                          # Optional: True to mirror on Y (e.g. for right-handed to left-handed model)
+                    'mirror_z': False,                         # Optional: True to mirror on Z
+                    #'stl_color': (0.8, 0.8, 0.3, 1.0),         # Optional: RGBA tuple (0-1) to color the whole STL if it has no color attributes or you want to override.
+                    'stl_draw_edges': True,                    # Optional: True to draw edges on the STL model
+                    'stl_edge_color': (0.1, 0.1, 0.1, 1.0)     # Optional: Color for STL edges if drawn
                     # 'component_height': 600, # Optional: set fixed size
                     # 'component_width': 800,  # Optional: set fixed size
                 }
-            }
+            },
         ]
     },
     {
@@ -6001,6 +6138,63 @@ class MainWindow(QMainWindow):
             self.pause_resume_button.setEnabled(False)
 
 
+    def handle_component_replay_export(self, component_instance: TimeSeriesPlotComponent, start_time_rel: float, end_time_rel: float):
+        if self._shutting_down: return
+        if state != "replay_active":
+            logger.warning("Replay plot export requested but not in replay_active state.")
+            QMessageBox.warning(self, "Export Error", "Plot export is only available during active replay.")
+            return
+            
+        logger.info(f"Handling replay export request for component '{component_instance.config.get('title', 'N/A')}' for window [{start_time_rel:.2f}s, {end_time_rel:.2f}s].")
+
+        target_pdf_dir_path = None
+        replayed_csv_path_str = getattr(self, 'df_filepath_for_display', None)
+
+        if replayed_csv_path_str:
+            replayed_csv_path = Path(replayed_csv_path_str)
+            # Try to find a "Logs/SESSION_TIMESTAMP" structure
+            parts = replayed_csv_path.parts
+            try:
+                # Find the index of "Logs". If multiple "Logs" exist, take the last one.
+                logs_indices = [i for i, part_name in enumerate(parts) if part_name == "Logs"]
+                if logs_indices:
+                    logs_idx = logs_indices[-1]
+                    if len(parts) > logs_idx + 1: # Ensure there's a part after "Logs" (the session_timestamp_dir)
+                        # Path up to and including session_timestamp_dir
+                        session_timestamp_dir = Path(*parts[:logs_idx+2]) 
+                        target_pdf_dir_path = session_timestamp_dir / "Replay Exports"
+                        logger.info(f"Deduced replay export target based on replayed CSV: {target_pdf_dir_path}")
+                    else:
+                        logger.warning(f"Path '{replayed_csv_path_str}' contains 'Logs' but no subsequent session directory. Using fallback.")
+                else: # 'Logs' not in path
+                    logger.warning(f"'Logs' directory not found in replayed CSV path '{replayed_csv_path_str}'. Using fallback.")
+            except Exception as path_err: # Catch any error during path parsing
+                logger.error(f"Error parsing replayed CSV path '{replayed_csv_path_str}' for export: {path_err}. Using fallback.")
+        else:
+            logger.warning("No replayed CSV path available (df_filepath_for_display not set). Using fallback for export path.")
+
+        if not target_pdf_dir_path: # Fallback logic if path deduction failed or no CSV path
+            fallback_base = Path("Logs") / "Replay_Exports_Standalone" # Ensures it's under "Logs"
+            timestamp_now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            target_pdf_dir_path = fallback_base / f"Export_{timestamp_now}"
+            logger.info(f"Using fallback replay export target: {target_pdf_dir_path}")
+        
+        try:
+            os.makedirs(target_pdf_dir_path, exist_ok=True)
+            
+            # Use the existing method, ensuring it's called correctly for single component export
+            self.generate_pdf_plots_from_buffer_for_component(
+                str(target_pdf_dir_path), 
+                component_instance,
+                start_time_rel,
+                end_time_rel
+            )
+            QMessageBox.information(self, "Export Successful", f"Plot exported to:\n{target_pdf_dir_path}")
+
+        except Exception as e:
+            logger.error(f"Failed to export replay plot: {e}", exc_info=True)
+            QMessageBox.critical(self, "Export Failed", f"Could not export plot:\n{e}")
+
 
     def update_scan_status(self, text: str):
          if state == "scanning": self.status_label.setText(text)
@@ -6744,18 +6938,33 @@ class MainWindow(QMainWindow):
             self.hide()
         QApplication.processEvents() # Allow hide event to process
 
+
+
         self.plot_update_timer.stop()
         self.scan_throbber_timer.stop()
+
+        # Remove and close the QtLogHandler first
         if self.log_handler:
             logger.info("Async shutdown: Removing GUI log handler...")
             root_logger = logging.getLogger()
             if self.log_handler in root_logger.handlers:
                 root_logger.removeHandler(self.log_handler)
-            self.log_handler.close() 
-            self.log_handler = None 
+            self.log_handler.close() # Calls logging.Handler.close()
+            self.log_handler = None
             logger.info("Async shutdown: GUI log handler removed and closed.")
+
+        # Perform standard logging shutdown BEFORE Qt application fully quits.
+        # This allows other standard handlers (like StreamHandlers) to flush properly.
+        # Our QtLogHandler was already removed from the root logger, but logging.shutdown()
+        # will process it if it's still in the global list, so it must be called while Qt is live.
+        logger.info("Async shutdown: Calling logging.shutdown()...")
+        logging.shutdown()
+        logger.info("Async shutdown: logging.shutdown() completed.")
         
         logger.info("Async shutdown: Clearing GUI components...")
+
+
+
         try:
             self.clear_gui_action(confirm=False)
         except Exception as e:
@@ -6829,7 +7038,6 @@ if __name__ == "__main__":
         except Exception as e:
             logger.warning(f"Could not reset matplotlib style: {e}")
         
-        logging.shutdown()
         logger.info(f"Application exiting with code {exit_code}.")
         sys.exit(exit_code)
 
