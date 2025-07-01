@@ -35,17 +35,19 @@ from PyQt6.QtWidgets import (
     QScrollArea, QMessageBox, QSizePolicy, QTextEdit, QTabWidget,
     QComboBox, QSlider 
 )
-from PyQt6.QtGui import (QColor, QPainter, QBrush, QPen, QPixmap, QImage, QPolygonF, QIntValidator, QDoubleValidator)
+from PyQt6.QtGui import (QColor, QPainter, QBrush, QPen, QPixmap, QImage, QPolygonF, QIntValidator, QDoubleValidator, QSurfaceFormat, QQuaternion, QVector3D, QImage, QPainter)
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QMetaObject, QThread, QPointF
 
 
 # --- PyQtGraph Import ---
 import pyqtgraph as pg
+import pyqtgraph.opengl as gl
+
 
 # --- SuperQT Import for RangeSlider ---
 from superqt.sliders import QRangeSlider # Needed for heatmap pressure range
 
-# Added for Impedance Plotter snapshot
+# for Impedance Plotter snapshot
 from concurrent.futures import ThreadPoolExecutor
 
 # Apply PyQtGraph global options for background/foreground
@@ -260,9 +262,9 @@ def handle_gravity_data(data: bytearray) -> dict:
         data_logger.error(f"Error parsing gravity data: {e}")
         return {}
 
-# ────────── optical_flow_handler.py ──────────
+# optical_flow_handler.py
 
-# module‐level accumulators
+# module‐level accumulators,!!!NEED TO BE explicitly CLEARED in "clear_gui_action"!!!
 opt_cum_x = 0
 opt_cum_y = 0
 
@@ -464,6 +466,27 @@ def handle_adc_data(data: bytearray) -> Dict[str, Any]:
         data_logger.error(f"Error processing ADC data '{text}': {e}")
         return {}
 
+
+def handle_quaternion_data(data: bytearray) -> dict:
+    try:
+        text = data.decode("utf-8").strip()
+        parts = text.split(",")
+        if len(parts) != 4:
+            data_logger.error("Invalid quaternion payload: expected 4 parts, got %d", len(parts))
+            return {}
+        w = float(parts[0])
+        x = float(parts[1])
+        y = float(parts[2])
+        z = float(parts[3])
+        data_logger.info(f"Quaternion Data: w={w:.3f}, x={x:.3f}, y={y:.3f}, z={z:.3f}") # Optional: for verbose logging
+        return {"quat_w": w, "quat_x": x, "quat_y": y, "quat_z": z}
+    except ValueError as e:
+        data_logger.error(f"Error parsing quaternion data (ValueError): {e} - Data: '{data.decode('utf-8', errors='ignore')}'")
+        return {}
+    except Exception as e:
+        data_logger.error(f"Error parsing quaternion data (Exception): {e} - Data: '{data.decode('utf-8', errors='ignore')}'")
+        return {}
+
 # --- Device Configuration (Initial Device Name still set here) ---
 # This object's 'name' attribute will be updated by the dropdown menu
 device_config = DeviceConfig(
@@ -502,6 +525,8 @@ device_config = DeviceConfig(
             handler=handle_ankle_angle_data,
             produces_data_types=['ankle_xz', 'ankle_yz']
         ),
+        CharacteristicConfig(uuid="19B10020-E8F2-537E-4F6C-D104768A1214", handler=handle_quaternion_data,
+                     produces_data_types=['quat_w', 'quat_x', 'quat_y', 'quat_z']),
     ],
     find_timeout=5.0,
     data_timeout=1.0
@@ -629,6 +654,7 @@ class BaseGuiComponent(QWidget):
 
 # --- Specific Component Implementations ---
 
+# --- TimeSeriesPlotComponent ---
 class TimeSeriesPlotComponent(BaseGuiComponent):
     """A GUI component that displays time-series data using pyqtgraph."""
     def __init__(self, config: Dict[str, Any], data_buffers_ref: Dict[str, List[Tuple[float, float]]], device_config_ref: DeviceConfig, parent: Optional[QWidget] = None):
@@ -2045,6 +2071,291 @@ class NyquistPlotComponent(BaseGuiComponent):
             self.snapshot_executor.shutdown(wait=False)
 
 
+# --- IMU Visualizer Component ---
+class IMUVisualizerComponent(BaseGuiComponent):
+    BOX_SIZE = (1.5, 3, 0.5)
+    AXIS_LENGTH = 3.0
+    AXIS_RADIUS = 0.03
+    ARROW_RADIUS = 0.08
+    ARROW_LENGTH = 0.3
+    AXIS_COLORS = {'x': (1, 0, 0, 1), 'y': (0, 1, 0, 1), 'z': (0, 0, 1, 1)} # R, G, B, Alpha (0-1)
+    GLVIEW_BACKGROUND_COLOR = QColor(200, 200, 200)
+    GRID_COLOR = QColor(0, 0, 0, 100) # R, G, B, Alpha (0-255)
+    GRID_SCALE = 5
+    BOX_EDGE_COLOR = (0.5, 0.5, 0.5, 1.0)
+    BOX_COLORS = [ # RGBA (0-1)
+        (0.6, 0.6, 0.6, 1.0), (0.9, 0.9, 0.9, 1.0), (0.8, 0.2, 0.2, 1.0),
+        (0.8, 0.5, 0.2, 1.0), (0.2, 0.8, 0.2, 1.0), (0.2, 0.2, 0.8, 1.0)
+    ]
+    SNAPSHOT_DIR_DEFAULT = "IMU_Snapshots"
+
+    def __init__(self, config: Dict[str, Any], data_buffers_ref: Dict[str, List[Tuple[float, float]]], device_config_ref: DeviceConfig, parent: Optional[QWidget] = None):
+        super().__init__(config, data_buffers_ref, device_config_ref, parent)
+        self._required_data_types = {"quat_w", "quat_x", "quat_y", "quat_z"}
+        self.current_quaternion = QQuaternion(1, 0, 0, 0)
+        self.baseline_quaternion = QQuaternion(1, 0, 0, 0)
+        
+        self.snapshot_dir = self.config.get('snapshot_dir', self.SNAPSHOT_DIR_DEFAULT)
+        os.makedirs(self.snapshot_dir, exist_ok=True)
+
+        self._setup_internal_ui()
+        self._setup_scene_elements()
+        self.clear_component()
+
+    def _setup_internal_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0,0,0,0)
+
+        self.view = gl.GLViewWidget()
+        self.view.setBackgroundColor(self.GLVIEW_BACKGROUND_COLOR)
+        self.view.setCameraPosition(distance=10, elevation=20, azimuth=45)
+        main_layout.addWidget(self.view, 1) # View takes most space
+
+        controls_widget = QWidget()
+        controls_layout = QVBoxLayout(controls_widget)
+        controls_layout.setContentsMargins(5,5,5,5)
+
+        self.orientation_status_label = QLabel("Yaw: 0.0° Pitch: 0.0° Roll: 0.0°")
+        self.orientation_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        font_orientation = self.orientation_status_label.font(); font_orientation.setPointSize(11)
+        self.orientation_status_label.setFont(font_orientation)
+        controls_layout.addWidget(self.orientation_status_label)
+
+        buttons_layout = QHBoxLayout()
+        self.snapshot_button = QPushButton("Take Snapshot")
+        self.snapshot_button.clicked.connect(self._take_snapshot_action)
+        buttons_layout.addWidget(self.snapshot_button)
+
+        self.reset_button = QPushButton("Reset Orientation")
+        self.reset_button.clicked.connect(self._reset_orientation_action)
+        buttons_layout.addWidget(self.reset_button)
+        controls_layout.addLayout(buttons_layout)
+        
+        controls_widget.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        main_layout.addWidget(controls_widget)
+        self.setLayout(main_layout)
+
+    @staticmethod
+    def _create_cylinder_mesh_data(radius: float, length: float, sections: int = 20) -> Tuple[np.ndarray, np.ndarray]:
+        verts = []
+        faces = []
+        for i in range(sections + 1):
+            angle = (i / sections) * 2 * np.pi
+            x = radius * np.cos(angle)
+            y = radius * np.sin(angle)
+            verts.extend([[x, y, 0], [x, y, length]])
+        for i in range(sections):
+            i2 = i * 2; i2_n = ((i + 1) % sections) * 2
+            faces.append([i2, i2 + 1, i2_n + 1]); faces.append([i2, i2_n + 1, i2_n])
+        bottom_center_idx = len(verts); verts.append([0, 0, 0])
+        top_center_idx = len(verts); verts.append([0, 0, length])
+        for i in range(sections):
+            i2 = i * 2; i2_n = ((i + 1) % sections) * 2
+            faces.append([bottom_center_idx, i2_n, i2]); faces.append([top_center_idx, i2 + 1, i2_n + 1])
+        return np.array(verts, dtype=np.float32), np.array(faces, dtype=np.uint32)
+
+    @staticmethod
+    def _create_cone_mesh_data(radius: float, length: float, sections: int = 20) -> Tuple[np.ndarray, np.ndarray]:
+        verts = []
+        faces = []
+        for i in range(sections):
+            angle = (i / sections) * 2 * np.pi
+            x = radius * np.cos(angle); y = radius * np.sin(angle)
+            verts.append([x, y, 0])
+        tip_idx = len(verts); verts.append([0, 0, length])
+        base_center_idx = len(verts); verts.append([0, 0, 0])
+        for i in range(sections):
+            i_n = (i + 1) % sections
+            faces.append([tip_idx, i, i_n]); faces.append([base_center_idx, i_n, i])
+        return np.array(verts, dtype=np.float32), np.array(faces, dtype=np.uint32)
+
+    def _setup_scene_elements(self):
+        grid = gl.GLGridItem()
+        grid.scale(self.GRID_SCALE, self.GRID_SCALE, 1)
+        grid.setColor(self.GRID_COLOR)
+        self.view.addItem(grid)
+
+        shaft_verts, shaft_faces = self._create_cylinder_mesh_data(self.AXIS_RADIUS, self.AXIS_LENGTH)
+        arrow_verts, arrow_faces = self._create_cone_mesh_data(self.ARROW_RADIUS, self.ARROW_LENGTH)
+
+        # X Axis
+        color_x = self.AXIS_COLORS['x']
+        x_shaft_mesh = gl.GLMeshItem(vertexes=shaft_verts, faces=shaft_faces, color=color_x, smooth=True, computeNormals=True)
+        tr_shaft_x = pg.Transform3D(); tr_shaft_x.rotate(90, 0, 1, 0); x_shaft_mesh.setTransform(tr_shaft_x)
+        self.view.addItem(x_shaft_mesh)
+        x_arrow_mesh = gl.GLMeshItem(vertexes=arrow_verts, faces=arrow_faces, color=color_x, smooth=True, computeNormals=True)
+        tr_arrow_x = pg.Transform3D(); tr_arrow_x.translate(self.AXIS_LENGTH, 0, 0); tr_arrow_x.rotate(90, 0, 1, 0); x_arrow_mesh.setTransform(tr_arrow_x)
+        self.view.addItem(x_arrow_mesh)
+
+        # Y Axis
+        color_y = self.AXIS_COLORS['y']
+        y_shaft_mesh = gl.GLMeshItem(vertexes=shaft_verts, faces=shaft_faces, color=color_y, smooth=True, computeNormals=True)
+        tr_shaft_y = pg.Transform3D(); tr_shaft_y.rotate(-90, 1, 0, 0); y_shaft_mesh.setTransform(tr_shaft_y)
+        self.view.addItem(y_shaft_mesh)
+        y_arrow_mesh = gl.GLMeshItem(vertexes=arrow_verts, faces=arrow_faces, color=color_y, smooth=True, computeNormals=True)
+        tr_arrow_y = pg.Transform3D(); tr_arrow_y.translate(0, self.AXIS_LENGTH, 0); tr_arrow_y.rotate(-90, 1, 0, 0); y_arrow_mesh.setTransform(tr_arrow_y)
+        self.view.addItem(y_arrow_mesh)
+
+        # Z Axis
+        color_z = self.AXIS_COLORS['z']
+        z_shaft_mesh = gl.GLMeshItem(vertexes=shaft_verts, faces=shaft_faces, color=color_z, smooth=True, computeNormals=True)
+        self.view.addItem(z_shaft_mesh) # No rotation needed for shaft
+        z_arrow_mesh = gl.GLMeshItem(vertexes=arrow_verts, faces=arrow_faces, color=color_z, smooth=True, computeNormals=True)
+        tr_arrow_z = pg.Transform3D(); tr_arrow_z.translate(0, 0, self.AXIS_LENGTH); z_arrow_mesh.setTransform(tr_arrow_z)
+        self.view.addItem(z_arrow_mesh)
+
+        # Box
+        width, height, depth = self.BOX_SIZE
+        w2, h2, d2 = width / 2, height / 2, depth / 2
+        box_vertices = np.array([
+            [-w2, -h2, -d2], [ w2, -h2, -d2], [ w2,  h2, -d2], [-w2,  h2, -d2],
+            [-w2, -h2,  d2], [ w2, -h2,  d2], [ w2,  h2,  d2], [-w2,  h2,  d2]], dtype=np.float32)
+        box_faces = np.array([
+            [0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7], [0, 4, 7], [0, 7, 3],
+            [1, 5, 6], [1, 6, 2], [0, 1, 5], [0, 5, 4], [3, 2, 6], [3, 6, 7]], dtype=np.uint32)
+        
+        face_colors_rgba = np.array(self.BOX_COLORS, dtype=np.float32) # Ensure it's (N,4)
+        triangle_colors = np.repeat(face_colors_rgba, 2, axis=0)
+
+        self.box_mesh = gl.GLMeshItem(
+            vertexes=box_vertices, faces=box_faces, faceColors=triangle_colors,
+            drawEdges=True, edgeColor=self.BOX_EDGE_COLOR, smooth=False, computeNormals=True)
+        self.view.addItem(self.box_mesh)
+
+    def update_component(self, current_relative_time: float, is_flowing: bool):
+        if plotting_paused: return
+        
+        missing_uuid_active = False
+        if self.uuid_missing_overlay and self.uuid_missing_overlay.isVisible():
+            missing_uuid_active = True
+
+        q_w, q_x, q_y, q_z = None, None, None, None
+        if not missing_uuid_active:
+            if 'quat_w' in self.data_buffers_ref and self.data_buffers_ref['quat_w']:
+                q_w = self.data_buffers_ref['quat_w'][-1][1]
+            if 'quat_x' in self.data_buffers_ref and self.data_buffers_ref['quat_x']:
+                q_x = self.data_buffers_ref['quat_x'][-1][1]
+            if 'quat_y' in self.data_buffers_ref and self.data_buffers_ref['quat_y']:
+                q_y = self.data_buffers_ref['quat_y'][-1][1]
+            if 'quat_z' in self.data_buffers_ref and self.data_buffers_ref['quat_z']:
+                q_z = self.data_buffers_ref['quat_z'][-1][1]
+
+        if all(q is not None for q in [q_w, q_x, q_y, q_z]):
+            self.current_quaternion = QQuaternion(float(q_w), float(q_x), float(q_y), float(q_z))
+        elif not missing_uuid_active: # Only reset if data is expected but not fully there
+            self.current_quaternion = QQuaternion(1,0,0,0) # Reset to identity if data incomplete and no UUID error
+
+        if missing_uuid_active: # If UUID missing, force identity and clear label
+            relative_quat = QQuaternion(1,0,0,0)
+            self.orientation_status_label.setText("Yaw: --- Pitch: --- Roll: ---")
+        else:
+            relative_quat = self.baseline_quaternion.inverted() * self.current_quaternion
+            yaw, pitch, roll = self._get_euler_angles_from_qt_quaternion(relative_quat)
+            self.orientation_status_label.setText(f"Yaw: {yaw:6.1f}°  Pitch: {pitch:6.1f}°  Roll: {roll:6.1f}°")
+
+        transform = pg.Transform3D()
+        transform.rotate(relative_quat)
+        if hasattr(self, 'box_mesh'):
+            self.box_mesh.setTransform(transform)
+
+    def _get_euler_angles_from_qt_quaternion(self, q: QQuaternion) -> Tuple[float, float, float]:
+        euler_vector = q.toEulerAngles() # Returns QVector3D: (pitch, yaw, roll)
+        pitch = euler_vector.x()
+        yaw = euler_vector.y()
+        roll = euler_vector.z()
+        return yaw, pitch, roll
+
+    def clear_component(self):
+        self.current_quaternion = QQuaternion(1, 0, 0, 0)
+        self.baseline_quaternion = QQuaternion(1, 0, 0, 0)
+        
+        identity_quat = QQuaternion(1,0,0,0)
+        transform = pg.Transform3D()
+        transform.rotate(identity_quat)
+        if hasattr(self, 'box_mesh'):
+            self.box_mesh.setTransform(transform)
+        
+        yaw, pitch, roll = self._get_euler_angles_from_qt_quaternion(identity_quat)
+        self.orientation_status_label.setText(f"Yaw: {yaw:6.1f}°  Pitch: {pitch:6.1f}°  Roll: {roll:6.1f}°")
+        super().handle_missing_uuids(set()) # Clear overlay
+        if hasattr(self, 'snapshot_button'): self.snapshot_button.setEnabled(True)
+        if hasattr(self, 'reset_button'): self.reset_button.setEnabled(True)
+
+
+    def _take_snapshot_action(self):
+        if not hasattr(self, 'view'): return
+        try:
+            size = self.view.size()
+            width, height = size.width(), size.height()
+            if width <= 0 or height <= 0:
+                logger.warning("IMU Snapshot: View size is invalid, cannot take snapshot.")
+                return
+
+            image = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
+            image.fill(Qt.GlobalColor.transparent) # Fill with transparent before rendering
+            
+            painter = QPainter(image)
+            # self.view.render(painter) # This renders GL content
+            # For full snapshot including controls if they overlay, grab widget:
+            # self.view.grabFramebuffer().save(os.path.join(self.snapshot_dir, f"snapshot_glview_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]}.png"))
+
+
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            filename = os.path.join(self.snapshot_dir, f"snapshot_{timestamp}.png")
+            
+            # Render the GLViewWidget content to the QImage
+            self.view.render(painter) # painter operates on 'image'
+            painter.end() # Crucial to end painting before saving
+
+            if image.save(filename, "PNG", 100):
+                logger.info(f"IMU Snapshot saved as {filename}")
+            else:
+                logger.error(f"IMU Snapshot: Failed to save QImage to {filename}")
+
+        except Exception as e:
+            logger.error(f"IMU Snapshot failed: {e}", exc_info=True)
+
+    def _reset_orientation_action(self):
+        self.baseline_quaternion = QQuaternion(
+            self.current_quaternion.scalar(),
+            self.current_quaternion.x(),
+            self.current_quaternion.y(),
+            self.current_quaternion.z(),
+        )
+        # Force an update to reflect the reset
+        self.update_component(0, False) # Args might not be ideal, but triggers logic
+
+    def get_widget(self) -> QWidget:
+        return self
+
+    def get_required_data_types(self) -> Set[str]:
+        return self._required_data_types
+
+    def get_log_filename_suffix(self) -> str:
+        if self.is_loggable:
+            title = self.config.get('title', 'IMU_3D_Visualizer')
+            safe_suffix = re.sub(r'[^\w\-]+', '_', title).strip('_')
+            return f"imuvis_{safe_suffix}" if safe_suffix else f"imuvis_{id(self)}"
+        return ""
+
+    def handle_missing_uuids(self, missing_uuids_for_component: Set[str]):
+        super().handle_missing_uuids(missing_uuids_for_component) # Show/hide overlay
+        are_buttons_defined = hasattr(self, 'snapshot_button') and hasattr(self, 'reset_button')
+
+        if missing_uuids_for_component:
+            if are_buttons_defined:
+                self.snapshot_button.setEnabled(False)
+                self.reset_button.setEnabled(False)
+            # Force view to identity and update label
+            self.current_quaternion = QQuaternion(1,0,0,0)
+            self.baseline_quaternion = QQuaternion(1,0,0,0)
+            self.update_component(0, False) 
+        else:
+            if are_buttons_defined:
+                self.snapshot_button.setEnabled(True)
+                self.reset_button.setEnabled(True)
+            # Data might become available, so an update is good
+            self.update_component(0, False)
 
 
 # --- Tab Layout Configuration ---
@@ -2084,38 +2395,45 @@ tab_configs = [
         ]
     },
     {
+        'tab_title': 'IMU 3D View', # New Tab
+        'layout': [
+            {
+                'component_class': IMUVisualizerComponent,
+                'row': 0, 'col': 0, 'rowspan':1, 'colspan':1,
+                'config': {
+                    'title': 'IMU Orientation Visualizer',
+                    'enable_logging': True, # Logs quat_w, quat_x, quat_y, quat_z
+                    # 'component_height': 600, # Optional: set fixed size
+                    # 'component_width': 800,  # Optional: set fixed size
+                }
+            }
+        ]
+    },
+    {
         'tab_title': 'Impedance',
         'layout': [
             {
                 'component_class': NyquistPlotComponent,
                 'row': 0, 'col': 0, 'rowspan': 2, 'colspan': 1,
                 'config': {
-                    'title': 'Live Nyquist Plot',
-                    'xlabel': "Re(Z) [kOhm]",
-                    'ylabel': "-Im(Z) [kOhm]",
-                    'plot_height': 600, 
-                    'plot_width': 600,  
-                    'snapshot_dir': 'nyquist_snapshots',
-                    'enable_logging': True 
+                    'title': 'Live Nyquist Plot', 'xlabel': "Re(Z) [kOhm]", 'ylabel': "-Im(Z) [kOhm]",
+                    'plot_height': 600, 'plot_width': 600,  
+                    'snapshot_dir': 'nyquist_snapshots', 'enable_logging': True 
                 }
             },
             {
-                'component_class': TimeSeriesPlotComponent,
-                'row': 0, 'col': 1,
+                'component_class': TimeSeriesPlotComponent, 'row': 0, 'col': 1,
                 'config': {
-                    'title': 'Impedance Magnitude vs Time',
-                    'xlabel': 'Time [s]', 'ylabel': '|Z| [Ohm]',
+                    'title': 'Impedance Magnitude vs Time', 'xlabel': 'Time [s]', 'ylabel': '|Z| [Ohm]',
                     'plot_height': 300, 
                     'datasets': [{'data_type': 'impedance_magnitude_ohm', 'label': '|Z|', 'color': 'purple'}],
                     'enable_logging': True
                 }
             },
             {
-                'component_class': TimeSeriesPlotComponent,
-                'row': 1, 'col': 1,
+                'component_class': TimeSeriesPlotComponent, 'row': 1, 'col': 1,
                 'config': {
-                    'title': 'Impedance Phase vs Time',
-                    'xlabel': 'Time [s]', 'ylabel': 'Phase [degrees]',
+                    'title': 'Impedance Phase vs Time', 'xlabel': 'Time [s]', 'ylabel': 'Phase [degrees]',
                     'plot_height': 300, 
                     'datasets': [{'data_type': 'impedance_phase_rad', 'label': 'Phase', 'color': 'orange'}],
                     'enable_logging': True
@@ -2126,8 +2444,7 @@ tab_configs = [
     {
         'tab_title': 'IMU Basic',
         'layout': [
-            {   'component_class': TimeSeriesPlotComponent,
-                'row': 0, 'col': 0,
+            {   'component_class': TimeSeriesPlotComponent, 'row': 0, 'col': 0,
                 'config': {
                     'title': 'Orientation vs Time', 'xlabel': 'Time [s]', 'ylabel': 'Degrees',
                     'plot_height': 300, 'plot_width': 450,
@@ -2137,8 +2454,7 @@ tab_configs = [
                     'enable_logging': True
                 }
             },
-            {   'component_class': TimeSeriesPlotComponent,
-                'row': 0, 'col': 1,
+            {   'component_class': TimeSeriesPlotComponent, 'row': 0, 'col': 1,
                 'config': {
                     'title': 'Angular Velocity vs Time','xlabel': 'Time [s]','ylabel': 'Degrees/s',
                     'plot_height': 300, 'plot_width': 600,
@@ -2148,24 +2464,16 @@ tab_configs = [
                     'enable_logging': False
                 }
             },
-            {   'component_class': SingleValueDisplayComponent,
-                'row': 1, 'col': 0,
+            {   'component_class': SingleValueDisplayComponent, 'row': 1, 'col': 0,
                 'config': {
-                    'label': 'Current Roll',
-                    'data_type': 'orientation_x',
-                    'format': '{:.1f}',
-                    'units': '°',
-                    'enable_logging': True
+                    'label': 'Current Roll', 'data_type': 'orientation_x',
+                    'format': '{:.1f}', 'units': '°', 'enable_logging': True
                 }
             },
-            {   'component_class': SingleValueDisplayComponent,
-                'row': 1, 'col': 1,
+            {   'component_class': SingleValueDisplayComponent, 'row': 1, 'col': 1,
                 'config': {
-                    'label': 'Current Yaw Rate',
-                    'data_type': 'gyro_z',
-                    'format': '{:.1f}',
-                    'units': '°/s',
-                    'enable_logging': False
+                    'label': 'Current Yaw Rate', 'data_type': 'gyro_z',
+                    'format': '{:.1f}', 'units': '°/s', 'enable_logging': False
                 }
             }
         ]
@@ -2173,8 +2481,7 @@ tab_configs = [
     {
         'tab_title': 'IMU Acceleration',
         'layout': [
-            {   'component_class': TimeSeriesPlotComponent,
-                'row': 0, 'col': 0,
+            {   'component_class': TimeSeriesPlotComponent, 'row': 0, 'col': 0,
                 'config': {
                     'title': 'Linear Acceleration vs Time','xlabel': 'Time [s]','ylabel': 'm/s²',
                     'plot_height': 300,
@@ -2184,8 +2491,7 @@ tab_configs = [
                     'enable_logging': True
                 }
             },
-            {   'component_class': TimeSeriesPlotComponent,
-                'row': 1, 'col': 0,
+            {   'component_class': TimeSeriesPlotComponent, 'row': 1, 'col': 0,
                 'config': {
                     'title': 'Raw Acceleration vs Time','xlabel': 'Time [s]','ylabel': 'm/s²',
                     'plot_height': 300,
@@ -2194,8 +2500,7 @@ tab_configs = [
                                  {'data_type': 'accel_z', 'label': 'Z', 'color': 'b'}]
                 }
             },
-            {   'component_class': TimeSeriesPlotComponent,
-                'row': 0, 'col': 1,
+            {   'component_class': TimeSeriesPlotComponent, 'row': 0, 'col': 1,
                 'config': {
                      'title': 'Gravity vs Time','xlabel': 'Time [s]','ylabel': 'm/s²',
                      'plot_height': 300,
@@ -2210,8 +2515,7 @@ tab_configs = [
     {
         'tab_title': 'Other Sensors',
         'layout': [
-             {  'component_class': TimeSeriesPlotComponent,
-                 'row': 0, 'col': 0,
+             {  'component_class': TimeSeriesPlotComponent, 'row': 0, 'col': 0,
                  'config': {
                      'title': 'Magnetic Field vs Time','xlabel': 'Time [s]','ylabel': 'µT',
                      'plot_height': 350, 'plot_width': 600,
@@ -2221,12 +2525,10 @@ tab_configs = [
                      'enable_logging': True
                  }
              },
-             {   'component_class': SingleValueDisplayComponent,
-                 'row': 1, 'col': 0,
+             {   'component_class': SingleValueDisplayComponent, 'row': 1, 'col': 0,
                  'config': {
                     'label': 'Current Mag X', 'data_type': 'mag_x',
-                    'format': '{:.1f}', 'units': 'µT',
-                    'enable_logging': True
+                    'format': '{:.1f}', 'units': 'µT', 'enable_logging': True
                 }
             },
         ]
@@ -2234,35 +2536,21 @@ tab_configs = [
     {
         'tab_title': 'Optical Flow',
         'layout': [
-            {
-                'component_class': TimeSeriesPlotComponent,
-                'row': 0, 'col': 0,
+            {   'component_class': TimeSeriesPlotComponent, 'row': 0, 'col': 0,
                 'config': {
-                    'title': 'Optical Flow Δ vs Time',
-                    'xlabel': 'Time [s]',
-                    'ylabel': 'Pixel Δ',
-                    'plot_height': 350,
-                    'plot_width': 600,
-                    'datasets': [
-                        {'data_type': 'opt_dx',    'label': 'ΔX',    'color': 'r'},
-                        {'data_type': 'opt_dy',    'label': 'ΔY',    'color': 'g'}
-                    ],
+                    'title': 'Optical Flow Δ vs Time', 'xlabel': 'Time [s]', 'ylabel': 'Pixel Δ',
+                    'plot_height': 350, 'plot_width': 600,
+                    'datasets': [ {'data_type': 'opt_dx', 'label': 'ΔX', 'color': 'r'},
+                                  {'data_type': 'opt_dy', 'label': 'ΔY', 'color': 'g'}],
                     'enable_logging': True
                 }
             },
-            {
-                'component_class': TimeSeriesPlotComponent,
-                'row': 0, 'col': 1,
+            {   'component_class': TimeSeriesPlotComponent, 'row': 0, 'col': 1,
                 'config': {
-                    'title': 'Cumulative Optical Flow vs Time',
-                    'xlabel': 'Time [s]',
-                    'ylabel': 'Pixels',
-                    'plot_height': 350,
-                    'plot_width': 600,
-                    'datasets': [
-                        {'data_type': 'opt_cum_x', 'label': 'Cum X', 'color': 'r'},
-                        {'data_type': 'opt_cum_y', 'label': 'Cum Y', 'color': 'g'}
-                    ],
+                    'title': 'Cumulative Optical Flow vs Time', 'xlabel': 'Time [s]', 'ylabel': 'Pixels',
+                    'plot_height': 350, 'plot_width': 600,
+                    'datasets': [ {'data_type': 'opt_cum_x', 'label': 'Cum X', 'color': 'r'},
+                                  {'data_type': 'opt_cum_y', 'label': 'Cum Y', 'color': 'g'}],
                     'enable_logging': True
                 }
             }
@@ -2271,33 +2559,19 @@ tab_configs = [
     {
         'tab_title': 'ToF Sensor',
         'layout': [
-            {
-                'component_class': TimeSeriesPlotComponent,
-                'row': 0, 'col': 0,
+            {   'component_class': TimeSeriesPlotComponent, 'row': 0, 'col': 0,
                 'config': {
-                    'title': 'Distance vs Time',
-                    'xlabel': 'Time [s]',
-                    'ylabel': 'Distance [mm]',
-                    'plot_height': 350,
-                    'plot_width': 350,
-                    'datasets': [
-                        {'data_type': 'tof_distance_mm', 'label': 'Distance', 'color': 'b'}
-                    ],
+                    'title': 'Distance vs Time', 'xlabel': 'Time [s]', 'ylabel': 'Distance [mm]',
+                    'plot_height': 350, 'plot_width': 350,
+                    'datasets': [ {'data_type': 'tof_distance_mm', 'label': 'Distance', 'color': 'b'}],
                     'enable_logging': True
                 }
             },
-            {
-                'component_class': TimeSeriesPlotComponent,
-                'row': 0, 'col': 1,
+            {   'component_class': TimeSeriesPlotComponent, 'row': 0, 'col': 1,
                 'config': {
-                    'title': 'Darkness vs Time',
-                    'xlabel': 'Time [s]',
-                    'ylabel': 'Darkness [kcps/spad]',
-                    'plot_height': 350,
-                    'plot_width': 350,
-                    'datasets': [
-                        {'data_type': 'tof_brightness_kcps', 'label': 'Darkness', 'color': 'k'}
-                    ],
+                    'title': 'Darkness vs Time', 'xlabel': 'Time [s]', 'ylabel': 'Darkness [kcps/spad]',
+                    'plot_height': 350, 'plot_width': 350,
+                    'datasets': [ {'data_type': 'tof_brightness_kcps', 'label': 'Darkness', 'color': 'k'}],
                     'enable_logging': True
                 }
             }
@@ -2306,38 +2580,26 @@ tab_configs = [
     {
         'tab_title': 'Ankle Angles',
         'layout': [
-            {   'component_class': TimeSeriesPlotComponent,
-                'row': 0, 'col': 0,
+            {   'component_class': TimeSeriesPlotComponent, 'row': 0, 'col': 0,
                 'config': {
-                    'title': 'Ankle XZ vs Time',
-                    'xlabel': 'Time [s]',
-                    'ylabel': 'Angle [°]',
+                    'title': 'Ankle XZ vs Time', 'xlabel': 'Time [s]', 'ylabel': 'Angle [°]',
                     'plot_height': 300, 'plot_width': 450,
-                    'datasets': [
-                        {'data_type': 'ankle_xz', 'label': 'XZ', 'color': 'r'}
-                    ],
+                    'datasets': [ {'data_type': 'ankle_xz', 'label': 'XZ', 'color': 'r'}],
                     'enable_logging': True
                 }
             },
-            {   'component_class': TimeSeriesPlotComponent,
-                'row': 0, 'col': 1,
+            {   'component_class': TimeSeriesPlotComponent, 'row': 0, 'col': 1,
                 'config': {
-                    'title': 'Ankle YZ vs Time',
-                    'xlabel': 'Time [s]',
-                    'ylabel': 'Angle [°]',
+                    'title': 'Ankle YZ vs Time', 'xlabel': 'Time [s]', 'ylabel': 'Angle [°]',
                     'plot_height': 300, 'plot_width': 450,
-                    'datasets': [
-                        {'data_type': 'ankle_yz', 'label': 'YZ', 'color': 'g'}
-                    ],
+                    'datasets': [ {'data_type': 'ankle_yz', 'label': 'YZ', 'color': 'g'}],
                     'enable_logging': True
                 }
             }
         ]
     }
 ]
-
-
-
+# ---
 
 #####################################################################################################################
 # End of customizable section
@@ -2410,14 +2672,24 @@ class GuiManager:
                 logger.error(f"Error updating component {type(component).__name__}: {e}", exc_info=True)
 
     def clear_all_components(self):
-        logger.info("GuiManager clearing all components.")
-        self.active_missing_uuids.clear()
+        logger.info("GuiManager clearing all connected components...")
         for component in self.all_components:
+            # skip components that still have missing‐UUID overlays
+            required = component.get_required_data_types()
+            missing_for_comp = {
+                uuid
+                for dt in required
+                if (uuid := self.device_config_ref.get_uuid_for_data_type(dt))
+                and uuid in self.active_missing_uuids
+            }
+            if missing_for_comp:
+                continue
             try:
                 component.clear_component()
                 component.handle_missing_uuids(set())
             except Exception as e:
                 logger.error(f"Error clearing component {type(component).__name__}: {e}", exc_info=True)
+
 
     def notify_missing_uuids(self, missing_uuids_set: Set[str]):
         logger.info(f"GuiManager received missing UUIDs: {missing_uuids_set if missing_uuids_set else 'None'}")
@@ -3220,7 +3492,7 @@ class MainWindow(QMainWindow):
         else: logger.warning("CSV generation done, but no files were saved (no loggable components / no valid data?).")
 
     def clear_gui_action(self, confirm=True):
-        global data_buffers, start_time
+        global data_buffers, start_time, opt_cum_x, opt_cum_y
         logger.info("Attempting to clear GUI components and data.")
         do_clear = False
         if confirm:
@@ -3245,6 +3517,12 @@ class MainWindow(QMainWindow):
                  self.capture_t0_absolute = None; self.capture_timestamp = None
             data_buffers.clear()
             start_time = None
+
+            # reset optical-flow accumulators:
+            opt_cum_x = 0
+            opt_cum_y = 0
+            logger.info(f"Optical‐flow accumulators reset → opt_cum_x={opt_cum_x}, opt_cum_y={opt_cum_y}")
+
             self.gui_manager.clear_all_components()
 
     def apply_interval(self):
@@ -3348,6 +3626,13 @@ class MainWindow(QMainWindow):
 
 # --- Main Execution ---
 if __name__ == "__main__":
+
+    # request aliasing
+    fmt = QSurfaceFormat()
+    fmt.setSamples(4)  # Request MSAA x4
+    QSurfaceFormat.setDefaultFormat(fmt)
+
+    # main application setup
     app = QApplication(sys.argv)
     qasync_loop = qasync.QEventLoop(app)
     asyncio.set_event_loop(qasync_loop)
