@@ -33,10 +33,10 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFrame, QGridLayout, QCheckBox, QLineEdit,
     QScrollArea, QMessageBox, QSizePolicy, QTextEdit, QTabWidget,
-    QComboBox, QSlider # Added QComboBox, QSlider
+    QComboBox, QSlider 
 )
-from PyQt6.QtGui import (QColor, QPainter, QBrush, QPen, QPixmap, QImage, QPolygonF, QIntValidator, QDoubleValidator) # Added heatmap graphics items
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QMetaObject, QThread, QPointF # Added QPointF for heatmap
+from PyQt6.QtGui import (QColor, QPainter, QBrush, QPen, QPixmap, QImage, QPolygonF, QIntValidator, QDoubleValidator)
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QMetaObject, QThread, QPointF
 
 
 # --- PyQtGraph Import ---
@@ -44,6 +44,9 @@ import pyqtgraph as pg
 
 # --- SuperQT Import for RangeSlider ---
 from superqt.sliders import QRangeSlider # Needed for heatmap pressure range
+
+# Added for Impedance Plotter snapshot
+from concurrent.futures import ThreadPoolExecutor
 
 # Apply PyQtGraph global options for background/foreground
 pg.setConfigOption('background', 'w')
@@ -136,7 +139,7 @@ class DeviceConfig:
 
 # 1. Data handlers for different characteristics
 # 2. Device configuration (add UUIDs AND `produces_data_types`)
-# 3. Define GUI Component Classes (e.g., plots, indicators)
+# 3. Define GUI Component Classes (e.g., plot class, indicator class, etc.)
 # 4. Define Tab Layout Configuration using the components
 
 # --- Constants needed for Insole Data Handling ---
@@ -467,7 +470,7 @@ device_config = DeviceConfig(
     name="Nano33IoT", # Initial default name
     service_uuid="19B10000-E8F2-537E-4F6C-D104768A1214",
     characteristics=[
-        # BLE Characteristics
+        # IMU Characteristics
         CharacteristicConfig(uuid="19B10001-E8F2-537E-4F6C-D104768A1214", handler=handle_orientation_data,
                              produces_data_types=['orientation_x', 'orientation_y', 'orientation_z']),
         CharacteristicConfig(uuid="19B10003-E8F2-537E-4F6C-D104768A1214", handler=handle_gyro_data,
@@ -482,24 +485,20 @@ device_config = DeviceConfig(
                              produces_data_types=['gravity_x', 'gravity_y', 'gravity_z']),
         # Insole Characteristic
         CharacteristicConfig(uuid="19B10002-E8F2-537E-4F6C-D104768A1214", handler=handle_insole_data,
-                             produces_data_types=HEATMAP_KEYS + ['estimated_weight']), # Produces FSR pressures + weight + angle
-        CharacteristicConfig(
-            uuid="19B10009-E8F2-537E-4F6C-D104768A1214",
+                             produces_data_types=HEATMAP_KEYS + ['estimated_weight']),
+        CharacteristicConfig(uuid="19B10009-E8F2-537E-4F6C-D104768A1214",
             handler=handle_adc_data,
             produces_data_types=['impedance_magnitude_ohm', 'impedance_phase_rad', 'real_part_kohm', 'imag_part_kohm']
         ),
-        CharacteristicConfig(
-            uuid="19B10012-E8F2-537E-4F6C-D104768A1214",
+        CharacteristicConfig(uuid="19B10012-E8F2-537E-4F6C-D104768A1214",
             handler=handle_optical_xy_data,
             produces_data_types=['opt_dx', 'opt_dy', 'opt_cum_x', 'opt_cum_y']
         ),
-        CharacteristicConfig(
-            uuid="19B10014-E8F2-537E-4F6C-D104768A1214",
+        CharacteristicConfig(uuid="19B10014-E8F2-537E-4F6C-D104768A1214",
             handler=handle_tof_data,
             produces_data_types=['tof_distance_mm', 'tof_brightness_kcps']
         ),
-        CharacteristicConfig(
-            uuid="19B10016-E8F2-537E-4F6C-D104768A1214",
+        CharacteristicConfig(uuid="19B10016-E8F2-537E-4F6C-D104768A1214",
             handler=handle_ankle_angle_data,
             produces_data_types=['ankle_xz', 'ankle_yz']
         ),
@@ -1783,6 +1782,271 @@ class SingleValueDisplayComponent(BaseGuiComponent):
              self.update_component(current_time, False)
 
 
+# --- Nyquist Plot Component ---
+class NyquistPlotComponent(BaseGuiComponent):
+    # Constants
+    TRAIL_MAX_LEN = 50
+    TRAIL_COLOR = QColor(243, 100, 248, 255)  # Bright pink
+    MAIN_POINT_COLOR = QColor(0, 0, 0, 255)    # Black
+    TRAIL_POINT_RADIUS = 3.0
+    MAIN_POINT_RADIUS = 5.0
+    SPLINE_SAMPLES_PER_SEGMENT = 10
+    SPLINE_LINE_WIDTH = 3
+    SNAPSHOT_DPI = 200
+
+    def __init__(self, config: Dict[str, Any], data_buffers_ref: Dict[str, List[Tuple[float, float]]], device_config_ref: DeviceConfig, parent: Optional[QWidget] = None):
+        super().__init__(config, data_buffers_ref, device_config_ref, parent)
+
+        self._required_data_types: Set[str] = {"real_part_kohm", "imag_part_kohm"}
+        self.missing_relevant_uuids: Set[str] = set()
+
+        self.trail_data: deque[Tuple[float, float]] = deque(maxlen=self.TRAIL_MAX_LEN)
+
+        self.snapshot_dir = self.config.get('snapshot_dir', "nyquist_snapshots")
+        os.makedirs(self.snapshot_dir, exist_ok=True)
+        self.snapshot_executor = ThreadPoolExecutor(max_workers=1)
+
+        self.plot_widget = pg.PlotWidget()
+        self.plot_item: pg.PlotItem = self.plot_widget.getPlotItem()
+        self._setup_plot_appearance()
+
+        self.spline_items: List[pg.PlotDataItem] = []
+        for _ in range(self.TRAIL_MAX_LEN - 1):
+            item = pg.PlotDataItem(pen=None)
+            self.plot_item.addItem(item)
+            self.spline_items.append(item)
+
+        self.trail_scatter_item = pg.ScatterPlotItem()
+        self.current_scatter_item = pg.ScatterPlotItem()
+        self.plot_item.addItem(self.trail_scatter_item)
+        self.plot_item.addItem(self.current_scatter_item)
+
+        component_layout = QVBoxLayout(self)
+        component_layout.setContentsMargins(0, 0, 0, 0)
+        component_layout.addWidget(self.plot_widget)
+
+        self.snapshot_button = QPushButton("Take Snapshot")
+        self.snapshot_button.clicked.connect(self._trigger_snapshot_creation)
+        component_layout.addWidget(self.snapshot_button)
+
+        self.setLayout(component_layout)
+        self.clear_component()
+
+    def _setup_plot_appearance(self):
+        plot_height = self.config.get('plot_height')
+        plot_width = self.config.get('plot_width')
+        if plot_height is not None: self.setFixedHeight(plot_height)
+        if plot_width is not None: self.setFixedWidth(plot_width)
+        
+        if plot_height is not None and plot_width is None:
+            self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        elif plot_width is not None and plot_height is None:
+            self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        elif plot_width is None and plot_height is None:
+             self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        else: 
+             self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
+        self.plot_item.setTitle(self.config.get('title', 'Nyquist Plot'), size='10pt')
+        self.plot_item.setLabel('bottom', self.config.get('xlabel', "Real Z' [kOhm]"))
+        self.plot_item.setLabel('left', self.config.get('ylabel', "-Imag Z'' [kOhm]"))
+        self.plot_item.showGrid(x=True, y=True, alpha=0.3)
+        self.plot_item.getViewBox().setAspectLocked(True)
+        self.plot_item.getViewBox().setDefaultPadding(0.05)
+
+    def get_required_data_types(self) -> Set[str]:
+        return self._required_data_types
+
+    def get_log_filename_suffix(self) -> str:
+        if self.is_loggable:
+            title = self.config.get('title', 'NyquistPlot')
+            safe_suffix = re.sub(r'[^\w\-]+', '_', title).strip('_')
+            return f"nyquist_{safe_suffix}" if safe_suffix else f"nyquist_{id(self)}"
+        return ""
+
+    def update_component(self, current_relative_time: float, is_flowing: bool):
+        if plotting_paused or self.missing_relevant_uuids:
+            return
+
+        real_key, imag_key = "real_part_kohm", "imag_part_kohm"
+        new_data_point = None
+
+        if real_key in self.data_buffers_ref and self.data_buffers_ref[real_key] and \
+           imag_key in self.data_buffers_ref and self.data_buffers_ref[imag_key]:
+            try:
+                latest_real_val = self.data_buffers_ref[real_key][-1][1]
+                latest_imag_val = self.data_buffers_ref[imag_key][-1][1]
+                new_data_point = (float(latest_real_val), -float(latest_imag_val))
+            except (IndexError, ValueError) as e:
+                logger.debug(f"NyquistPlot: Error fetching latest data: {e}")
+            except Exception as e:
+                logger.warning(f"NyquistPlot: Unexpected error processing data: {e}")
+
+        if new_data_point:
+            self.trail_data.append(new_data_point)
+            self._refresh_plot_graphics()
+
+    def _refresh_plot_graphics(self):
+        points = list(self.trail_data)
+        num_points = len(points)
+
+        if not num_points:
+            self.trail_scatter_item.clear()
+            self.current_scatter_item.clear()
+            for spline in self.spline_items:
+                spline.clear()
+            return
+
+        if num_points > 1:
+            alphas_for_trail = (np.linspace(0.1, 1.0, num_points) ** 1.5) * 255
+        else:
+            alphas_for_trail = np.array([255.0])
+        alphas_for_trail = np.clip(alphas_for_trail, 0, 255).astype(int)
+
+        base_rgb = (self.TRAIL_COLOR.red(), self.TRAIL_COLOR.green(), self.TRAIL_COLOR.blue())
+
+        trail_plot_data = []
+        for i in range(num_points):
+            pt = points[i]; alpha = alphas_for_trail[i]
+            trail_plot_data.append({'pos': pt, 'size': self.TRAIL_POINT_RADIUS * 2,
+                                    'brush': pg.mkBrush(QColor(*base_rgb, alpha)), 'pen': None})
+        self.trail_scatter_item.setData(trail_plot_data)
+
+        self.current_scatter_item.setData([{'pos': points[-1], 'size': self.MAIN_POINT_RADIUS * 2,
+                                           'brush': pg.mkBrush(self.MAIN_POINT_COLOR),
+                                           'pen': pg.mkPen(QColor(255,255,255,150), width=0.5)}])
+        for i in range(len(self.spline_items)):
+            if i < num_points - 1:
+                p1 = points[i]; p2 = points[i+1]
+                p0 = points[i-1] if i > 0 else p1
+                p3 = points[i+2] if i < num_points - 2 else p2
+                segment_coords = self._catmull_rom_segment_static(p0, p1, p2, p3, self.SPLINE_SAMPLES_PER_SEGMENT)
+                xs = [c[0] for c in segment_coords]; ys = [c[1] for c in segment_coords]
+                segment_alpha = alphas_for_trail[i]
+                pen = pg.mkPen(QColor(*base_rgb, segment_alpha), width=self.SPLINE_LINE_WIDTH)
+                self.spline_items[i].setData(xs, ys, pen=pen)
+            else:
+                self.spline_items[i].clear()
+        
+        if not self.missing_relevant_uuids and num_points > 0:
+            self.plot_item.enableAutoRange(axis='xy', enable=True)
+
+    @staticmethod
+    def _catmull_rom_point_static(t: float, p0_tuple, p1_tuple, p2_tuple, p3_tuple):
+        t2 = t * t; t3 = t2 * t
+        p0x, p0y = p0_tuple; p1x, p1y = p1_tuple; p2x, p2y = p2_tuple; p3x, p3y = p3_tuple
+        x = 0.5 * ((2 * p1x) + (-p0x + p2x) * t + (2 * p0x - 5 * p1x + 4 * p2x - p3x) * t2 + (-p0x + 3 * p1x - 3 * p2x + p3x) * t3)
+        y = 0.5 * ((2 * p1y) + (-p0y + p2y) * t + (2 * p0y - 5 * p1y + 4 * p2y - p3y) * t2 + (-p0y + 3 * p1y - 3 * p2y + p3y) * t3)
+        return (x, y)
+
+    @classmethod
+    def _catmull_rom_segment_static(cls, p0, p1, p2, p3, samples: int):
+        return [cls._catmull_rom_point_static(i / samples, p0, p1, p2, p3) for i in range(samples + 1)]
+
+    def clear_component(self):
+        self.trail_data.clear()
+        self._refresh_plot_graphics()
+        super().handle_missing_uuids(set())
+        self.missing_relevant_uuids.clear()
+        self.plot_item.setXRange(-1, 1, padding=0.1)
+        self.plot_item.setYRange(-1, 1, padding=0.1)
+        self.plot_item.enableAutoRange(axis='xy', enable=True)
+        self.snapshot_button.setEnabled(True)
+        self.snapshot_button.setText("Take Snapshot")
+
+    def handle_missing_uuids(self, missing_uuids_for_component: Set[str]):
+        super().handle_missing_uuids(missing_uuids_for_component)
+        self.missing_relevant_uuids = missing_uuids_for_component
+        if self.missing_relevant_uuids:
+            self.trail_data.clear()
+            self._refresh_plot_graphics()
+            self.plot_item.enableAutoRange(axis='xy', enable=False)
+            self.plot_item.setXRange(-1, 1, padding=0.1)
+            self.plot_item.setYRange(-1, 1, padding=0.1)
+            self.snapshot_button.setEnabled(False)
+        else:
+            self.plot_item.enableAutoRange(axis='xy', enable=True)
+            self.snapshot_button.setEnabled(True)
+
+    def _trigger_snapshot_creation(self):
+        if not self.snapshot_button.isEnabled() or not self.trail_data:
+            if not self.trail_data: logger.info("NyquistPlot: No data for snapshot.")
+            return
+        self.snapshot_button.setEnabled(False)
+        self.snapshot_button.setText("Saving Snapshot...")
+        points_to_snapshot = list(self.trail_data)
+        current_view_range = self.plot_item.getViewBox().viewRange()
+        num_pts = len(points_to_snapshot)
+        alphas_snapshot = (np.linspace(0.1, 1.0, num_pts) ** 1.5) if num_pts > 1 else (np.array([1.0]) if num_pts ==1 else np.array([]))
+        timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        filename = f"nyquist_snapshot_{timestamp_str}.pdf"
+        filepath = os.path.join(self.snapshot_dir, filename)
+        loop = asyncio.get_running_loop() # Assumes qasync loop is running
+        future = loop.run_in_executor(
+            self.snapshot_executor, self._build_snapshot_pdf_sync,
+            points_to_snapshot, current_view_range, alphas_snapshot, filepath,
+            self.config.get('title', 'Nyquist Plot'),
+            self.config.get('xlabel', "Real Z' [kOhm]"),
+            self.config.get('ylabel', "-Imag Z'' [kOhm]")
+        )
+        future.add_done_callback(self._snapshot_done_callback)
+
+    def _snapshot_done_callback(self, future_result):
+        self.snapshot_button.setEnabled(True)
+        self.snapshot_button.setText("Take Snapshot")
+        try:
+            result_path = future_result.result()
+            if result_path: logger.info(f"NyquistPlot: Snapshot saved to {result_path}")
+        except Exception as e:
+            logger.error(f"NyquistPlot: Error retrieving snapshot result: {e}", exc_info=True)
+
+    @classmethod
+    def _build_snapshot_pdf_sync(cls, points, view_range, alphas, path, title_str, xlabel_str, ylabel_str):
+        try:
+            (x_min, x_max), (y_min, y_max) = view_range
+            base_color_tuple = (cls.TRAIL_COLOR.redF(), cls.TRAIL_COLOR.greenF(), cls.TRAIL_COLOR.blueF())
+            
+            # Use scienceplots style if available, otherwise default
+            plot_style = 'science' if 'science' in plt.style.available else 'default'
+
+            with plt.style.context([plot_style]):
+                if plot_style == 'science':
+                    plt.rcParams.update({'text.usetex': False, 'figure.figsize': [6, 5],
+                                         'legend.fontsize': 9, 'axes.labelsize': 10, 
+                                         'xtick.labelsize': 9, 'ytick.labelsize': 9, 'axes.titlesize': 11})
+                else: # Basic defaults if scienceplots not used
+                    plt.rcParams.update({'figure.figsize': [6, 5], 'axes.grid': True})
+
+                fig, ax = plt.subplots(figsize=(6, 5), dpi=cls.SNAPSHOT_DPI)
+                num_snapshot_points = len(points)
+                if num_snapshot_points > 0:
+                    for i in range(num_snapshot_points - 1):
+                        p1 = points[i]; p2 = points[i+1]
+                        p0 = points[i-1] if i > 0 else p1
+                        p3 = points[i+2] if i < num_snapshot_points - 2 else p2
+                        seg_coords = cls._catmull_rom_segment_static(p0, p1, p2, p3, cls.SPLINE_SAMPLES_PER_SEGMENT)
+                        xs, ys = zip(*seg_coords)
+                        ax.plot(xs, ys, color=base_color_tuple, alpha=float(alphas[i]), linewidth=cls.SPLINE_LINE_WIDTH / 1.5)
+                    ax.scatter([points[-1][0]], [points[-1][1]], color=base_color_tuple,
+                               s=cls.MAIN_POINT_RADIUS * 10, edgecolor="black", linewidth=0.5, zorder=5)
+                
+                ax.set_xlabel(xlabel_str); ax.set_ylabel(ylabel_str)
+                ax.set_title(title_str + " (Snapshot)"); ax.grid(True, alpha=0.3, linestyle='--')
+                ax.set_aspect("equal", adjustable="box"); ax.set_xlim(x_min, x_max); ax.set_ylim(y_min, y_max)
+                fig.tight_layout(pad=0.5); plt.savefig(path, format="pdf", bbox_inches="tight", dpi=cls.SNAPSHOT_DPI)
+                plt.close(fig)
+            return path
+        except Exception as e:
+            logger.error(f"NyquistPlot: Failed to build snapshot PDF '{path}': {e}", exc_info=True)
+            return None
+
+    def __del__(self):
+        if hasattr(self, 'snapshot_executor') and self.snapshot_executor:
+            self.snapshot_executor.shutdown(wait=False)
+
+
+
+
 # --- Tab Layout Configuration ---
 # List of dictionaries, each defining a tab.
 # Each dictionary contains 'tab_title' and 'layout'.
@@ -1820,17 +2084,57 @@ tab_configs = [
         ]
     },
     {
+        'tab_title': 'Impedance',
+        'layout': [
+            {
+                'component_class': NyquistPlotComponent,
+                'row': 0, 'col': 0, 'rowspan': 2, 'colspan': 1,
+                'config': {
+                    'title': 'Live Nyquist Plot',
+                    'xlabel': "Re(Z) [kOhm]",
+                    'ylabel': "-Im(Z) [kOhm]",
+                    'plot_height': 600, 
+                    'plot_width': 600,  
+                    'snapshot_dir': 'nyquist_snapshots',
+                    'enable_logging': True 
+                }
+            },
+            {
+                'component_class': TimeSeriesPlotComponent,
+                'row': 0, 'col': 1,
+                'config': {
+                    'title': 'Impedance Magnitude vs Time',
+                    'xlabel': 'Time [s]', 'ylabel': '|Z| [Ohm]',
+                    'plot_height': 300, 
+                    'datasets': [{'data_type': 'impedance_magnitude_ohm', 'label': '|Z|', 'color': 'purple'}],
+                    'enable_logging': True
+                }
+            },
+            {
+                'component_class': TimeSeriesPlotComponent,
+                'row': 1, 'col': 1,
+                'config': {
+                    'title': 'Impedance Phase vs Time',
+                    'xlabel': 'Time [s]', 'ylabel': 'Phase [degrees]',
+                    'plot_height': 300, 
+                    'datasets': [{'data_type': 'impedance_phase_rad', 'label': 'Phase', 'color': 'orange'}],
+                    'enable_logging': True
+                }
+            }
+        ]
+    },
+    {
         'tab_title': 'IMU Basic',
         'layout': [
             {   'component_class': TimeSeriesPlotComponent,
-                'row': 0, 'col': 0, # 'colspan' and 'rowspan' can be used for larger components
-                'config': { # Configuration specific to this component instance
+                'row': 0, 'col': 0,
+                'config': {
                     'title': 'Orientation vs Time', 'xlabel': 'Time [s]', 'ylabel': 'Degrees',
-                    'plot_height': 300, 'plot_width': 450, # Size constraints applied to the component
+                    'plot_height': 300, 'plot_width': 450,
                     'datasets': [{'data_type': 'orientation_x', 'label': 'X (Roll)', 'color': 'r'},
                                  {'data_type': 'orientation_y', 'label': 'Y (Pitch)', 'color': 'g'},
                                  {'data_type': 'orientation_z', 'label': 'Z (Yaw)', 'color': 'b'}],
-                    'enable_logging': True # Enable logging for this specific plot
+                    'enable_logging': True
                 }
             },
             {   'component_class': TimeSeriesPlotComponent,
@@ -1841,17 +2145,17 @@ tab_configs = [
                     'datasets': [{'data_type': 'gyro_x', 'label': 'X', 'color': 'r'},
                                  {'data_type': 'gyro_y', 'label': 'Y', 'color': 'g'},
                                  {'data_type': 'gyro_z', 'label': 'Z', 'color': 'b'}],
-                    'enable_logging': False # Logging disabled for this plot (default if key omitted)
+                    'enable_logging': False
                 }
             },
             {   'component_class': SingleValueDisplayComponent,
                 'row': 1, 'col': 0,
                 'config': {
-                    'label': 'Current Roll', # Display name
-                    'data_type': 'orientation_x', # Data source
-                    'format': '{:.1f}', # Format string
-                    'units': '°', # Units string
-                    'enable_logging': True # Also log this single value
+                    'label': 'Current Roll',
+                    'data_type': 'orientation_x',
+                    'format': '{:.1f}',
+                    'units': '°',
+                    'enable_logging': True
                 }
             },
             {   'component_class': SingleValueDisplayComponent,
@@ -1861,7 +2165,7 @@ tab_configs = [
                     'data_type': 'gyro_z',
                     'format': '{:.1f}',
                     'units': '°/s',
-                    'enable_logging': False # Don't log this one
+                    'enable_logging': False
                 }
             }
         ]
@@ -1874,22 +2178,20 @@ tab_configs = [
                 'config': {
                     'title': 'Linear Acceleration vs Time','xlabel': 'Time [s]','ylabel': 'm/s²',
                     'plot_height': 300,
-                    # No size constraints -> uses default Expanding policy
                     'datasets': [{'data_type': 'lin_accel_x', 'label': 'X', 'color': 'r'},
                                  {'data_type': 'lin_accel_y', 'label': 'Y', 'color': 'g'},
                                  {'data_type': 'lin_accel_z', 'label': 'Z', 'color': 'b'}],
-                    'enable_logging': True # Log this plot's data
+                    'enable_logging': True
                 }
             },
             {   'component_class': TimeSeriesPlotComponent,
                 'row': 1, 'col': 0,
                 'config': {
                     'title': 'Raw Acceleration vs Time','xlabel': 'Time [s]','ylabel': 'm/s²',
-                    'plot_height': 300, # Height constraint
+                    'plot_height': 300,
                     'datasets': [{'data_type': 'accel_x', 'label': 'X', 'color': 'r'},
                                  {'data_type': 'accel_y', 'label': 'Y', 'color': 'g'},
                                  {'data_type': 'accel_z', 'label': 'Z', 'color': 'b'}]
-                    # enable_logging defaults to False if omitted
                 }
             },
             {   'component_class': TimeSeriesPlotComponent,
@@ -1900,7 +2202,7 @@ tab_configs = [
                      'datasets': [{'data_type': 'gravity_x', 'label': 'X', 'color': 'r'},
                                   {'data_type': 'gravity_y', 'label': 'Y', 'color': 'g'},
                                   {'data_type': 'gravity_z', 'label': 'Z', 'color': 'b'}],
-                     'enable_logging': True # Log this one too
+                     'enable_logging': True
                 }
             }
         ]
@@ -1909,44 +2211,24 @@ tab_configs = [
         'tab_title': 'Other Sensors',
         'layout': [
              {  'component_class': TimeSeriesPlotComponent,
-                 'row': 1, 'col': 1,
+                 'row': 0, 'col': 0,
                  'config': {
                      'title': 'Magnetic Field vs Time','xlabel': 'Time [s]','ylabel': 'µT',
-                     'plot_height': 350, 'plot_width': 600, # Both constraints
+                     'plot_height': 350, 'plot_width': 600,
                      'datasets': [{'data_type': 'mag_x', 'label': 'X', 'color': 'r'},
                                   {'data_type': 'mag_y', 'label': 'Y', 'color': 'g'},
                                   {'data_type': 'mag_z', 'label': 'Z', 'color': 'b'}],
-                     'enable_logging': True # Log magnetometer data
+                     'enable_logging': True
                  }
              },
-             # Example of placing another loggable value display
              {   'component_class': SingleValueDisplayComponent,
                  'row': 1, 'col': 0,
                  'config': {
                     'label': 'Current Mag X', 'data_type': 'mag_x',
                     'format': '{:.1f}', 'units': 'µT',
-                    'enable_logging': True # Log this specific value as well
-                }
-            },
-                {  'component_class': TimeSeriesPlotComponent,
-                'row': 0, 'col': 0,
-                'config': {
-                    'title': 'Impedance Magnitude vs Time','xlabel': 'Time [s]','ylabel': 'Impedance Magnitude',
-                    'plot_height': 350, 'plot_width': 600,
-                    'datasets': [{'data_type': 'impedance_magnitude_ohm', 'label': 'Magnitude','color': 'r'},],
                     'enable_logging': True
                 }
             },
-                {  'component_class': TimeSeriesPlotComponent,
-                'row': 0, 'col': 1,
-                'config': {
-                    'title': 'Impdance Phase in Degrees vs Time','xlabel': 'Time [s]','ylabel': 'Impdance Phase [°]]',
-                    'plot_height': 350, 'plot_width': 600,
-                    'datasets': [{'data_type': 'impedance_phase_rad', 'label': 'Phase', 'color': 'r'},],
-                    'enable_logging': True
-                }
-            },
-
         ]
     },
     {
@@ -2053,6 +2335,8 @@ tab_configs = [
         ]
     }
 ]
+
+
 
 
 #####################################################################################################################
