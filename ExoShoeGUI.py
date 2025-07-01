@@ -17,7 +17,7 @@
 ################################################################################
 # Dependencies:
 #   pip install qasync bleak pandas numpy matplotlib scienceplots \
-#               PyQt6 pyqtgraph superqt
+#               PyQt6 pyqtgraph superqt numpy-stl
 ################################################################################
 # License (MIT):
 #   Copyright (c) 2025 Arvin Parvizinia

@@ -4,6 +4,14 @@ A modular and customizable PyQt6-based graphical interface for acquiring, visual
 
 ![Main Demo GIF](<INSERT_DEMO_GIF_PATH_HERE.gif>)
 
+### About This Project
+
+This application was developed between November 2024 and May 2025 as a component of my Bachelor's Thesis, titled **"Development and Testing of a multisensory Shoe for an Exoskeleton"** at RWTH Aachen University.
+
+The primary goal of this GUI was to provide a robust, real-time interface for acquiring, processing, and visualizing the fused data streams from the custom-built shoe, which includes pressure, inertia, ground impedance, time-of-flight, and optical flow sensors. As such, the default configuration of this script—including all BLE Service/Characteristic UUIDs, data parsing functions, and GUI layouts—is tailored specifically to the hardware and objectives of this thesis project.
+
+However, I believe the underlying architecture and extensive customizability make this a valuable tool for a wide range of BLE sensor monitoring applications. While this script was developed for a specific purpose and may still have some issues, I am offering it to anyone who finds it useful and encourage you to build upon it. The seamless integration of live plotting and data replay, in particular, is an invaluable asset for any project involving BLE sensor data.
+
 ## Features
 
 - **Real-time Visualization:** Multi-tab interface with various plotting components:
@@ -47,23 +55,36 @@ A modular and customizable PyQt6-based graphical interface for acquiring, visual
 Run the main script from your terminal:
 
 ```bash
-python <your_script_name>.py
+python ExoShoeGUI.py
 ```
 
-The application will launch, allowing you to scan for and connect to your configured BLE device.
+### Demonstration & Replay
 
-## Customization
+To allow users to explore the GUI's features without needing the physical thesis hardware, sample log files are included in the `sample_logs/` directory.
 
-This application is designed to be easily adapted. All user-modifiable code is located in the **"customizable section"** at the top of the main script. Follow these steps to add a new sensor or change the layout:
+Use the **`Replay CSV...`** button in the GUI to load one or more of these files. The application's visualization components will populate with the sample data, enabling you to test the replay and export functionalities.
 
-1.  **Define a Data Handler:** Write a function to parse the raw `bytearray` from your sensor's BLE characteristic.
-2.  **Define Derived Data (Optional):** Create functions to compute new data from existing raw or derived data streams.
-3.  **Register Derived Data:** Register your new computation functions.
-4.  **Update Device Configuration:** Add your new BLE characteristic UUIDs and handler functions to the `device_config` object.
-5.  **Create/Modify GUI Components (Optional):** Define new `BaseGuiComponent` subclasses for custom visualizations.
-6.  **Configure Tab Layout:** Add your components to the `tab_configs` list to place them in the GUI.
+## Adapting for Your Own BLE Device
 
-The script includes a built-in `Help` window that provides a more detailed, step-by-step guide for each of these customization areas.
+**Important Note:** The default configuration of this script is tailored *specifically* to the multisensory exoskeleton shoe developed for the author's thesis. To use this application with your own BLE device, you **must** modify the "customizable section" in the main Python script.
+
+Follow these essential steps:
+
+1.  **Define Your Data Handlers:**
+    - In the script, locate the section `# 1. --- Data Handlers ... ---`.
+    - Write new Python functions to parse the `bytearray` data from your sensor's specific BLE characteristics. Each handler must return a dictionary of data types and their values (e.g., `{'temperature': 25.5, 'humidity': 45.1}`).
+
+2.  **Modify the `DeviceConfig` Object:**
+    - Locate the `device_config = DeviceConfig(...)` definition.
+    - Change the `name` and `service_uuid` to match your BLE device.
+    - **Crucially, update the `characteristics` list.** Remove the existing `CharacteristicConfig` objects and add new ones for your device. Each new entry must link your characteristic's `uuid` to the corresponding data `handler` function you wrote in Step 1.
+
+3.  **Reconfigure the GUI Layout:**
+    - Locate the `tab_configs` list at the end of the customizable section.
+    - Modify the layouts to display your new data. You will need to change the `data_type` strings within the component `config` dictionaries to match the keys your new data handlers produce.
+    - Remove or replace components that are specific to the thesis project (e.g., the insole pressure map, impedance plots) with components relevant to your data.
+
+The built-in **`Help`** window provides a more detailed, step-by-step guide for each of these customization tasks. After making these changes, the application will be tailored to your custom hardware.
 
 ## License
 
