@@ -6,7 +6,7 @@ import logging
 from typing import Optional, Callable, Dict, List, Tuple, Set, Any, Type
 import time
 from functools import partial
-from collections import deque # Keep for potential future optimization if lists grow huge
+from collections import deque # for sensor fusion and potential future optimization if lists grow huge
 import threading
 import sys
 import datetime
@@ -134,15 +134,86 @@ class DeviceConfig:
         return self.data_type_to_uuid_map.get(data_type)
 
 
+# --- Derived / Fused Data Framework ----------------------------------------------
+class DerivedDataDefinition:
+    """
+    data_type          – name of the new (virtual) data-series that will appear in
+                         data_buffers and can be referenced by any GUI component.
+    dependencies       – list of RAW OR DERIVED data_type strings the function needs
+                         (they, in turn, resolve to concrete UUIDs through
+                         device_config or other DerivedDataDefinitions).
+    compute_func()     – function that returns the **latest** value of the derived
+                         quantity (or None if it cannot be computed yet).
+                         It MUST read its own inputs from the global `data_buffers`
+                         and MUST NOT modify anything except appending its result.
+    """
+    def __init__(self,
+                 data_type: str,
+                 dependencies: List[str],
+                 compute_func: Callable[[], Optional[float]]):
+        self.data_type = data_type
+        self.dependencies = dependencies
+        self.compute_func = compute_func
+
+# global registry of all derived data
+derived_data_definitions: Dict[str, DerivedDataDefinition] = {}
+
+def register_derived_data(defn: DerivedDataDefinition):
+    if defn.data_type in derived_data_definitions:
+        logger.warning(f"Derived data '{defn.data_type}' already registered – overriding.")
+    derived_data_definitions[defn.data_type] = defn
+    logger.info(f"Registered derived data: {defn.data_type} ; depends on {defn.dependencies}")
+
+def _all_dependency_uuids(dep_list: List[str], dev_cfg: DeviceConfig) -> Set[str]:
+    """Returns the concrete UUIDs needed (recursively) for the given dependency list."""
+    req_uuids: Set[str] = set()
+    for dt in dep_list:
+        uuid = dev_cfg.get_uuid_for_data_type(dt)
+        if uuid:
+            req_uuids.add(uuid)
+        elif dt in derived_data_definitions:
+            req_uuids |= _all_dependency_uuids(derived_data_definitions[dt].dependencies, dev_cfg)
+    return req_uuids
+
+def compute_all_derived_data(current_relative_time: float):
+    """
+    Call this every time new raw data arrive.
+    Any derived value that CAN be computed is pushed to data_buffers
+    with the SAME timestamp as the triggering raw sample.
+    """
+    for defn in derived_data_definitions.values():
+        # need at least ONE sample available for each dependency
+        deps_ok = all(d in data_buffers and data_buffers[d] for d in defn.dependencies)
+        if not deps_ok:
+            continue
+        try:
+            val = defn.compute_func()
+        except Exception as e:
+            logger.error(f"Derived '{defn.data_type}' compute error: {e}")
+            continue
+        if val is None:
+            continue
+        buf = data_buffers.setdefault(defn.data_type, [])
+        buf.append((current_relative_time, val))
+# ---------------------------------------------------------------------------------
+
 #####################################################################################################################
 # Start of customizable section
 #####################################################################################################################
-# Section for customizing device configuration, data handling, and plotting.
+"""
+Section for customizing device configuration, data handling, and plotting.
 
-# 1. Data handlers for different characteristics
-# 2. Device configuration (add UUIDs AND `produces_data_types`)
-# 3. Define GUI Component Classes (e.g., plot class, indicator class, etc.)
-# 4. Define Tab Layout Configuration using the components
+The following sections outline the steps to set up the GUI and device configuration:
+1. Data handlers for different characteristics
+2. Data fusion/derived handlers for derived data 
+3. Register the derived data handlers and their dependencies
+4. Device configuration (add UUIDs AND `produces_data_types`)
+5. Define GUI Component Classes (e.g., plot class, indicator class, etc.)
+6. Define Tab Layout Configuration using the components
+"""
+
+
+# 1. --- Data Handlers for Different Characteristics ---
 
 # --- Constants needed for Insole Data Handling ---
 ADC_MAX_VOLTAGE = 3.3           # Maximal voltage expected from ADC
@@ -173,6 +244,7 @@ VOLTAGE_TO_WEIGHT_FACTOR = 25.0  # Convert total summed voltage to weight units
 INITIAL_PRESSURE_SENSITIVITY = 300.0 # Initial Sensitivity range (GLOBAL, HANDLED BY HEATMAP COMPONENT)
 
 # --- Data Handlers ---
+
 def handle_orientation_data(data: bytearray) -> dict:
     try:
         text = data.decode("utf-8").strip()
@@ -457,7 +529,7 @@ def handle_adc_data(data: bytearray) -> Dict[str, Any]:
 
         return {
             "impedance_magnitude_ohm": mag_Z_ohm,
-            "impedance_phase_rad": phase_Z * 180.0 / math.pi,  # Convert to degrees
+            "impedance_phase_deg": phase_Z * 180.0 / math.pi,  # Convert to degrees
             "real_part_kohm": real_kohm,
             "imag_part_kohm": imag_kohm,
         }
@@ -486,8 +558,86 @@ def handle_quaternion_data(data: bytearray) -> dict:
     except Exception as e:
         data_logger.error(f"Error parsing quaternion data (Exception): {e} - Data: '{data.decode('utf-8', errors='ignore')}'")
         return {}
+# ------------------------------------------------------------------
 
-# --- Device Configuration (Initial Device Name still set here) ---
+
+# 2. --- Derived/Fusion Data Handlers ---
+
+# derived data example:  |Z| change-speed  (ABS(Δ|Z|) / Δt   in  Ω/s)
+# dependencies:  |Z| (Ω)  (from ADC characteristic)
+def _compute_dZ_dt(min_span_sec: float = 0.08,
+                   window_sec: float   = 0.40,
+                   history_maxlen: int = 12
+                  ) -> Optional[float]:
+    """
+    Returns d|Z|/dt (Ω/s), signed:
+      • positive when |Z| rises
+      • negative when |Z| falls
+
+    Uses a sliding window (≤ window_sec) of at most history_maxlen samples,
+    computes a least-squares slope, and only returns a value once the time
+    span ≥ min_span_sec.
+    """
+
+    # initialize persistent history on first call
+    hist_attr = "_compute_dZ_dt_history"
+    if not hasattr(_compute_dZ_dt, hist_attr):
+        setattr(_compute_dZ_dt, hist_attr,
+                deque(maxlen=history_maxlen))
+    history: deque = getattr(_compute_dZ_dt, hist_attr)
+
+    # get latest |Z|
+    buf = data_buffers.get('impedance_magnitude_ohm', [])
+    if not buf:
+        return None
+    t_now, z_now = buf[-1]
+
+    # append to history
+    history.append((t_now, z_now))
+
+    # drop samples older than window_sec
+    while history and (t_now - history[0][0]) > window_sec:
+        history.popleft()
+
+    # need at least 3 points for a stable slope
+    if len(history) < 3:
+        return None
+
+    # check total timespan
+    span = history[-1][0] - history[0][0]
+    if span < min_span_sec:
+        return None
+
+    # prepare for least-squares slope
+    times = np.array([pt[0] for pt in history], dtype=np.float64)
+    mags  = np.array([pt[1] for pt in history], dtype=np.float64)
+    t_mean, m_mean = times.mean(), mags.mean()
+    t_c = times - t_mean
+    m_c = mags  - m_mean
+
+    denom = np.dot(t_c, t_c)
+    if denom <= 1e-12:
+        return None
+
+    slope = np.dot(t_c, m_c) / denom  # Ω/s, signed
+    return float(slope)
+
+# ------------------------------------------------------------------
+
+# 3. --- Register the Derived Data Handlers and their Dependencies ---
+
+# Register the derived / fused data definitions
+register_derived_data(
+    DerivedDataDefinition(
+        data_type='impedance_change_speed_ohm_per_s',
+        dependencies=['impedance_magnitude_ohm'],
+        compute_func=_compute_dZ_dt,
+    )
+)
+# ------------------------------------------------------------------
+
+# 4. --- Device Configuration (Initial Device Name still set here) ---
+
 # This object's 'name' attribute will be updated by the dropdown menu
 device_config = DeviceConfig(
     name="Nano33IoT", # Initial default name
@@ -511,7 +661,7 @@ device_config = DeviceConfig(
                              produces_data_types=HEATMAP_KEYS + ['estimated_weight']),
         CharacteristicConfig(uuid="19B10009-E8F2-537E-4F6C-D104768A1214",
             handler=handle_adc_data,
-            produces_data_types=['impedance_magnitude_ohm', 'impedance_phase_rad', 'real_part_kohm', 'imag_part_kohm']
+            produces_data_types=['impedance_magnitude_ohm', 'impedance_phase_deg', 'real_part_kohm', 'imag_part_kohm']
         ),
         CharacteristicConfig(uuid="19B10012-E8F2-537E-4F6C-D104768A1214",
             handler=handle_optical_xy_data,
@@ -534,9 +684,11 @@ device_config = DeviceConfig(
 
 # List of available device names for the dropdown
 AVAILABLE_DEVICE_NAMES = ["Nano33IoT", "NanoESP32"]
+# ------------------------------------------------------------------
 
+# 5. --- GUI Component Classes ---
 
-# --- Component Base Class ---
+# This is the base class for all GUI components.
 class BaseGuiComponent(QWidget):
     # Base class for modular GUI components.
     def __init__(self, config: Dict[str, Any], data_buffers_ref: Dict[str, List[Tuple[float, float]]], device_config_ref: DeviceConfig, parent: Optional[QWidget] = None):
@@ -602,8 +754,8 @@ class BaseGuiComponent(QWidget):
         Handles showing/hiding a generic overlay message.
         """
         if missing_uuids_for_component:
-            first_missing_uuid = next(iter(missing_uuids_for_component), None)
-            text_content = f"Required UUID:\n{first_missing_uuid}\nnot found!"
+            text_content = "Missing UUID(s):\n" + "\n".join(sorted(missing_uuids_for_component))
+
 
             if not self.uuid_missing_overlay:
                 # Create overlay label centered within the component
@@ -2357,8 +2509,10 @@ class IMUVisualizerComponent(BaseGuiComponent):
             # Data might become available, so an update is good
             self.update_component(0, False)
 
+# ------------------------------------------------------------------
 
-# --- Tab Layout Configuration ---
+# 6. --- Tab Layout Configuration ---
+
 # List of dictionaries, each defining a tab.
 # Each dictionary contains 'tab_title' and 'layout'.
 # 'layout' is a list of component definitions for that tab's grid.
@@ -2435,7 +2589,22 @@ tab_configs = [
                 'config': {
                     'title': 'Impedance Phase vs Time', 'xlabel': 'Time [s]', 'ylabel': 'Phase [degrees]',
                     'plot_height': 300, 
-                    'datasets': [{'data_type': 'impedance_phase_rad', 'label': 'Phase', 'color': 'orange'}],
+                    'datasets': [{'data_type': 'impedance_phase_deg', 'label': 'Phase', 'color': 'orange'}],
+                    'enable_logging': True
+                }
+            },
+            {
+                'component_class': TimeSeriesPlotComponent, 'row': 2, 'col': 1,
+                'config': {
+                    'title': 'd|Z|/dt vs Time',
+                    'xlabel': 'Time [s]',
+                    'ylabel': 'Δ|Z|/Δt  [Ω/s]',
+                    'plot_height': 300,
+                    'datasets': [
+                        {'data_type': 'impedance_change_speed_ohm_per_s',
+                         'label': 'd|Z|/dt',
+                         'color': 'r'}
+                    ],
                     'enable_logging': True
                 }
             }
@@ -2562,7 +2731,7 @@ tab_configs = [
             {   'component_class': TimeSeriesPlotComponent, 'row': 0, 'col': 0,
                 'config': {
                     'title': 'Distance vs Time', 'xlabel': 'Time [s]', 'ylabel': 'Distance [mm]',
-                    'plot_height': 350, 'plot_width': 350,
+                    'plot_height': 350, 'plot_width': 450,
                     'datasets': [ {'data_type': 'tof_distance_mm', 'label': 'Distance', 'color': 'b'}],
                     'enable_logging': True
                 }
@@ -2570,7 +2739,7 @@ tab_configs = [
             {   'component_class': TimeSeriesPlotComponent, 'row': 0, 'col': 1,
                 'config': {
                     'title': 'Darkness vs Time', 'xlabel': 'Time [s]', 'ylabel': 'Darkness [kcps/spad]',
-                    'plot_height': 350, 'plot_width': 350,
+                    'plot_height': 350, 'plot_width': 450,
                     'datasets': [ {'data_type': 'tof_brightness_kcps', 'label': 'Darkness', 'color': 'k'}],
                     'enable_logging': True
                 }
@@ -2599,7 +2768,6 @@ tab_configs = [
         ]
     }
 ]
-# ---
 
 #####################################################################################################################
 # End of customizable section
@@ -2691,6 +2859,22 @@ class GuiManager:
                 logger.error(f"Error clearing component {type(component).__name__}: {e}", exc_info=True)
 
 
+    # ------------------------------------------------------------------
+    def _missing_uuids_for_dtype(self, dtype: str) -> Set[str]:
+        """Recursively resolve which underlying UUIDs are absent for a data_type and fusion."""
+        uuid = self.device_config_ref.get_uuid_for_data_type(dtype)
+        if uuid:
+            return {uuid} if uuid in self.active_missing_uuids else set()
+        if dtype in derived_data_definitions:
+            miss: Set[str] = set()
+            for dep in derived_data_definitions[dtype].dependencies:
+                miss |= self._missing_uuids_for_dtype(dep)
+            return miss
+        return set()
+    # ------------------------------------------------------------------
+
+
+
     def notify_missing_uuids(self, missing_uuids_set: Set[str]):
         logger.info(f"GuiManager received missing UUIDs: {missing_uuids_set if missing_uuids_set else 'None'}")
         self.active_missing_uuids = missing_uuids_set
@@ -2700,9 +2884,7 @@ class GuiManager:
                 continue
             relevant_missing_uuids_for_comp = set()
             for data_type in required_types:
-                uuid = self.device_config_ref.get_uuid_for_data_type(data_type)
-                if uuid and uuid in self.active_missing_uuids:
-                    relevant_missing_uuids_for_comp.add(uuid)
+                relevant_missing_uuids_for_comp |= self._missing_uuids_for_dtype(data_type)
             try:
                 component.handle_missing_uuids(relevant_missing_uuids_for_comp)
             except Exception as e:
@@ -2755,6 +2937,9 @@ async def notification_handler(char_config: CharacteristicConfig, sender: int, d
         if key not in data_buffers:
             data_buffers[key] = []
         data_buffers[key].append((relative_time, value))
+    # --- derive / fuse ----------------------------------------------------------
+    compute_all_derived_data(relative_time)
+
 
 async def find_device(device_config_current: DeviceConfig) -> Optional[BleakClient]:
     found_event = asyncio.Event()
