@@ -98,6 +98,10 @@ pg.setConfigOption('background', 'w')
 pg.setConfigOption('foreground', 'k')
 pg.setConfigOptions(antialias=True) # Ensure anti-aliasing is enabled
 
+# subfolder named 'assets' in the same directory as this script.
+SCRIPT_DIR = Path(__file__).resolve().parent
+ASSETS_DIR = SCRIPT_DIR / "assets"
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -1695,7 +1699,7 @@ class PressureHeatmapComponent(BaseGuiComponent):
     SLIDER_FLOAT_PRECISION_FACTOR_HEATMAP = 100 # For 0.01s resolution, adjust as needed
 
     # --- Constants specific to this component ---
-    DEFAULT_INSOLE_IMAGE_PATH = 'Sohle_rechts.png'
+    DEFAULT_INSOLE_IMAGE_PATH = str(ASSETS_DIR / 'Sohle_rechts.png')
     DEFAULT_OUTLINE_COORDS = np.array([(186, 0), (146, 9), (108, 34), (79, 66), (59, 101), (43, 138), (30, 176), (19, 215),
                                        (11, 255), (6, 303), (2, 358), (0, 418), (3, 463), (8, 508), (14, 550), (23, 590),
                                        (34, 630), (47, 668), (60, 706), (71, 745), (82, 786), (91, 825), (95, 865),
@@ -3998,7 +4002,7 @@ tab_configs = [
                     'title': 'IMU Orientation Visualizer',
                     'enable_logging': True, 
                     # --- New STL configurations ---
-                    'stl_filename': "Sohle1V2_MIR.stl",  # Optional: Path to your .stl file
+                    'stl_filename': ASSETS_DIR / "Sohle1V2_MIR.stl",  # Optional: Path to your .stl file
                     'stl_scale': 0.02, # Example if STL is in mm and you want meters for display
                     'use_stl_attributes_for_color': False,  # << SET TO FALSE
                     'stl_color': (0.5, 0.5, 0.5, 0),    # << SET YOUR DESIRED GREY COLOR
