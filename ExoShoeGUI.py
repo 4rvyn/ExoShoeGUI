@@ -57,7 +57,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QFrame, QGridLayout, QCheckBox, QLineEdit,
     QScrollArea, QMessageBox, QSizePolicy, QTextEdit, QTabWidget,
     QComboBox, QSlider, QDialog, QTreeWidget, QTreeWidgetItem,
-    QSplitter, QTextBrowser
+    QSplitter, QTextBrowser, QFileDialog
 )
 from PyQt6.QtGui import (
     QColor, QPainter, QBrush, QPen, QPixmap, QImage, QPolygonF,
@@ -110,19 +110,378 @@ class QtLogHandler(logging.Handler, QObject):
         except Exception:
             self.handleError(record) # Default handler error handling
 
+from abc import ABC, abstractmethod
+
+class DataSource(ABC):
+    @abstractmethod
+    async def start(self):
+        pass
+
+    @abstractmethod
+    async def stop(self):
+        pass
+
+class BleDataSource(DataSource):
+    def __init__(self, device_config_ref: 'DeviceConfig', gui_emitter_ref: 'GuiSignalEmitter'):
+        self._device_config = device_config_ref
+        self._gui_emitter = gui_emitter_ref
+        self._client: Optional[BleakClient] = None
+        self._stop_requested = False
+        self._active_char_configs: List[CharacteristicConfig] = []
+
+
+    async def start(self):
+        global stop_flag, disconnected_event, state, last_received_time
+        
+        self._stop_requested = False
+        original_stop_flag_val = stop_flag
+        stop_flag = False 
+
+        target_device = None
+        
+        try:
+            target_device = await find_device(self._device_config)
+        except asyncio.CancelledError:
+            logger.info("BleDataSource: Scan was cancelled by stop_requested.")
+            self._gui_emitter.emit_state_change("idle")
+            stop_flag = original_stop_flag_val
+            return
+        except Exception as e:
+            logger.error(f"BleDataSource: Error during find_device: {e}")
+            self._gui_emitter.emit_show_error("Scan Error", f"Scan failed: {e}")
+            self._gui_emitter.emit_state_change("idle")
+            stop_flag = original_stop_flag_val
+            return
+
+        if self._stop_requested:
+            logger.info("BleDataSource: Stop requested after find_device.")
+            self._gui_emitter.emit_state_change("idle")
+            stop_flag = original_stop_flag_val
+            return
+        
+        if not target_device:
+            logger.info(f"BleDataSource: Device '{self._device_config.name}' not found.")
+            self._gui_emitter.emit_scan_throbber(f"Device '{self._device_config.name}' not found.")
+            self._gui_emitter.emit_state_change("idle")
+            stop_flag = original_stop_flag_val
+            return
+
+        self._gui_emitter.emit_connection_status(f"Found {self._device_config.name}. Connecting...")
+        
+        connection_successful = False
+        for attempt in range(3):
+            if self._stop_requested:
+                logger.info("BleDataSource: Stop requested during connection attempts.")
+                break
+            try:
+                logger.info(f"BleDataSource: Connecting (attempt {attempt + 1})...")
+                self._client = BleakClient(target_device, disconnected_callback=disconnected_callback)
+                await self._client.connect(timeout=10.0)
+                logger.info("BleDataSource: Connected successfully.")
+                connection_successful = True
+                self._gui_emitter.emit_state_change("connected")
+                break
+            except Exception as e:
+                logger.error(f"BleDataSource: Connection attempt {attempt + 1} failed: {e}")
+                if self._client:
+                    try: await self._client.disconnect()
+                    except Exception as disconnect_err: logger.warning(f"BleDataSource: Error during disconnect after failed connection: {disconnect_err}")
+                self._client = None
+                if attempt < 2 and not self._stop_requested: await asyncio.sleep(2)
+        
+        if self._stop_requested and not connection_successful:
+             logger.info("BleDataSource: Stop requested and connection failed or aborted.")
+             if self._client:
+                 try: await self._client.disconnect()
+                 except Exception as e: logger.warning(f"BleDataSource: Error disconnecting client after stop during connect: {e}")
+                 self._client = None
+             self._gui_emitter.emit_state_change("idle")
+             stop_flag = original_stop_flag_val
+             return
+
+        if not connection_successful:
+            logger.error("BleDataSource: Max connection attempts reached or connection aborted.")
+            self._gui_emitter.emit_missing_uuids(set())
+            self._gui_emitter.emit_scan_throbber("Connection failed.")
+            self._gui_emitter.emit_state_change("idle")
+            stop_flag = original_stop_flag_val
+            return
+
+        missing_uuids = set()
+        self._active_char_configs = [] 
+        try:
+            logger.info(f"BleDataSource: Checking characteristics for service {self._device_config.service_uuid}...")
+            if not self._client or not self._client.is_connected:
+                raise Exception("Client not available or not connected before characteristic check.")
+
+            service = self._client.services.get_service(self._device_config.service_uuid)
+            if not service:
+                logger.error(f"BleDataSource: Service {self._device_config.service_uuid} not found.")
+                self._gui_emitter.emit_show_error("Connection Error", f"Service UUID\n{self._device_config.service_uuid}\nnot found on device.")
+                raise Exception("Service not found")
+
+            logger.info("BleDataSource: Service found. Checking configured characteristics...")
+            for char_config_iter in self._device_config.characteristics:
+                bleak_char = service.get_characteristic(char_config_iter.uuid)
+                if bleak_char:
+                    if "notify" in bleak_char.properties or "indicate" in bleak_char.properties:
+                        self._active_char_configs.append(char_config_iter)
+                    else:
+                        missing_uuids.add(char_config_iter.uuid)
+                else:
+                    missing_uuids.add(char_config_iter.uuid)
+            
+            self._gui_emitter.emit_missing_uuids(missing_uuids)
+
+            if not self._active_char_configs:
+                logger.error("BleDataSource: No usable characteristics found. Disconnecting.")
+                self._gui_emitter.emit_show_error("Connection Error", "None of the configured characteristics\nwere found or support notifications.")
+                raise Exception("No usable characteristics")
+
+            logger.info(f"BleDataSource: Starting notifications for {len(self._active_char_configs)} characteristics...")
+            notify_tasks = []
+            for char_conf in self._active_char_configs:
+                handler_with_char = partial(notification_handler, char_conf)
+                if self._client and self._client.is_connected:
+                    notify_tasks.append(self._client.start_notify(char_conf.uuid, handler_with_char))
+                else:
+                    raise Exception(f"Client disconnected before starting notify for {char_conf.uuid}")
+            
+            results = await asyncio.gather(*notify_tasks, return_exceptions=True)
+            all_notifications_started = True
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    char_uuid_err = self._active_char_configs[i].uuid
+                    logger.error(f"BleDataSource: Failed to start notification for {char_uuid_err}: {result}")
+                    all_notifications_started = False
+                    missing_uuids.add(char_uuid_err)
+            
+            if not all_notifications_started:
+                self._gui_emitter.emit_missing_uuids(missing_uuids)
+                raise Exception("Could not start all required notifications")
+
+            logger.info("BleDataSource: Notifications started. Listening...")
+            last_received_time = time.time()
+            disconnected_event.clear()
+            
+            while not self._stop_requested and self._client and self._client.is_connected:
+                try:
+                    await asyncio.wait_for(disconnected_event.wait(), timeout=0.2)
+                    logger.info("BleDataSource: Disconnected event received while listening.")
+                    break 
+                except asyncio.TimeoutError:
+                    current_time_loop = time.time()
+                    if current_time_loop - last_received_time > self._device_config.data_timeout:
+                        logger.warning(f"BleDataSource: No data timeout ({self._device_config.data_timeout}s). Assuming disconnect.")
+                        break
+                    if not (self._client and self._client.is_connected):
+                        logger.warning("BleDataSource: Client reported disconnected during listening loop.")
+                        break
+                    continue
+                except asyncio.CancelledError:
+                    logger.info("BleDataSource: Listening loop cancelled by stop_requested.")
+                    break 
+                except Exception as e:
+                    logger.error(f"BleDataSource: Error during notification listening: {e}")
+                    break
+            
+        except asyncio.CancelledError:
+            logger.info("BleDataSource: Start operation cancelled by stop_requested.")
+        except Exception as e:
+            logger.error(f"BleDataSource: Error during setup/listen: {e}")
+            if state == "connected": self._gui_emitter.emit_state_change("disconnecting")
+        finally:
+            logger.info("BleDataSource: Performing cleanup...")
+            local_client_ref = self._client
+            self._client = None
+
+            if local_client_ref:
+                is_conn_at_cleanup = False
+                try: is_conn_at_cleanup = local_client_ref.is_connected
+                except: pass
+
+                if is_conn_at_cleanup:
+                    logger.info("BleDataSource: Stopping notifications and disconnecting client...")
+                    stop_notify_tasks_final = []
+                    for char_conf_final in self._active_char_configs:
+                        try:
+                            if local_client_ref.is_connected:
+                                stop_notify_tasks_final.append(local_client_ref.stop_notify(char_conf_final.uuid))
+                        except Exception as e:
+                            logger.warning(f"BleDataSource: Error preparing stop_notify for {char_conf_final.uuid}: {e}")
+                    if stop_notify_tasks_final:
+                        try: await asyncio.gather(*stop_notify_tasks_final, return_exceptions=True)
+                        except Exception: pass
+                    try:
+                        if local_client_ref.is_connected:
+                             await asyncio.wait_for(local_client_ref.disconnect(), timeout=5.0)
+                        logger.info("BleDataSource: Client disconnected.")
+                    except Exception as e:
+                        logger.error(f"BleDataSource: Error during client disconnect: {e}")
+            
+            self._active_char_configs = []
+            disconnected_event.clear()
+            
+            if not self._stop_requested:
+                self._gui_emitter.emit_state_change("idle")
+            
+            stop_flag = original_stop_flag_val
+            logger.info("BleDataSource: Start method finished.")
+
+    async def stop(self):
+        logger.info("BleDataSource: Stop requested.")
+        self._stop_requested = True
+        global stop_flag # To ensure the global stop_flag used by find_device is also set
+        stop_flag = True
+        
+        if self._client and self._client.is_connected:
+            logger.info("BleDataSource: Client is connected, setting disconnected_event to break listen loop.")
+            disconnected_event.set()
+        else:
+            logger.info("BleDataSource: Client not connected or None, stop will primarily affect scan/connect phases.")
+        
+        
+        if self._client and self._client.is_connected:
+            try:
+                await asyncio.wait_for(self._client.disconnect(), timeout=2.0)
+                logger.info("BleDataSource: Client disconnected successfully in stop().")
+            except asyncio.TimeoutError:
+                logger.warning("BleDataSource: Timeout disconnecting client in stop().")
+            except Exception as e:
+                logger.error(f"BleDataSource: Error disconnecting client in stop(): {e}")
+        self._client = None
+
+
+
+
+class CsvReplaySource(DataSource):
+    def __init__(self, filepath: str, **kwargs): # emit_interval_ms no longer used directly for emission
+        self.df = pd.read_csv(filepath)
+        
+        found_time_col = None
+        exact_match_time_s = 'Time (s)'
+        
+        if exact_match_time_s in self.df.columns:
+            found_time_col = exact_match_time_s
+        else:
+            # Attempt to find a case-insensitive match or 'Master Time (s)'
+            for col in self.df.columns:
+                if col.lower() == 'time (s)':
+                    found_time_col = col
+                    logger.info(f"Replay CSV: Found case-insensitive 'Time (s)' column: '{col}'. Will rename.")
+                    break
+                elif col.lower() == 'master time (s)':
+                    found_time_col = col
+                    logger.info(f"Replay CSV: Found 'Master Time (s)' column: '{col}'. Will rename.")
+                    break
+        
+        if not found_time_col:
+            err_msg = "CSV file for replay must contain a 'Time (s)' or 'Master Time (s)' column."
+            logger.error(err_msg + f" Columns found: {list(self.df.columns)}")
+            raise ValueError(err_msg)
+            
+        if found_time_col != exact_match_time_s:
+            self.df = self.df.rename(columns={found_time_col: exact_match_time_s})
+            logger.info(f"Replay CSV: Renamed column '{found_time_col}' to '{exact_match_time_s}'.")
+
+        self.df.attrs['filepath'] = filepath 
+        self._finished_event = asyncio.Event()
+        self._stop_requested = False # For future use if we want cancellable bulk load
+
+    async def start(self):
+        global start_time, data_buffers
+        
+        self._stop_requested = False
+        self._finished_event.clear()
+        
+        # Set a conceptual start_time for the session.
+        # The actual timestamps in data_buffers will come directly from the CSV's 'Time (s)' column.
+        start_time = datetime.datetime.now() 
+        
+        logger.info(f"CsvReplaySource: Starting bulk load from {os.path.basename(self.df.attrs.get('filepath', 'Unknown CSV'))}.")
+
+        try:
+            # Process all rows in the DataFrame
+            for idx, row in self.df.iterrows():
+                if self._stop_requested:
+                    logger.info("CsvReplaySource: Bulk load interrupted by stop request.")
+                    break
+
+                # Use the 'Time (s)' column directly from the CSV for the timestamp
+                # This ensures the replayed data retains its original relative timing.
+                csv_row_time_original = row['Time (s)']
+                
+                for col_name, value in row.items():
+                    if col_name == 'Time (s)': # Skip the time column itself
+                        continue
+                    
+                    data_type = col_name
+                    try:
+                        numeric_value = float(value) # Ensure value is float
+                        if pd.isna(numeric_value): # Handle NaN values if any
+                            # logger.debug(f"CsvReplaySource: NaN value for {data_type} at time {csv_row_time_original:.3f}s. Skipping.")
+                            continue
+
+                        if data_type not in data_buffers:
+                            data_buffers[data_type] = []
+                        
+                        # Append with the original CSV time
+                        data_buffers[data_type].append((csv_row_time_original, numeric_value))
+
+                    except ValueError:
+                        logger.warning(f"CsvReplaySource: Could not convert value '{value}' for data_type '{data_type}' at CSV time {csv_row_time_original:.2f}s to float. Skipping.")
+                    except Exception as e:
+                        logger.error(f"CsvReplaySource: Error processing column {col_name} at CSV time {csv_row_time_original:.2f}s: {e}")
+                
+                # Call derived data computation after each conceptual "sample" is loaded
+                compute_all_derived_data(csv_row_time_original)
+
+            # After loading, sort each buffer by time to ensure correctness for bisect, etc.
+            for data_type in data_buffers.keys():
+                data_buffers[data_type].sort(key=lambda x: x[0])
+            
+            logger.info("CsvReplaySource: Bulk load completed.")
+
+        except Exception as e:
+            logger.error(f"CsvReplaySource: Error during bulk data load: {e}", exc_info=True)
+        finally:
+            # Signal that processing is done
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.call_soon_threadsafe(self._finished_event.set)
+            else:
+                self._finished_event.set()
+        
+        await self._finished_event.wait() # The event will be set very quickly
+        logger.info("CsvReplaySource start method finished after bulk load.")
+
+    async def stop(self):
+        logger.info("CsvReplaySource: Stop requested (during bulk load or if it were continuous).")
+        self._stop_requested = True # This flag can be checked during bulk load
+        
+        # Ensure finished_event is set if not already
+        if not self._finished_event.is_set():
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.call_soon_threadsafe(self._finished_event.set)
+            else:
+                self._finished_event.set()
+
+
+
 # --- Global variables ---
 disconnected_event = asyncio.Event()
 last_received_time = 0
-# data_buffers hold ALL received data since connection/clear
+
 data_buffers: Dict[str, List[Tuple[float, float]]] = {}
-start_time: Optional[datetime.datetime] = None # Absolute start time of the current connection/session
+start_time: Optional[datetime.datetime] = None 
 stop_flag = False
 state = "idle"
 current_task: Optional[asyncio.Task] = None
 loop: Optional[asyncio.AbstractEventLoop] = None
-client: Optional[BleakClient] = None
+
 plotting_paused = False
-flowing_interval = 10.0  # Initial interval in seconds
+flowing_interval = 10.0 
 
 # --- Configuration classes ---
 class CharacteristicConfig:
@@ -223,6 +582,22 @@ def compute_all_derived_data(current_relative_time: float):
         buf = data_buffers.setdefault(defn.data_type, [])
         buf.append((current_relative_time, val))
 # ---------------------------------------------------------------------------------
+
+
+def get_value_at_time(data_type_key: str, target_time: float, buffers: Dict[str, List[Tuple[float, float]]]) -> Optional[float]:
+    if data_type_key not in buffers or not buffers[data_type_key]:
+        return None
+    
+    buffer = buffers[data_type_key]
+    times = [item[0] for item in buffer]
+    
+    idx = bisect.bisect_right(times, target_time)
+    
+    if idx == 0:
+        if buffer: return buffer[0][1] 
+        return None
+        
+    return buffer[idx-1][1]
 
 #####################################################################################################################
 # Start of customizable section
@@ -831,11 +1206,47 @@ class BaseGuiComponent(QWidget):
         super().showEvent(event)
         QTimer.singleShot(0, self._position_overlay) # Delay position until layout settles
 
+
+    def handle_missing_replay_data(self, missing_data_types_for_component: Set[str]):
+        """
+        Called by GuiManager during replay mode if required data types are not in data_buffers.
+        """
+        if missing_data_types_for_component:
+            # Create a comma-separated list, limit length for display
+            missing_types_str = ", ".join(sorted(list(missing_data_types_for_component)))
+            if len(missing_types_str) > 100: # Limit display length
+                missing_types_str = missing_types_str[:97] + "..."
+            text_content = f"Data Not Loaded From CSV for:\n{missing_types_str}"
+
+            if not self.uuid_missing_overlay: # Re-use the same overlay QLabel object
+                self.uuid_missing_overlay = QLabel(text_content, self)
+                self.uuid_missing_overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.uuid_missing_overlay.setStyleSheet("background-color: rgba(120, 120, 50, 200); color: white; font-weight: bold; border-radius: 5px; padding: 10px;") # Slightly different color
+                self.uuid_missing_overlay.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Maximum)
+                self.uuid_missing_overlay.adjustSize()
+                self.uuid_missing_overlay.raise_()
+                self.uuid_missing_overlay.setVisible(True)
+                self._position_overlay()
+            else:
+                self.uuid_missing_overlay.setText(text_content)
+                self.uuid_missing_overlay.setStyleSheet("background-color: rgba(120, 120, 50, 200); color: white; font-weight: bold; border-radius: 5px; padding: 10px;") # Ensure style
+                self.uuid_missing_overlay.adjustSize()
+                self._position_overlay()
+                self.uuid_missing_overlay.setVisible(True)
+                self.uuid_missing_overlay.raise_()
+        else: # No missing data types for this component
+            # If the overlay is visible and it's a "CSV Not Loaded" message, hide it.
+            # This check prevents hiding a "UUID Missing" message if both were somehow active.
+            if self.uuid_missing_overlay and "CSV" in self.uuid_missing_overlay.text():                self.uuid_missing_overlay.setVisible(False)
+
 # --- Specific Component Implementations ---
 
 # --- TimeSeriesPlotComponent ---
 class TimeSeriesPlotComponent(BaseGuiComponent):
     """A GUI component that displays time-series data using pyqtgraph."""
+
+    SLIDER_FLOAT_PRECISION_FACTOR = 100  # For 2 decimal places (e.g., 0.01s resolution)
+
     def __init__(self, config: Dict[str, Any], data_buffers_ref: Dict[str, List[Tuple[float, float]]], device_config_ref: DeviceConfig, parent: Optional[QWidget] = None):
         super().__init__(config, data_buffers_ref, device_config_ref, parent)
 
@@ -848,11 +1259,51 @@ class TimeSeriesPlotComponent(BaseGuiComponent):
 
         self._setup_plot()
 
-        # Main layout for this component (contains just the plot widget)
+
+
+        # --- Main Layout ---
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.plot_widget)
+
+        # --- Replay Slider Controls ---
+        self.replay_slider_widget = QWidget()
+        slider_controls_layout = QHBoxLayout(self.replay_slider_widget)
+        slider_controls_layout.setContentsMargins(5,0,5,0) # Add some horizontal margin
+
+        self.min_time_textbox = QLineEdit("0.00")
+        self.min_time_textbox.setFixedWidth(60)
+        self.min_time_textbox.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.min_time_validator = QDoubleValidator(0.0, 9999.0, 2, self) # Initial broad range, will be updated
+        self.min_time_validator.setNotation(QDoubleValidator.Notation.StandardNotation)
+        self.min_time_textbox.setValidator(self.min_time_validator)
+        
+        # Rename export_slider to replay_time_slider for clarity
+        self.replay_time_slider = QRangeSlider(Qt.Orientation.Horizontal)
+        self.replay_time_slider.setRange(0, 0) # Initial empty range
+
+        self.max_time_textbox = QLineEdit("0.00")
+        self.max_time_textbox.setFixedWidth(60)
+        self.max_time_textbox.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.max_time_validator = QDoubleValidator(0.0, 9999.0, 2, self) # Initial broad range
+        self.max_time_validator.setNotation(QDoubleValidator.Notation.StandardNotation)
+        self.max_time_textbox.setValidator(self.max_time_validator)
+
+        slider_controls_layout.addWidget(QLabel("View:"))
+        slider_controls_layout.addWidget(self.min_time_textbox)
+        slider_controls_layout.addWidget(self.replay_time_slider)
+        slider_controls_layout.addWidget(self.max_time_textbox)
+        slider_controls_layout.addWidget(QLabel("s"))
+
+        self.replay_slider_widget.setVisible(False) # Initially hidden, shown in non-flowing mode
+        layout.addWidget(self.replay_slider_widget)
         self.setLayout(layout)
+
+        # --- Connect Signals ---
+        self.replay_time_slider.valueChanged.connect(self._on_replay_slider_changed)
+        self.min_time_textbox.editingFinished.connect(self._update_slider_from_textboxes)
+        self.max_time_textbox.editingFinished.connect(self._update_slider_from_textboxes)
+
 
     def get_widget(self) -> QWidget:
         return self # The component itself holds the plot
@@ -881,6 +1332,16 @@ class TimeSeriesPlotComponent(BaseGuiComponent):
         self.plot_item.showGrid(x=True, y=True, alpha=0.1)
         self.plot_item.addLegend(offset=(10, 5))
         self.plot_item.getViewBox().setDefaultPadding(0.01)
+
+
+        # The replay slider (previously export_slider) functionality
+        # is now handled by self.replay_time_slider and its associated widgets,
+        # which are set up in __init__ and added to the layout there.
+        # This self.export_slider is no longer needed for replay scrubbing.
+        # If a separate export-only slider is ever needed, it would require
+        # its own distinct setup and handler.
+        pass # Or simply remove these lines if no other purpose for an 'export_slider' here.
+
 
         for dataset in self.config.get('datasets', []):
             data_type = dataset['data_type']
@@ -924,27 +1385,106 @@ class TimeSeriesPlotComponent(BaseGuiComponent):
 
     def update_component(self, current_relative_time: float, is_flowing: bool):
         """Updates the plot lines based on data in the shared buffer."""
-        if plotting_paused: return
+        # If in flowing mode AND plotting is paused, then return.
+        # Otherwise (e.g., not flowing (slider mode), or flowing and not paused), proceed to update.
+        if plotting_paused and is_flowing:
+            return
 
-        # --- Determine Time Axis Range ---
-        min_time_axis = 0
-        max_time_axis = max(current_relative_time, flowing_interval)
+
+
+        # --- Determine Time Axis Range and Slider Configuration ---
+        filter_min_time_float: float
+        filter_max_time_float: float
 
         if is_flowing:
-            min_time_axis = max(0, current_relative_time - flowing_interval)
-            max_time_axis = current_relative_time
-            self.plot_item.setXRange(min_time_axis, max_time_axis, padding=0.02)
-        else:
-            max_data_time = 0
-            # Only consider data types from non-missing UUIDs for axis range
-            for data_type in self.get_required_data_types(): # Use the method here
-                 uuid = self.device_config_ref.get_uuid_for_data_type(data_type)
-                 if uuid and uuid not in self.missing_relevant_uuids and data_type in self.data_buffers_ref and self.data_buffers_ref[data_type]:
-                     try: max_data_time = max(max_data_time, self.data_buffers_ref[data_type][-1][0])
-                     except IndexError: pass
+            filter_min_time_float = max(0, current_relative_time - flowing_interval)
+            filter_max_time_float = current_relative_time
+            self.replay_slider_widget.setVisible(False)
+            self.plot_item.setXRange(filter_min_time_float, filter_max_time_float, padding=0.02)
 
-            max_time_axis = max(max_data_time, flowing_interval)
-            self.plot_item.setXRange(0, max_time_axis, padding=0.02)
+
+            # Check if overlay indicates CSV data is missing
+            is_csv_data_missing_for_plot = False
+            if self.uuid_missing_overlay and self.uuid_missing_overlay.isVisible() and "CSV" in self.uuid_missing_overlay.text():
+                 # Check if any of *this plot's* required data types are actually missing from buffers
+                 for dt_check in self.get_required_data_types():
+                     if dt_check not in self.data_buffers_ref or not self.data_buffers_ref[dt_check]:
+                         is_csv_data_missing_for_plot = True
+                         break
+            
+            if is_csv_data_missing_for_plot:
+                self.replay_slider_widget.setVisible(False) # Hide slider if data not loaded
+
+        else:  # Not flowing mode: use slider to control view
+            self.replay_slider_widget.setVisible(True)
+
+            actual_min_data_time_float = float('inf')
+            actual_max_data_time_float = 0.0 
+            found_any_data_for_slider = False
+
+            for data_type_slider in self.get_required_data_types():
+                uuid_slider = self.device_config_ref.get_uuid_for_data_type(data_type_slider)
+                if uuid_slider and uuid_slider in self.missing_relevant_uuids:
+                    continue
+                if data_type_slider in self.data_buffers_ref and self.data_buffers_ref[data_type_slider]:
+                    series_times = [item[0] for item in self.data_buffers_ref[data_type_slider]]
+                    if series_times:
+                        actual_min_data_time_float = min(actual_min_data_time_float, series_times[0])
+                        actual_max_data_time_float = max(actual_max_data_time_float, series_times[-1])
+                        found_any_data_for_slider = True
+            
+            if not found_any_data_for_slider:
+                actual_min_data_time_float = 0.0
+                actual_max_data_time_float = max(flowing_interval, 0.1) 
+            
+            # Ensure max is greater than min for float times
+            if actual_max_data_time_float <= actual_min_data_time_float:
+                actual_max_data_time_float = actual_min_data_time_float + 0.1 # Ensure a small valid range
+
+            # Convert float times to scaled integers for the QRangeSlider
+            slider_abs_min_range_int = int(math.floor(actual_min_data_time_float * self.SLIDER_FLOAT_PRECISION_FACTOR))
+            slider_abs_max_range_int = int(math.ceil(actual_max_data_time_float * self.SLIDER_FLOAT_PRECISION_FACTOR))
+
+            # Ensure max_int > min_int for slider range
+            if slider_abs_max_range_int <= slider_abs_min_range_int:
+                slider_abs_max_range_int = slider_abs_min_range_int + 1 
+
+            self.replay_time_slider.blockSignals(True)
+            current_slider_min_int, current_slider_max_int = self.replay_time_slider.value()
+            range_changed = False
+            if self.replay_time_slider.minimum() != slider_abs_min_range_int or \
+               self.replay_time_slider.maximum() != slider_abs_max_range_int:
+                self.replay_time_slider.setRange(slider_abs_min_range_int, slider_abs_max_range_int)
+                # If overall range changes, reset slider handles to cover the full new range
+                self.replay_time_slider.setValue((slider_abs_min_range_int, slider_abs_max_range_int))
+                current_slider_min_int, current_slider_max_int = self.replay_time_slider.value() # Update current values
+                range_changed = True
+            self.replay_time_slider.blockSignals(False)
+
+            # Update text box validators based on the new overall data range
+            self.min_time_validator.setRange(actual_min_data_time_float, actual_max_data_time_float)
+            self.max_time_validator.setRange(actual_min_data_time_float, actual_max_data_time_float)
+
+            # Get current slider selection (scaled integers)
+            selected_min_int, selected_max_int = self.replay_time_slider.value()
+            filter_min_time_float = float(selected_min_int) / self.SLIDER_FLOAT_PRECISION_FACTOR
+            filter_max_time_float = float(selected_max_int) / self.SLIDER_FLOAT_PRECISION_FACTOR
+
+            # If the overall range changed, textboxes need update from slider's new full range
+            # Also, ensure textboxes are in sync if they weren't the source of a change
+            if range_changed or \
+               abs(float(self.min_time_textbox.text()) - filter_min_time_float) > 1e-3 or \
+               abs(float(self.max_time_textbox.text()) - filter_max_time_float) > 1e-3:
+                self.min_time_textbox.blockSignals(True)
+                self.max_time_textbox.blockSignals(True)
+                self.min_time_textbox.setText(f"{filter_min_time_float:.2f}")
+                self.max_time_textbox.setText(f"{filter_max_time_float:.2f}")
+                self.min_time_textbox.blockSignals(False)
+                self.max_time_textbox.blockSignals(False)
+            
+            self.plot_item.setXRange(filter_min_time_float, filter_max_time_float, padding=0.02)
+
+
 
         # --- Update Data for Lines ---
         data_updated_in_plot = False
@@ -962,12 +1502,11 @@ class TimeSeriesPlotComponent(BaseGuiComponent):
             elif data_type in self.data_buffers_ref:
                 data = self.data_buffers_ref[data_type]
                 plot_data_tuples = []
-                if is_flowing:
-                    # Find the starting index for the flowing window
-                    start_idx = bisect.bisect_left(data, min_time_axis, key=lambda x: x[0])
-                    plot_data_tuples = data[start_idx:]
-                else:
-                    plot_data_tuples = data # Use all data
+                # Filter data based on filter_min_time_float and filter_max_time_float determined earlier
+                # 'data' here refers to the data_series for the current data_type
+                start_idx = bisect.bisect_left(data, filter_min_time_float, key=lambda x: x[0])
+                end_idx = bisect.bisect_right(data, filter_max_time_float, key=lambda x: x[0])
+                plot_data_tuples = data[start_idx:end_idx]
 
                 if plot_data_tuples:
                     try:
@@ -984,18 +1523,37 @@ class TimeSeriesPlotComponent(BaseGuiComponent):
             else:
                 line.setData(x=[], y=[]) # Clear line if data_type not found in buffers
 
-        # --- Y Auto-Ranging ---
-        if data_updated_in_plot and not plot_has_missing_uuid_overlay:
+
+
+
+        # Determine if any overlay (UUID or CSV missing) is active for this plot's data
+        is_any_data_issue_overlay_active = False
+        if self.uuid_missing_overlay and self.uuid_missing_overlay.isVisible():
+            # Check if the overlay is due to UUIDs missing for this plot
+            if self.missing_relevant_uuids: 
+                is_any_data_issue_overlay_active = True
+            # Check if the overlay is due to CSV data not loaded for this plot
+            elif "CSV" in self.uuid_missing_overlay.text():
+                for dt_check in self.get_required_data_types():
+                     if dt_check not in self.data_buffers_ref or not self.data_buffers_ref[dt_check]:
+                         is_any_data_issue_overlay_active = True
+                         break
+        
+        if data_updated_in_plot and not is_any_data_issue_overlay_active:
             self.plot_item.enableAutoRange(axis='y', enable=True)
-        elif plot_has_missing_uuid_overlay:
-             # Disable auto-ranging and set a default range if overlay is shown
-             self.plot_item.enableAutoRange(axis='y', enable=False)
-             # Keep existing range or set a default? Let's try setting a simple default.
-             self.plot_item.setYRange(-1, 1, padding=0.1) # Example default range
+        elif is_any_data_issue_overlay_active:
+             self.plot_item.enableAutoRange(axis='y', enable=False) # Disable auto Y range
+             self.plot_item.setYRange(-1, 1, padding=0.1) # Set a default Y range
+             # Clear lines if an overlay is active
+             for data_type, line in self.lines.items():
+                 line.setData(x=[], y=[])
+        # If !data_updated_in_plot AND no overlay, auto-range might be okay, or let it be.
+        # If data_buffers are empty for this plot's types, lines will be empty anyway.
+
 
 
     def clear_component(self):
-        """Clears the plot lines and resets axes."""
+        """Clears the plot lines, resets axes, and hides replay controls."""
         for line in self.lines.values():
             line.setData(x=[], y=[])
 
@@ -1003,15 +1561,124 @@ class TimeSeriesPlotComponent(BaseGuiComponent):
         self.handle_missing_uuids(set())
         self.missing_relevant_uuids.clear() # Also clear internal set
 
-        # Reset view ranges
+        # Reset view ranges for "live" or "flowing" mode
         self.plot_item.setXRange(0, flowing_interval, padding=0.02)
-        self.plot_item.setYRange(-1, 1, padding=0.1) # Reset Y range to default
-        self.plot_item.enableAutoRange(axis='y', enable=True) # Re-enable Y auto-ranging
+        self.plot_item.setYRange(-1, 1, padding=0.1) 
+        self.plot_item.enableAutoRange(axis='y', enable=True)
 
+        # --- Explicitly hide and reset replay slider components ---
+        if hasattr(self, 'replay_slider_widget'):
+            self.replay_slider_widget.setVisible(False)
+        if hasattr(self, 'replay_time_slider'):
+            self.replay_time_slider.blockSignals(True)
+            self.replay_time_slider.setRange(0,0) # Reset range
+            self.replay_time_slider.setValue((0,0)) # Reset values
+            self.replay_time_slider.blockSignals(False)
+        if hasattr(self, 'min_time_textbox'):
+            self.min_time_textbox.blockSignals(True)
+            self.min_time_textbox.setText("0.00")
+            self.min_time_textbox.blockSignals(False)
+        if hasattr(self, 'max_time_textbox'):
+            self.max_time_textbox.blockSignals(True)
+            self.max_time_textbox.setText("0.00") # Or a default like str(flowing_interval)
+            self.max_time_textbox.blockSignals(False)
+        
+        # Reset validators to a broad initial range if necessary,
+        # or let update_component handle it when new data comes in live.
+        # For now, just resetting text is probably fine.
+        logger.debug(f"TimeSeriesPlotComponent '{self.config.get('title', 'Plot')}' cleared, replay controls hidden.")
+
+
+
+    def _on_replay_slider_changed(self, value_tuple: Tuple[int, int]):
+        t0_int, t1_int = value_tuple  # Integer values from the slider
+
+        # Scale to float based on precision factor
+        t0_float = float(t0_int) / self.SLIDER_FLOAT_PRECISION_FACTOR
+        t1_float = float(t1_int) / self.SLIDER_FLOAT_PRECISION_FACTOR
+        
+        # Ensure t0 is not greater than t1 if slider handles cross (shouldn't happen with QRangeSlider)
+        t0_float = min(t0_float, t1_float)
+
+        # Update text boxes without triggering their editingFinished signal back to slider
+        self.min_time_textbox.blockSignals(True)
+        self.max_time_textbox.blockSignals(True)
+        self.min_time_textbox.setText(f"{t0_float:.2f}")
+        self.max_time_textbox.setText(f"{t1_float:.2f}")
+        self.min_time_textbox.blockSignals(False)
+        self.max_time_textbox.blockSignals(False)
+
+        logger.debug(f"Replay slider changed for '{self.config.get('title', 'Plot')}': [{t0_float:.2f}s, {t1_float:.2f}s]")
+        
+        # Request GUI update to refresh the plot based on the new slider range
+        self._request_gui_update_for_yrange()
+
+    def _update_slider_from_textboxes(self):
+        try:
+            min_val_text = float(self.min_time_textbox.text())
+            max_val_text = float(self.max_time_textbox.text())
+        except ValueError:
+            logger.warning("Invalid input in time textboxes. Reverting to slider values.")
+            # Revert textboxes to current slider values if input is bad
+            current_slider_min_int, current_slider_max_int = self.replay_time_slider.value()
+            self.min_time_textbox.setText(f"{float(current_slider_min_int) / self.SLIDER_FLOAT_PRECISION_FACTOR:.2f}")
+            self.max_time_textbox.setText(f"{float(current_slider_max_int) / self.SLIDER_FLOAT_PRECISION_FACTOR:.2f}")
+            return
+
+        # Validate: min <= max
+        if min_val_text > max_val_text:
+            logger.warning("Min time in textbox cannot be greater than max time. Adjusting.")
+            # Option 1: swap them if min > max
+            # min_val_text, max_val_text = max_val_text, min_val_text 
+            # self.min_time_textbox.setText(f"{min_val_text:.2f}")
+            # self.max_time_textbox.setText(f"{max_val_text:.2f}")
+            # Option 2: set min to max or max to min - simpler, set min to what max is
+            min_val_text = max_val_text 
+            self.min_time_textbox.setText(f"{min_val_text:.2f}")
+
+
+        # Get overall min/max for slider range to clamp textbox input
+        slider_overall_min_int = self.replay_time_slider.minimum()
+        slider_overall_max_int = self.replay_time_slider.maximum()
+        
+        overall_min_float = float(slider_overall_min_int) / self.SLIDER_FLOAT_PRECISION_FACTOR
+        overall_max_float = float(slider_overall_max_int) / self.SLIDER_FLOAT_PRECISION_FACTOR
+
+        # Clamp textbox values to the slider's possible range
+        min_val_text = max(overall_min_float, min(min_val_text, overall_max_float))
+        max_val_text = max(overall_min_float, min(max_val_text, overall_max_float))
+        
+        # Ensure min is still not greater than max after clamping
+        min_val_text = min(min_val_text, max_val_text)
+
+
+        # Scale float values from textboxes to integers for the slider
+        target_slider_min_int = int(round(min_val_text * self.SLIDER_FLOAT_PRECISION_FACTOR))
+        target_slider_max_int = int(round(max_val_text * self.SLIDER_FLOAT_PRECISION_FACTOR))
+        
+        # Update slider (this will trigger _on_replay_slider_changed, which updates plot)
+        self.replay_time_slider.blockSignals(True) # Block to prevent immediate loop from setValue
+        self.replay_time_slider.setValue((target_slider_min_int, target_slider_max_int))
+        self.replay_time_slider.blockSignals(False)
+
+        # Refresh textboxes to reflect potentially clamped/rounded values
+        self.min_time_textbox.blockSignals(True)
+        self.max_time_textbox.blockSignals(True)
+        self.min_time_textbox.setText(f"{float(target_slider_min_int) / self.SLIDER_FLOAT_PRECISION_FACTOR:.2f}")
+        self.max_time_textbox.setText(f"{float(target_slider_max_int) / self.SLIDER_FLOAT_PRECISION_FACTOR:.2f}")
+        self.min_time_textbox.blockSignals(False)
+        self.max_time_textbox.blockSignals(False)
+        
+        logger.debug(f"Slider updated from textboxes to: [{min_val_text:.2f}s, {max_val_text:.2f}s]")
+        # Manually trigger plot update as slider's valueChanged might not fire if values are identical
+        # after rounding, or if we want immediate feedback.
+        self._request_gui_update_for_yrange()
 
 # --- HEATMAP COMPONENT ---
+
 class PressureHeatmapComponent(BaseGuiComponent):
     """ Displays a pressure heatmap based on sensor data. """
+    SLIDER_FLOAT_PRECISION_FACTOR_HEATMAP = 100 # For 0.01s resolution, adjust as needed
 
     # --- Constants specific to this component ---
     DEFAULT_INSOLE_IMAGE_PATH = 'Sohle_rechts.png'
@@ -1261,6 +1928,30 @@ class PressureHeatmapComponent(BaseGuiComponent):
         cmap_layout.addWidget(self.cmap_combobox)
         self.controls_layout.addLayout(cmap_layout)
 
+
+        self.time_slider_heatmap = QSlider(Qt.Orientation.Horizontal)
+
+        self.current_replay_time_label_heatmap = QLabel("0.00s")
+        self.current_replay_time_label_heatmap.setFixedWidth(50) # Adjust width as needed
+        self.current_replay_time_label_heatmap.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.time_slider_heatmap.setRange(0, 0)
+        self.time_slider_heatmap.valueChanged.connect(self.on_time_slider_heatmap)
+        # Slider itself is not set to visible/invisible directly anymore
+        
+        # Create a container widget for the scrub time controls
+        self.scrub_time_widget_heatmap = QWidget()
+        time_slider_layout = QHBoxLayout(self.scrub_time_widget_heatmap)
+        time_slider_layout.setContentsMargins(0,0,0,0) # Minimize extra space
+        time_slider_layout.addWidget(QLabel("Scrub Time:"))
+        time_slider_layout.addWidget(self.time_slider_heatmap)
+
+        time_slider_layout.addWidget(self.current_replay_time_label_heatmap)
+
+        self.controls_layout.addWidget(self.scrub_time_widget_heatmap)
+        self.scrub_time_widget_heatmap.setVisible(False) # Initially hidden
+
+
         # --- Save/Snapshot Button ---
         self.save_button = QPushButton("Take Snapshot")
         self.save_button.clicked.connect(self.save_current_view)
@@ -1292,51 +1983,111 @@ class PressureHeatmapComponent(BaseGuiComponent):
             return f"heatmap_{safe_suffix}" if safe_suffix else f"heatmap_{id(self)}"
         return ""
 
+
+    def _update_controls_based_on_data_status(self):
+        """Helper to enable/disable controls based on any active overlay."""
+        is_overlay_active = self.uuid_missing_overlay and self.uuid_missing_overlay.isVisible()
+        
+        if hasattr(self, 'controls_widget'):
+            self.controls_widget.setEnabled(not is_overlay_active)
+        if is_overlay_active:
+            # If an overlay is active (either UUID or CSV data missing), clear the visual component
+            # But don't call full clear_component as that might reset slider ranges we want to keep.
+            self.pressure_values.fill(0.0)
+            self.center_of_pressure = None
+            self.cop_trail.clear()
+            if self.heatmap_qimage: # Check if precomputation succeeded
+                calculated_pressures = self._calculate_pressure_fast() # Will be zeros
+                self._render_heatmap_to_buffer(calculated_pressures)
+                self._update_display_pixmap()
+
+
     def handle_missing_uuids(self, missing_uuids_for_component: Set[str]):
         """ Shows overlay and disables controls if the required UUID is missing. """
-        is_missing = bool(missing_uuids_for_component)
-        # Use base class overlay for the message
         super().handle_missing_uuids(missing_uuids_for_component)
-        # Disable/Enable controls
-        if hasattr(self, 'controls_widget'): # Check if controls widget exists (init might fail)
-             self.controls_widget.setEnabled(not is_missing) # Disable entire control panel
-        if is_missing:
-             self.clear_component() # Also clear heatmap visually
+        self._update_controls_based_on_data_status()
+
+    def handle_missing_replay_data(self, missing_data_types_for_component: Set[str]):
+        super().handle_missing_replay_data(missing_data_types_for_component)
+        self._update_controls_based_on_data_status()
 
     # --- Update and Clear ---
     def update_component(self, current_relative_time: float, is_flowing: bool):
-        if plotting_paused: return
+
+        # Directly use is_flowing argument, and global plotting_paused
+        if plotting_paused and is_flowing: # If live and paused, do nothing.
+             return
         if not self.heatmap_qimage: return # Skip update if precomputation failed
 
-        # --- Get Latest Pressure Data AND RESCALE IT ---
-        data_found_count = 0
-        # Create a temporary array to store the pressures scaled by the *current* sensitivity
-        rescaled_pressures = np.zeros(self.NUM_SENSORS, dtype=np.float32)
 
-        for i, key in enumerate(HEATMAP_KEYS):
-             if key in self.data_buffers_ref and self.data_buffers_ref[key]:
-                 # Get the pressure value calculated with INITIAL_PRESSURE_SENSITIVITY
-                 initial_pressure = self.data_buffers_ref[key][-1][1]
+        if not is_flowing: # This implies replay mode or "Flowing Mode" checkbox is unchecked
+            self.scrub_time_widget_heatmap.setVisible(True)
+            
+            actual_min_data_time_hm = float('inf')
+            actual_max_data_time_hm = 0.0
+            found_any_data_hm = False
 
-                 # --- FIX: Rescale the pressure using the current sensitivity ---
-                 if INITIAL_PRESSURE_SENSITIVITY > 1e-6: # Avoid division by zero
-                     current_pressure = initial_pressure * (self.current_pressure_sensitivity / INITIAL_PRESSURE_SENSITIVITY)
-                 else:
-                     current_pressure = 0.0 # Or handle error appropriately
+            for key_hm_slider in HEATMAP_KEYS: # HEATMAP_KEYS are the required data types
+                if key_hm_slider in self.data_buffers_ref and self.data_buffers_ref[key_hm_slider]:
+                    series_times_hm = [item[0] for item in self.data_buffers_ref[key_hm_slider]]
+                    if series_times_hm:
+                        actual_min_data_time_hm = min(actual_min_data_time_hm, series_times_hm[0])
+                        actual_max_data_time_hm = max(actual_max_data_time_hm, series_times_hm[-1])
+                        found_any_data_hm = True
+            
+            if not found_any_data_hm:
+                actual_min_data_time_hm = 0.0
+                actual_max_data_time_hm = 1.0 
+            
+            if actual_max_data_time_hm <= actual_min_data_time_hm:
+                actual_max_data_time_hm = actual_min_data_time_hm + 0.1 
 
-                 rescaled_pressures[i] = max(0.0, current_pressure) # Apply non-negative constraint
-                 # --- END FIX ---
-                 data_found_count += 1
-             # else: logger.debug(f"No data found for heatmap sensor {key}")
+            slider_min_int = int(math.floor(actual_min_data_time_hm * self.SLIDER_FLOAT_PRECISION_FACTOR_HEATMAP))
+            slider_max_int = int(math.ceil(actual_max_data_time_hm * self.SLIDER_FLOAT_PRECISION_FACTOR_HEATMAP))
 
-        # Only update if we actually found data for at least one sensor
-        if data_found_count > 0:
-            # --- Store the RESCALED pressures for rendering ---
-            self.pressure_values = rescaled_pressures
-            # logger.debug(f"Updating heatmap with RESCALED pressures: {self.pressure_values.round(1)}")
+            if slider_max_int <= slider_min_int:
+                slider_max_int = slider_min_int + 1 
 
-            # --- Heatmap Calculation and Rendering ---
-            current_cop_qpoint = self._calculate_center_of_pressure()
+            self.time_slider_heatmap.blockSignals(True)
+            if self.time_slider_heatmap.minimum() != slider_min_int or \
+               self.time_slider_heatmap.maximum() != slider_max_int:
+                current_val = self.time_slider_heatmap.value()
+                self.time_slider_heatmap.setRange(slider_min_int, slider_max_int)
+                # Try to keep value if within new range, else set to min
+                if slider_min_int <= current_val <= slider_max_int:
+                    self.time_slider_heatmap.setValue(current_val)
+                else:
+                    self.time_slider_heatmap.setValue(slider_min_int)
+                # Trigger initial render for the new range/value if not user-driven
+                # self.on_time_slider_heatmap(self.time_slider_heatmap.value()) 
+            self.time_slider_heatmap.blockSignals(False)
+            
+            # If in replay/slider mode, rendering is driven by on_time_slider_heatmap()
+            # or an initial call after range setting if needed.
+            # For now, let slider interaction trigger the render.
+            # If no interaction yet, it might show last state or be blank until slider moved.
+            # To ensure it shows data for current_relative_time (if that's desired concept for "latest" in paused mode):
+            if plotting_paused: # This means we are in slider mode
+                 # Render for the current slider value. If slider was just set up, this renders initial view.
+                 self.render_heatmap_for_time(float(self.time_slider_heatmap.value()) / self.SLIDER_FLOAT_PRECISION_FACTOR_HEATMAP)
+
+        else: # is_flowing is True (Live mode)
+            self.scrub_time_widget_heatmap.setVisible(False)
+            # --- Get Latest Pressure Data AND RESCALE IT (Live Mode Path) ---
+            data_found_count = 0
+            rescaled_pressures = np.zeros(self.NUM_SENSORS, dtype=np.float32)
+            for i, key in enumerate(HEATMAP_KEYS):
+                if key in self.data_buffers_ref and self.data_buffers_ref[key]:
+                    initial_pressure = self.data_buffers_ref[key][-1][1]
+                    if INITIAL_PRESSURE_SENSITIVITY > 1e-6:
+                        current_pressure = initial_pressure * (self.current_pressure_sensitivity / INITIAL_PRESSURE_SENSITIVITY)
+                    else: current_pressure = 0.0
+                    rescaled_pressures[i] = max(0.0, current_pressure)
+                    data_found_count += 1
+            if data_found_count > 0: self.pressure_values = rescaled_pressures
+
+            # --- Live Heatmap Calculation and Rendering ---
+            current_cop_qpoint = self._calculate_center_of_pressure() # Uses self.pressure_values
             self.center_of_pressure = current_cop_qpoint
             if current_cop_qpoint is not None:
                 is_different = True
@@ -1345,13 +2096,9 @@ class PressureHeatmapComponent(BaseGuiComponent):
                     if abs(current_cop_qpoint.x() - last_point.x()) < 0.1 and abs(current_cop_qpoint.y() - last_point.y()) < 0.1: is_different = False
                 if is_different: self.cop_trail.append(current_cop_qpoint)
 
-            # Calculate pressure distribution using the rescaled pressure values and current gaussian factors
             calculated_pressures = self._calculate_pressure_fast()
-            # Render the heatmap using the current windowing (norm) and colormap
             self._render_heatmap_to_buffer(calculated_pressures)
-            # Update the display widget
             self._update_display_pixmap()
-
 
     def clear_component(self):
         if not self.heatmap_qimage: return # Skip if precomputation failed
@@ -1364,8 +2111,32 @@ class PressureHeatmapComponent(BaseGuiComponent):
         self._render_heatmap_to_buffer(calculated_pressures)
         self._update_display_pixmap()
         # Hide overlay via base class method
-        super().handle_missing_uuids(set())
 
+
+        super().handle_missing_uuids(set())
+        super().handle_missing_replay_data(set()) # Ensure replay overlay is also cleared
+
+
+        # --- Reset time slider and hide its container ---
+        if hasattr(self, 'time_slider_heatmap'):
+            self.time_slider_heatmap.blockSignals(True)
+            self.time_slider_heatmap.setRange(0, 0) # Reset range
+            self.time_slider_heatmap.setValue(0)    # Reset value
+            self.time_slider_heatmap.blockSignals(False)
+            # The slider's visibility is controlled by its parent scrub_time_widget_heatmap
+
+            
+        # Update the replay time label to reflect the current slider value
+        current_slider_val_for_label = self.time_slider_heatmap.value()
+        time_sec_for_label = float(current_slider_val_for_label) / self.SLIDER_FLOAT_PRECISION_FACTOR_HEATMAP
+        if hasattr(self, 'current_replay_time_label_heatmap'):
+            self.current_replay_time_label_heatmap.setText(f"{time_sec_for_label:.2f}s")
+
+        if hasattr(self, 'scrub_time_widget_heatmap'):
+            self.scrub_time_widget_heatmap.setVisible(False)
+
+        if hasattr(self, 'current_replay_time_label_heatmap'):
+            self.current_replay_time_label_heatmap.setText("0.00s")
 
     # --- Precomputation and Masking Methods (Internal) ---
     def _generate_outline_mask(self) -> QImage:
@@ -1449,11 +2220,20 @@ class PressureHeatmapComponent(BaseGuiComponent):
         # logger.debug(f"Calculated pressures min/max: {np.min(calculated_pressures_masked):.1f}/{np.max(calculated_pressures_masked):.1f}")
         return calculated_pressures_masked
 
-    def _calculate_center_of_pressure(self) -> Optional[QPointF]:
-        # Use the current internal *rescaled* pressure values
-        pressures = np.maximum(self.pressure_values, 0.0)
+    def _calculate_center_of_pressure(self, pressures_array: Optional[np.ndarray] = None) -> Optional[QPointF]:
+        # Use the provided pressures_array if given, otherwise use self.pressure_values
+        pressures_to_use = pressures_array if pressures_array is not None else self.pressure_values
+        
+        # Ensure pressures_to_use is a valid numpy array before proceeding
+        if pressures_to_use is None or not isinstance(pressures_to_use, np.ndarray) or pressures_to_use.size == 0:
+            return None
+
+        pressures = np.maximum(pressures_to_use, 0.0) # Ensure non-negative
         total_pressure = np.sum(pressures)
-        if total_pressure < 1e-6: return None
+
+        if total_pressure < 1e-9: # Use a smaller epsilon for float comparisons
+            return None
+            
         sensor_x = self.sensor_coords[:, 0]
         sensor_y = self.sensor_coords[:, 1]
         cop_x = np.sum(pressures * sensor_x) / total_pressure
@@ -1648,6 +2428,21 @@ class PressureHeatmapComponent(BaseGuiComponent):
     # --- Slot for Save Button ---
     def save_current_view(self):
         """ Saves the current heatmap view including CoP to a file. """
+
+
+        is_paused_or_replaying = plotting_paused or (state == "replay_active") # Simpler check for replay state
+        if is_paused_or_replaying and self.scrub_time_widget_heatmap.isVisible(): # Check visibility of the container
+            current_slider_int_value = self.time_slider_heatmap.value()
+            current_slider_time_sec = float(current_slider_int_value) / self.SLIDER_FLOAT_PRECISION_FACTOR_HEATMAP
+            logger.info(f"Heatmap snapshot: Using data from slider time {current_slider_time_sec:.2f}s (raw slider: {current_slider_int_value}).")
+            # Ensure render_heatmap_for_time is called *before* drawing to the save_pixmap
+            self.render_heatmap_for_time(current_slider_time_sec) 
+        else:
+            logger.info("Heatmap snapshot: Using live/latest data (not from slider).")
+            # For live data, self.pressure_values, self.center_of_pressure, self.cop_trail
+            # should already reflect the latest state from update_component.
+
+
         if self.original_pixmap.isNull() or not self.heatmap_qimage:
              logger.warning("Cannot save snapshot: Background or heatmap data missing.")
              # Optionally show a message box to the user
@@ -1859,20 +2654,113 @@ class PressureHeatmapComponent(BaseGuiComponent):
         except ValueError: max_val_f = self.current_pressure_max # Revert on bad input
         self._update_pressure_range(min_val_f, max_val_f)
 
-    # --- Colormap Selection Slot (Internal) ---
+
+
     def _update_colormap(self, cmap_name):
         try:
             self.cmap = matplotlib.colormaps[cmap_name]
             self.current_cmap_name = cmap_name
             logger.info(f"Heatmap colormap changed to: {self.current_cmap_name}")
-             # Trigger a visual update since colormap changed
-            # (Assuming update_component will be called shortly by the main timer anyway)
+             
         except KeyError:
              logger.error(f"Heatmap: Invalid colormap selected in dropdown: {cmap_name}. Keeping previous.")
-             # Revert dropdown to previous valid value
+             
              self.cmap_combobox.blockSignals(True)
              self.cmap_combobox.setCurrentText(self.current_cmap_name)
              self.cmap_combobox.blockSignals(False)
+
+    def on_time_slider_heatmap(self, slider_value_int: int):
+        global plotting_paused
+        if not plotting_paused: # If we are entering scrub mode via slider interaction
+            plotting_paused = True 
+            main_window = self.window()
+            if isinstance(main_window, MainWindow):
+                if main_window.pause_resume_button.text() != "Resume Plotting":
+                     main_window.pause_resume_button.setText("Resume Plotting")
+        
+        time_sec_float = float(slider_value_int) / self.SLIDER_FLOAT_PRECISION_FACTOR_HEATMAP
+
+        if hasattr(self, 'current_replay_time_label_heatmap'):
+            self.current_replay_time_label_heatmap.setText(f"{time_sec_float:.2f}s")
+
+        self.render_heatmap_for_time(time_sec_float)
+
+
+
+    def render_heatmap_for_time(self, time_sec: float):
+        if not self.heatmap_qimage: return
+
+        # --- 1. Calculate and set self.pressure_values for heatmap coloration at time_sec ---
+        pressures_for_heatmap_at_time_sec = np.zeros(self.NUM_SENSORS, dtype=np.float32)
+        data_found_for_heatmap = False
+        for i, key in enumerate(HEATMAP_KEYS):
+            val_at_time = get_value_at_time(key, time_sec, self.data_buffers_ref)
+            if val_at_time is not None:
+                initial_pressure = val_at_time
+                rescaled_val = 0.0
+                if INITIAL_PRESSURE_SENSITIVITY > 1e-6:
+                    rescaled_val = initial_pressure * (self.current_pressure_sensitivity / INITIAL_PRESSURE_SENSITIVITY)
+                pressures_for_heatmap_at_time_sec[i] = max(0.0, rescaled_val)
+                data_found_for_heatmap = True
+        
+        self.pressure_values = pressures_for_heatmap_at_time_sec # Used by _calculate_pressure_fast for heatmap colors
+
+        if not data_found_for_heatmap and time_sec > 0.01: # Avoid log spam for t=0 if no data
+             logger.debug(f"Heatmap render_for_time({time_sec:.2f}s): No data for heatmap colors.")
+        
+        # --- 2. Reconstruct CoP trail leading up to time_sec ---
+        self.cop_trail.clear()
+        self.center_of_pressure = None # Will be set to the last point of the trail
+
+        all_heatmap_keys_timestamps = []
+        for key in HEATMAP_KEYS:
+            if key in self.data_buffers_ref and self.data_buffers_ref[key]:
+                all_heatmap_keys_timestamps.extend([item[0] for item in self.data_buffers_ref[key]])
+        
+        if all_heatmap_keys_timestamps:
+            unique_sorted_times = sorted(list(set(all_heatmap_keys_timestamps)))
+            
+            # Find the index of the actual data point at or just before time_sec
+            idx_current_render_time = bisect.bisect_right(unique_sorted_times, time_sec) - 1
+
+            if idx_current_render_time >= 0:
+                # Determine the range of timestamps for the trail
+                trail_end_idx = idx_current_render_time
+                trail_start_idx = max(0, trail_end_idx - self.COP_TRAIL_MAX_LEN + 1)
+                timestamps_for_trail = unique_sorted_times[trail_start_idx : trail_end_idx + 1]
+
+                temp_trail_cops = []
+                for t_hist in timestamps_for_trail:
+                    historical_pressures_at_t_hist = np.zeros(self.NUM_SENSORS, dtype=np.float32)
+                    data_found_for_trail_point = False
+                    for i, key_trail in enumerate(HEATMAP_KEYS):
+                        val_at_t_hist = get_value_at_time(key_trail, t_hist, self.data_buffers_ref)
+                        if val_at_t_hist is not None:
+                            initial_pressure = val_at_t_hist
+                            rescaled_val = 0.0
+                            if INITIAL_PRESSURE_SENSITIVITY > 1e-6:
+                                 rescaled_val = initial_pressure * (self.current_pressure_sensitivity / INITIAL_PRESSURE_SENSITIVITY)
+                            historical_pressures_at_t_hist[i] = max(0.0, rescaled_val)
+                            data_found_for_trail_point = True
+                    
+                    if data_found_for_trail_point:
+                        cop_at_t_hist = self._calculate_center_of_pressure(pressures_array=historical_pressures_at_t_hist)
+                        if cop_at_t_hist:
+                            temp_trail_cops.append(cop_at_t_hist)
+                
+                if temp_trail_cops:
+                    self.cop_trail.extend(temp_trail_cops)
+                    self.center_of_pressure = self.cop_trail[-1] # Main CoP dot is the last in the trail
+            else: # time_sec is before any data
+                self.pressure_values.fill(0.0) 
+        else: # No timestamps at all for heatmap keys
+            self.pressure_values.fill(0.0)
+
+        # --- 3. Render heatmap and CoP ---
+        calculated_pressures_for_heatmap = self._calculate_pressure_fast() # Uses self.pressure_values
+        self._render_heatmap_to_buffer(calculated_pressures_for_heatmap)
+        self._update_display_pixmap()
+
 
 
 # --- SingleValueDisplayComponent ---
@@ -1944,7 +2832,13 @@ class SingleValueDisplayComponent(BaseGuiComponent):
                      value_found = True
 
         # Only show '--' if not paused, not missing UUID, and value not found
-        if not value_found and not is_uuid_missing and not plotting_paused:
+        is_csv_data_missing = False
+        if state == "replay_active" and self.data_type_to_monitor not in self.data_buffers_ref:
+            is_csv_data_missing = True
+            self.value_label.setText("(CSV Data Missing)")
+
+        # Only show '--' if not paused, not missing UUID, not missing CSV data, and value not found
+        if not value_found and not is_uuid_missing and not is_csv_data_missing and not plotting_paused:
              self.value_label.setText("--")
 
 
@@ -1986,10 +2880,26 @@ class SingleValueDisplayComponent(BaseGuiComponent):
              if start_time: current_time = (datetime.datetime.now() - start_time).total_seconds()
              self.update_component(current_time, False)
 
+    def handle_missing_replay_data(self, missing_data_types_for_component: Set[str]):
+        # For SingleValueDisplay, if its specific data_type is in the missing set for replay
+        if self.data_type_to_monitor in missing_data_types_for_component:
+            self.value_label.setText("(CSV Data Missing)")
+        else:
+            # If the overlay was visible and was for CSV data, but our type is now loaded, update
+            if self.uuid_missing_overlay and self.uuid_missing_overlay.isVisible() and "CSV" in self.uuid_missing_overlay.text():
+                 current_time = 0.0
+                 if start_time: current_time = (datetime.datetime.now() - start_time).total_seconds()
+                 self.update_component(current_time, False) # Attempt to update with current data
+        # The generic overlay is handled by super if we call it:
+        # super().handle_missing_replay_data(missing_data_types_for_component)
+        # However, for this simple component, updating its own label might be cleaner.
 
 # --- Nyquist Plot Component ---
 class NyquistPlotComponent(BaseGuiComponent):
     # Constants
+    SLIDER_FLOAT_PRECISION_FACTOR_NYQUIST = 100 # For 0.01s resolution, adjust as needed
+
+
     TRAIL_MAX_LEN = 50
     TRAIL_COLOR = QColor(243, 100, 248, 255)  # Bright pink
     MAIN_POINT_COLOR = QColor(0, 0, 0, 255)    # Black
@@ -2029,6 +2939,31 @@ class NyquistPlotComponent(BaseGuiComponent):
         component_layout = QVBoxLayout(self)
         component_layout.setContentsMargins(0, 0, 0, 0)
         component_layout.addWidget(self.plot_widget)
+
+
+        self.time_slider_nyquist = QSlider(Qt.Orientation.Horizontal)
+
+        self.current_replay_time_label_nyquist = QLabel("0.00s")
+        self.current_replay_time_label_nyquist.setFixedWidth(50) # Adjust width as needed
+        self.current_replay_time_label_nyquist.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.time_slider_nyquist.setRange(0,0)
+        self.time_slider_nyquist.valueChanged.connect(self.on_time_slider_nyquist)
+
+        # Create a container widget for the scrub time controls
+        self.scrub_time_widget_nyquist = QWidget()
+        time_slider_layout_nq = QHBoxLayout(self.scrub_time_widget_nyquist)
+        time_slider_layout_nq.setContentsMargins(0,0,0,0) # Minimize extra space
+        time_slider_layout_nq.addWidget(QLabel("Scrub Time:"))
+        time_slider_layout_nq.addWidget(self.time_slider_nyquist)
+
+        time_slider_layout_nq.addWidget(self.current_replay_time_label_nyquist)
+        
+        # Add the container widget directly to the main component layout
+        component_layout.addWidget(self.scrub_time_widget_nyquist)
+        self.scrub_time_widget_nyquist.setVisible(False) # Initially hidden
+
+
 
         self.snapshot_button = QPushButton("Take Snapshot")
         self.snapshot_button.clicked.connect(self._trigger_snapshot_creation)
@@ -2070,26 +3005,78 @@ class NyquistPlotComponent(BaseGuiComponent):
         return ""
 
     def update_component(self, current_relative_time: float, is_flowing: bool):
-        if plotting_paused or self.missing_relevant_uuids:
+
+
+        if (plotting_paused and is_flowing) or self.missing_relevant_uuids: # plotting_paused global, is_flowing arg
             return
 
-        real_key, imag_key = "real_part_kohm", "imag_part_kohm"
-        new_data_point = None
+        if not is_flowing: # Replay mode or "Flowing Mode" checkbox unchecked
+            self.scrub_time_widget_nyquist.setVisible(True)
+            
+            actual_min_data_time_nq = float('inf')
+            actual_max_data_time_nq = 0.0
+            found_any_data_nq = False
 
-        if real_key in self.data_buffers_ref and self.data_buffers_ref[real_key] and \
-           imag_key in self.data_buffers_ref and self.data_buffers_ref[imag_key]:
-            try:
-                latest_real_val = self.data_buffers_ref[real_key][-1][1]
-                latest_imag_val = self.data_buffers_ref[imag_key][-1][1]
-                new_data_point = (float(latest_real_val), -float(latest_imag_val))
-            except (IndexError, ValueError) as e:
-                logger.debug(f"NyquistPlot: Error fetching latest data: {e}")
-            except Exception as e:
-                logger.warning(f"NyquistPlot: Unexpected error processing data: {e}")
+            for key_nq_slider in self._required_data_types: 
+                if key_nq_slider in self.data_buffers_ref and self.data_buffers_ref[key_nq_slider]:
+                    series_times_nq = [item[0] for item in self.data_buffers_ref[key_nq_slider]]
+                    if series_times_nq:
+                        actual_min_data_time_nq = min(actual_min_data_time_nq, series_times_nq[0])
+                        actual_max_data_time_nq = max(actual_max_data_time_nq, series_times_nq[-1])
+                        found_any_data_nq = True
+            
+            if not found_any_data_nq:
+                actual_min_data_time_nq = 0.0
+                actual_max_data_time_nq = 1.0 
+            
+            if actual_max_data_time_nq <= actual_min_data_time_nq:
+                actual_max_data_time_nq = actual_min_data_time_nq + 0.1
 
-        if new_data_point:
-            self.trail_data.append(new_data_point)
-            self._refresh_plot_graphics()
+            slider_min_int = int(math.floor(actual_min_data_time_nq * self.SLIDER_FLOAT_PRECISION_FACTOR_NYQUIST))
+            slider_max_int = int(math.ceil(actual_max_data_time_nq * self.SLIDER_FLOAT_PRECISION_FACTOR_NYQUIST))
+
+            if slider_max_int <= slider_min_int:
+                slider_max_int = slider_min_int + 1
+
+            self.time_slider_nyquist.blockSignals(True)
+            if self.time_slider_nyquist.minimum() != slider_min_int or \
+               self.time_slider_nyquist.maximum() != slider_max_int:
+                current_val = self.time_slider_nyquist.value()
+                self.time_slider_nyquist.setRange(slider_min_int, slider_max_int)
+                if slider_min_int <= current_val <= slider_max_int:
+                    self.time_slider_nyquist.setValue(current_val)
+                else:
+                    self.time_slider_nyquist.setValue(slider_min_int)
+            self.time_slider_nyquist.blockSignals(False)
+
+            
+            # Update the replay time label to reflect the current slider value
+            current_slider_val_for_label_nq = self.time_slider_nyquist.value()
+            time_sec_for_label_nq = float(current_slider_val_for_label_nq) / self.SLIDER_FLOAT_PRECISION_FACTOR_NYQUIST
+            if hasattr(self, 'current_replay_time_label_nyquist'):
+                self.current_replay_time_label_nyquist.setText(f"{time_sec_for_label_nq:.2f}s")
+            
+            if plotting_paused: # This means we are in slider mode
+                 self.render_nyquist_for_time(float(self.time_slider_nyquist.value()) / self.SLIDER_FLOAT_PRECISION_FACTOR_NYQUIST)
+
+        else: # is_flowing is True (Live mode)
+            self.scrub_time_widget_nyquist.setVisible(False)
+            # Live update logic
+            real_key, imag_key = "real_part_kohm", "imag_part_kohm"
+            new_data_point = None
+            if real_key in self.data_buffers_ref and self.data_buffers_ref[real_key] and \
+               imag_key in self.data_buffers_ref and self.data_buffers_ref[imag_key]:
+                try:
+                    latest_real_val = self.data_buffers_ref[real_key][-1][1]
+                    latest_imag_val = self.data_buffers_ref[imag_key][-1][1]
+                    new_data_point = (float(latest_real_val), -float(latest_imag_val))
+                except (IndexError, ValueError) as e: logger.debug(f"NyquistPlot: Error fetching latest data: {e}")
+                except Exception as e: logger.warning(f"NyquistPlot: Unexpected error processing data: {e}")
+
+            if new_data_point:
+                self.trail_data.append(new_data_point)
+                self._refresh_plot_graphics()
+
 
     def _refresh_plot_graphics(self):
         points = list(self.trail_data)
@@ -2151,32 +3138,77 @@ class NyquistPlotComponent(BaseGuiComponent):
     def clear_component(self):
         self.trail_data.clear()
         self._refresh_plot_graphics()
+
         super().handle_missing_uuids(set())
+        super().handle_missing_replay_data(set()) # Ensure replay overlay is also cleared        
         self.missing_relevant_uuids.clear()
         self.plot_item.setXRange(-1, 1, padding=0.1)
         self.plot_item.setYRange(-1, 1, padding=0.1)
+
         self.plot_item.enableAutoRange(axis='xy', enable=True)
         self.snapshot_button.setEnabled(True)
         self.snapshot_button.setText("Take Snapshot")
 
+        # --- Reset time slider and hide its container ---
+        if hasattr(self, 'time_slider_nyquist'):
+            self.time_slider_nyquist.blockSignals(True)
+            self.time_slider_nyquist.setRange(0, 0) # Reset range
+            self.time_slider_nyquist.setValue(0)    # Reset value
+            self.time_slider_nyquist.blockSignals(False)
+            # The slider's visibility is controlled by its parent scrub_time_widget_nyquist
+
+        if hasattr(self, 'scrub_time_widget_nyquist'):
+            self.scrub_time_widget_nyquist.setVisible(False)
+
+        if hasattr(self, 'current_replay_time_label_nyquist'):
+            self.current_replay_time_label_nyquist.setText("0.00s")
+
+
     def handle_missing_uuids(self, missing_uuids_for_component: Set[str]):
         super().handle_missing_uuids(missing_uuids_for_component)
-        self.missing_relevant_uuids = missing_uuids_for_component
-        if self.missing_relevant_uuids:
+        self.missing_relevant_uuids = missing_uuids_for_component # Keep track of missing UUIDs
+        self._update_controls_based_on_data_status()
+
+
+    def _update_controls_based_on_data_status(self):
+        is_overlay_active = self.uuid_missing_overlay and self.uuid_missing_overlay.isVisible()
+        if hasattr(self, 'snapshot_button'):
+            self.snapshot_button.setEnabled(not is_overlay_active)
+        
+        if is_overlay_active:
             self.trail_data.clear()
-            self._refresh_plot_graphics()
+            self._refresh_plot_graphics() # Clear visual plot
             self.plot_item.enableAutoRange(axis='xy', enable=False)
             self.plot_item.setXRange(-1, 1, padding=0.1)
             self.plot_item.setYRange(-1, 1, padding=0.1)
-            self.snapshot_button.setEnabled(False)
         else:
-            self.plot_item.enableAutoRange(axis='xy', enable=True)
-            self.snapshot_button.setEnabled(True)
+            if self.trail_data: # Only enable autorange if there's data and no overlay
+                 self.plot_item.enableAutoRange(axis='xy', enable=True)
+
+
+    def handle_missing_replay_data(self, missing_data_types_for_component: Set[str]):
+        super().handle_missing_replay_data(missing_data_types_for_component)
+        self._update_controls_based_on_data_status()
+
 
     def _trigger_snapshot_creation(self):
         if not self.snapshot_button.isEnabled() or not self.trail_data:
             if not self.trail_data: logger.info("NyquistPlot: No data for snapshot.")
             return
+        
+
+        is_paused_or_replaying_nq = plotting_paused or (state == "replay_active")
+        if is_paused_or_replaying_nq and self.scrub_time_widget_nyquist.isVisible():
+            current_slider_int_value_nq = self.time_slider_nyquist.value()
+            current_slider_time_nq_sec = float(current_slider_int_value_nq) / self.SLIDER_FLOAT_PRECISION_FACTOR_NYQUIST
+            logger.info(f"Nyquist snapshot: Using data from slider time {current_slider_time_nq_sec:.2f}s (raw slider: {current_slider_int_value_nq}).")
+            # Ensure render_nyquist_for_time updates self.trail_data before PDF generation
+            self.render_nyquist_for_time(current_slider_time_nq_sec)
+        else:
+             logger.info("Nyquist snapshot: Using live/latest trail data (not from slider).")
+             # For live data, self.trail_data should be current from update_component.
+
+
         self.snapshot_button.setEnabled(False)
         self.snapshot_button.setText("Saving Snapshot...")
         points_to_snapshot = list(self.trail_data)
@@ -2204,6 +3236,75 @@ class NyquistPlotComponent(BaseGuiComponent):
             if result_path: logger.info(f"NyquistPlot: Snapshot saved to {result_path}")
         except Exception as e:
             logger.error(f"NyquistPlot: Error retrieving snapshot result: {e}", exc_info=True)
+
+
+
+
+    def on_time_slider_nyquist(self, slider_value_int: int):
+        global plotting_paused
+        if not plotting_paused: # If we are entering scrub mode via slider interaction
+            plotting_paused = True
+            main_window = self.window()
+            if isinstance(main_window, MainWindow):
+                if main_window.pause_resume_button.text() != "Resume Plotting":
+                    main_window.pause_resume_button.setText("Resume Plotting")
+        
+        time_sec_float = float(slider_value_int) / self.SLIDER_FLOAT_PRECISION_FACTOR_NYQUIST
+
+        if hasattr(self, 'current_replay_time_label_nyquist'):
+            self.current_replay_time_label_nyquist.setText(f"{time_sec_float:.2f}s")
+
+        self.render_nyquist_for_time(time_sec_float)
+
+    def render_nyquist_for_time(self, time_sec: float):
+        self.trail_data.clear()
+
+        real_key = "real_part_kohm"
+        imag_key = "imag_part_kohm"
+
+        # Check if the required data types are even in data_buffers
+        if real_key not in self.data_buffers_ref or imag_key not in self.data_buffers_ref or \
+           not self.data_buffers_ref[real_key] or not self.data_buffers_ref[imag_key]:
+            logger.debug(f"Nyquist render_for_time({time_sec:.2f}s): Missing or empty buffers for {real_key} or {imag_key}.")
+            self._refresh_plot_graphics() # Refresh to show an empty plot
+            return
+
+        # Combine all timestamps from real and imag parts to find relevant historical points
+        all_nyquist_timestamps = []
+        all_nyquist_timestamps.extend([item[0] for item in self.data_buffers_ref[real_key]])
+        all_nyquist_timestamps.extend([item[0] for item in self.data_buffers_ref[imag_key]])
+        
+        if not all_nyquist_timestamps:
+            self._refresh_plot_graphics()
+            return
+
+        unique_sorted_times = sorted(list(set(all_nyquist_timestamps)))
+        
+        # Find the index of the actual data point at or just before time_sec
+        idx_current_render_time = bisect.bisect_right(unique_sorted_times, time_sec) -1
+
+        if idx_current_render_time < 0: # time_sec is before any data
+            self._refresh_plot_graphics() # Refresh to show an empty plot
+            return
+
+        # Determine the range of timestamps for the trail
+        trail_end_idx = idx_current_render_time
+        trail_start_idx = max(0, trail_end_idx - self.TRAIL_MAX_LEN + 1)
+        timestamps_for_trail = unique_sorted_times[trail_start_idx : trail_end_idx + 1]
+        
+        temp_trail_points = []
+        for t_hist in timestamps_for_trail:
+            real_val_hist = get_value_at_time(real_key, t_hist, self.data_buffers_ref)
+            imag_val_hist = get_value_at_time(imag_key, t_hist, self.data_buffers_ref)
+
+            if real_val_hist is not None and imag_val_hist is not None:
+                temp_trail_points.append((float(real_val_hist), -float(imag_val_hist)))
+        
+        if temp_trail_points:
+            self.trail_data.extend(temp_trail_points)
+        
+        self._refresh_plot_graphics()
+
 
     @classmethod
     def _build_snapshot_pdf_sync(cls, points, view_range, alphas, path, title_str, xlabel_str, ylabel_str):
@@ -2252,6 +3353,10 @@ class NyquistPlotComponent(BaseGuiComponent):
 
 # --- IMU Visualizer Component ---
 class IMUVisualizerComponent(BaseGuiComponent):
+
+    SLIDER_FLOAT_PRECISION_FACTOR_IMU = 100 # For 0.01s resolution
+
+
     BOX_SIZE = (1.5, 3, 0.5)
     AXIS_LENGTH = 3.0
     AXIS_RADIUS = 0.03
@@ -2299,6 +3404,31 @@ class IMUVisualizerComponent(BaseGuiComponent):
         font_orientation = self.orientation_status_label.font(); font_orientation.setPointSize(11)
         self.orientation_status_label.setFont(font_orientation)
         controls_layout.addWidget(self.orientation_status_label)
+
+        self.time_slider_imu = QSlider(Qt.Orientation.Horizontal)
+
+        self.current_replay_time_label_imu = QLabel("0.00s")
+        self.current_replay_time_label_imu.setFixedWidth(50) # Adjust width as needed
+        self.current_replay_time_label_imu.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.time_slider_imu.setRange(0,0)
+        self.time_slider_imu.valueChanged.connect(self.on_time_slider_imu)
+        
+        # Create a container widget for the scrub time controls
+        self.scrub_time_widget_imu = QWidget()
+        time_slider_layout_imu = QHBoxLayout(self.scrub_time_widget_imu)
+        time_slider_layout_imu.setContentsMargins(0,0,0,0) # Minimize extra space
+        time_slider_layout_imu.addWidget(QLabel("Scrub Time:"))
+
+        time_slider_layout_imu.addWidget(self.time_slider_imu)
+
+
+        time_slider_layout_imu.addWidget(self.current_replay_time_label_imu)
+
+        controls_layout.addWidget(self.scrub_time_widget_imu)
+        self.scrub_time_widget_imu.setVisible(False) # Initially hidden
+
+
 
         buttons_layout = QHBoxLayout()
         self.snapshot_button = QPushButton("Take Snapshot")
@@ -2402,40 +3532,90 @@ class IMUVisualizerComponent(BaseGuiComponent):
         self.view.addItem(self.box_mesh)
 
     def update_component(self, current_relative_time: float, is_flowing: bool):
-        if plotting_paused: return
+
+
+        # Directly use is_flowing argument, and global plotting_paused
+        if plotting_paused and is_flowing: # If live and paused, do nothing.
+            return
         
-        missing_uuid_active = False
-        if self.uuid_missing_overlay and self.uuid_missing_overlay.isVisible():
-            missing_uuid_active = True
+        is_uuid_missing_active = self.uuid_missing_overlay and self.uuid_missing_overlay.isVisible()
 
-        q_w, q_x, q_y, q_z = None, None, None, None
-        if not missing_uuid_active:
-            if 'quat_w' in self.data_buffers_ref and self.data_buffers_ref['quat_w']:
-                q_w = self.data_buffers_ref['quat_w'][-1][1]
-            if 'quat_x' in self.data_buffers_ref and self.data_buffers_ref['quat_x']:
-                q_x = self.data_buffers_ref['quat_x'][-1][1]
-            if 'quat_y' in self.data_buffers_ref and self.data_buffers_ref['quat_y']:
-                q_y = self.data_buffers_ref['quat_y'][-1][1]
-            if 'quat_z' in self.data_buffers_ref and self.data_buffers_ref['quat_z']:
-                q_z = self.data_buffers_ref['quat_z'][-1][1]
+        if not is_flowing: # Replay mode or "Flowing Mode" checkbox unchecked
+            self.scrub_time_widget_imu.setVisible(True)
+            
+            actual_min_data_time_imu = float('inf')
+            actual_max_data_time_imu = 0.0
+            found_any_data_imu = False
 
-        if all(q is not None for q in [q_w, q_x, q_y, q_z]):
-            self.current_quaternion = QQuaternion(float(q_w), float(q_x), float(q_y), float(q_z))
-        elif not missing_uuid_active: # Only reset if data is expected but not fully there
-            self.current_quaternion = QQuaternion(1,0,0,0) # Reset to identity if data incomplete and no UUID error
+            for key_imu in self._required_data_types: # quat_w,x,y,z
+                if key_imu in self.data_buffers_ref and self.data_buffers_ref[key_imu]:
+                    series_times_imu = [item[0] for item in self.data_buffers_ref[key_imu]]
+                    if series_times_imu:
+                        actual_min_data_time_imu = min(actual_min_data_time_imu, series_times_imu[0])
+                        actual_max_data_time_imu = max(actual_max_data_time_imu, series_times_imu[-1])
+                        found_any_data_imu = True
+            
+            if not found_any_data_imu: # No data for any quat component
+                actual_min_data_time_imu = 0.0
+                actual_max_data_time_imu = 1.0 
+            
+            if actual_max_data_time_imu <= actual_min_data_time_imu: # e.g. only one data point
+                actual_max_data_time_imu = actual_min_data_time_imu + 0.1
 
-        if missing_uuid_active: # If UUID missing, force identity and clear label
-            relative_quat = QQuaternion(1,0,0,0)
-            self.orientation_status_label.setText("Yaw: --- Pitch: --- Roll: ---")
-        else:
-            relative_quat = self.baseline_quaternion.inverted() * self.current_quaternion
-            yaw, pitch, roll = self._get_euler_angles_from_qt_quaternion(relative_quat)
-            self.orientation_status_label.setText(f"Yaw: {yaw:6.1f}°  Pitch: {pitch:6.1f}°  Roll: {roll:6.1f}°")
+            # Scale for precision slider
+            slider_min_int = int(math.floor(actual_min_data_time_imu * self.SLIDER_FLOAT_PRECISION_FACTOR_IMU))
+            slider_max_int = int(math.ceil(actual_max_data_time_imu * self.SLIDER_FLOAT_PRECISION_FACTOR_IMU))
 
-        transform = pg.Transform3D()
-        transform.rotate(relative_quat)
-        if hasattr(self, 'box_mesh'):
-            self.box_mesh.setTransform(transform)
+            if slider_max_int <= slider_min_int: # Ensure slider has a range > 0
+                slider_max_int = slider_min_int + 1
+
+            self.time_slider_imu.blockSignals(True)
+            if self.time_slider_imu.minimum() != slider_min_int or \
+               self.time_slider_imu.maximum() != slider_max_int:
+                current_val = self.time_slider_imu.value()
+                self.time_slider_imu.setRange(slider_min_int, slider_max_int)
+                if slider_min_int <= current_val <= slider_max_int:
+                    self.time_slider_imu.setValue(current_val)
+                else:
+                    self.time_slider_imu.setValue(slider_min_int)
+            self.time_slider_imu.blockSignals(False)
+
+
+            # Update the replay time label to reflect the current slider value
+            current_slider_val_for_label_imu = self.time_slider_imu.value()
+            time_sec_for_label_imu = float(current_slider_val_for_label_imu) / self.SLIDER_FLOAT_PRECISION_FACTOR_IMU
+            if hasattr(self, 'current_replay_time_label_imu'):
+                self.current_replay_time_label_imu.setText(f"{time_sec_for_label_imu:.2f}s")
+
+            if plotting_paused: # This means we are in slider mode
+                self.render_imu_for_time(float(self.time_slider_imu.value()) / self.SLIDER_FLOAT_PRECISION_FACTOR_IMU)
+        
+        else: # is_flowing is True (Live mode)
+            self.scrub_time_widget_imu.setVisible(False)
+            if is_uuid_missing_active: # If UUIDs missing in live mode, show default
+                relative_quat = QQuaternion(1,0,0,0)
+                self.orientation_status_label.setText("Yaw: --- Pitch: --- Roll: ---")
+            else:
+                q_w, q_x, q_y, q_z = None, None, None, None
+                if 'quat_w' in self.data_buffers_ref and self.data_buffers_ref['quat_w']: q_w = self.data_buffers_ref['quat_w'][-1][1]
+                if 'quat_x' in self.data_buffers_ref and self.data_buffers_ref['quat_x']: q_x = self.data_buffers_ref['quat_x'][-1][1]
+                if 'quat_y' in self.data_buffers_ref and self.data_buffers_ref['quat_y']: q_y = self.data_buffers_ref['quat_y'][-1][1]
+                if 'quat_z' in self.data_buffers_ref and self.data_buffers_ref['quat_z']: q_z = self.data_buffers_ref['quat_z'][-1][1]
+
+                if all(q is not None for q in [q_w, q_x, q_y, q_z]):
+                    self.current_quaternion = QQuaternion(float(q_w), float(q_x), float(q_y), float(q_z))
+                else: # Data incomplete for live update
+                    self.current_quaternion = QQuaternion(1,0,0,0) 
+
+                relative_quat = self.baseline_quaternion.inverted() * self.current_quaternion
+                yaw, pitch, roll = self._get_euler_angles_from_qt_quaternion(relative_quat)
+                self.orientation_status_label.setText(f"Yaw: {yaw:6.1f}°  Pitch: {pitch:6.1f}°  Roll: {roll:6.1f}°")
+
+            transform = pg.Transform3D()
+            transform.rotate(relative_quat)
+            if hasattr(self, 'box_mesh'):
+                self.box_mesh.setTransform(transform)
+
 
     def _get_euler_angles_from_qt_quaternion(self, q: QQuaternion) -> Tuple[float, float, float]:
         euler_vector = q.toEulerAngles() # Returns QVector3D: (pitch, yaw, roll)
@@ -2456,13 +3636,45 @@ class IMUVisualizerComponent(BaseGuiComponent):
         
         yaw, pitch, roll = self._get_euler_angles_from_qt_quaternion(identity_quat)
         self.orientation_status_label.setText(f"Yaw: {yaw:6.1f}°  Pitch: {pitch:6.1f}°  Roll: {roll:6.1f}°")
-        super().handle_missing_uuids(set()) # Clear overlay
+
+        super().handle_missing_uuids(set()) # Clear UUID overlay
+        super().handle_missing_replay_data(set()) # Clear replay data overlay
+
         if hasattr(self, 'snapshot_button'): self.snapshot_button.setEnabled(True)
         if hasattr(self, 'reset_button'): self.reset_button.setEnabled(True)
+
+        # --- Reset time slider and hide its container ---
+        if hasattr(self, 'time_slider_imu'):
+            self.time_slider_imu.blockSignals(True)
+            self.time_slider_imu.setRange(0, 0) # Reset range
+            self.time_slider_imu.setValue(0)    # Reset value
+            self.time_slider_imu.blockSignals(False)
+            # The slider's visibility is controlled by its parent scrub_time_widget_imu
+
+        if hasattr(self, 'scrub_time_widget_imu'):
+            self.scrub_time_widget_imu.setVisible(False)
+
+        if hasattr(self, 'current_replay_time_label_imu'):
+            self.current_replay_time_label_imu.setText("0.00s")
 
 
     def _take_snapshot_action(self):
         if not hasattr(self, 'view'): return
+
+
+
+        is_paused_or_replaying_imu = plotting_paused or (state == "replay_active")
+        if is_paused_or_replaying_imu and self.scrub_time_widget_imu.isVisible():
+            current_slider_int_value_imu = self.time_slider_imu.value()
+            current_slider_time_imu_sec = float(current_slider_int_value_imu) / self.SLIDER_FLOAT_PRECISION_FACTOR_IMU
+            logger.info(f"IMU snapshot: Rendering view for slider time {current_slider_time_imu_sec:.2f}s (raw slider: {current_slider_int_value_imu}).")
+            # Ensure render_imu_for_time updates the view to the specified time *before* snapshotting
+            self.render_imu_for_time(current_slider_time_imu_sec)
+        else:
+            logger.info("IMU snapshot: Using live/latest orientation data (not from slider).")
+            # For live data, the view should be current from update_component.
+
+
         try:
             size = self.view.size()
             width, height = size.width(), size.height()
@@ -2504,6 +3716,46 @@ class IMUVisualizerComponent(BaseGuiComponent):
         # Force an update to reflect the reset
         self.update_component(0, False) # Args might not be ideal, but triggers logic
 
+
+
+    def on_time_slider_imu(self, slider_value_int: int): # Renamed arg for clarity
+        global plotting_paused
+        if not plotting_paused: # If we are entering scrub mode via slider interaction
+            plotting_paused = True 
+            main_window = self.window()
+            if isinstance(main_window, MainWindow):
+                if main_window.pause_resume_button.text() != "Resume Plotting":
+                     main_window.pause_resume_button.setText("Resume Plotting")
+        
+        time_sec_float = float(slider_value_int) / self.SLIDER_FLOAT_PRECISION_FACTOR_IMU
+
+        if hasattr(self, 'current_replay_time_label_imu'):
+            self.current_replay_time_label_imu.setText(f"{time_sec_float:.2f}s")
+
+        self.render_imu_for_time(time_sec_float)
+
+    def render_imu_for_time(self, time_sec: float):
+        q_w = get_value_at_time("quat_w", time_sec, self.data_buffers_ref)
+        q_x = get_value_at_time("quat_x", time_sec, self.data_buffers_ref)
+        q_y = get_value_at_time("quat_y", time_sec, self.data_buffers_ref)
+        q_z = get_value_at_time("quat_z", time_sec, self.data_buffers_ref)
+
+        historical_quaternion = QQuaternion(1,0,0,0) # Default to identity
+        if all(q is not None for q in [q_w, q_x, q_y, q_z]):
+            historical_quaternion = QQuaternion(float(q_w), float(q_x), float(q_y), float(q_z))
+        
+        
+        relative_quat_hist = self.baseline_quaternion.inverted() * historical_quaternion
+        
+        yaw, pitch, roll = self._get_euler_angles_from_qt_quaternion(relative_quat_hist)
+        self.orientation_status_label.setText(f"Yaw: {yaw:6.1f}°  Pitch: {pitch:6.1f}°  Roll: {roll:6.1f}° (T={time_sec:.1f}s)")
+
+        transform = pg.Transform3D()
+        transform.rotate(relative_quat_hist)
+        if hasattr(self, 'box_mesh'):
+            self.box_mesh.setTransform(transform)
+
+
     def get_widget(self) -> QWidget:
         return self
 
@@ -2517,24 +3769,31 @@ class IMUVisualizerComponent(BaseGuiComponent):
             return f"imuvis_{safe_suffix}" if safe_suffix else f"imuvis_{id(self)}"
         return ""
 
+
     def handle_missing_uuids(self, missing_uuids_for_component: Set[str]):
         super().handle_missing_uuids(missing_uuids_for_component) # Show/hide overlay
+        self._update_controls_based_on_data_status()
+
+
+    def _update_controls_based_on_data_status(self):
+        is_overlay_active = self.uuid_missing_overlay and self.uuid_missing_overlay.isVisible()
         are_buttons_defined = hasattr(self, 'snapshot_button') and hasattr(self, 'reset_button')
 
-        if missing_uuids_for_component:
-            if are_buttons_defined:
-                self.snapshot_button.setEnabled(False)
-                self.reset_button.setEnabled(False)
+        if are_buttons_defined:
+            self.snapshot_button.setEnabled(not is_overlay_active)
+            self.reset_button.setEnabled(not is_overlay_active)
+        
+        if is_overlay_active:
             # Force view to identity and update label
             self.current_quaternion = QQuaternion(1,0,0,0)
-            self.baseline_quaternion = QQuaternion(1,0,0,0)
-            self.update_component(0, False) 
-        else:
-            if are_buttons_defined:
-                self.snapshot_button.setEnabled(True)
-                self.reset_button.setEnabled(True)
-            # Data might become available, so an update is good
-            self.update_component(0, False)
+            # Do not reset baseline_quaternion here as it's user set.
+            # Let update_component handle the visual reset based on current_quaternion.
+            self.update_component(0, False) # Trigger visual update to identity
+            self.orientation_status_label.setText("Yaw: --- Pitch: --- Roll: ---")
+
+    def handle_missing_replay_data(self, missing_data_types_for_component: Set[str]):
+        super().handle_missing_replay_data(missing_data_types_for_component)
+        self._update_controls_based_on_data_status()
 
 # ------------------------------------------------------------------
 
@@ -2858,8 +4117,10 @@ class GuiManager:
             self.tab_widget.addTab(scroll_area, tab_title)
 
     def update_all_components(self, current_relative_time: float, is_flowing: bool):
-        if plotting_paused or start_time is None:
+        if start_time is None: # Only return if there's no session start time (e.g., before any data)
             return
+        # The plotting_paused logic will be handled by individual components
+        # based on whether they are in a "flowing" state or a "static/slider" state.
         for component in self.all_components:
             try:
                 component.update_component(current_relative_time, is_flowing)
@@ -2867,23 +4128,17 @@ class GuiManager:
                 logger.error(f"Error updating component {type(component).__name__}: {e}", exc_info=True)
 
     def clear_all_components(self):
-        logger.info("GuiManager clearing all connected components...")
+        logger.info("GuiManager clearing all connected components and their overlays...")
         for component in self.all_components:
-            # skip components that still have missing‐UUID overlays
-            required = component.get_required_data_types()
-            missing_for_comp = {
-                uuid
-                for dt in required
-                if (uuid := self.device_config_ref.get_uuid_for_data_type(dt))
-                and uuid in self.active_missing_uuids
-            }
-            if missing_for_comp:
-                continue
             try:
                 component.clear_component()
-                component.handle_missing_uuids(set())
+                # Explicitly tell each component to remove any active overlays, regardless of current missing sets
+                component.handle_missing_uuids(set()) 
+                component.handle_missing_replay_data(set()) 
             except Exception as e:
-                logger.error(f"Error clearing component {type(component).__name__}: {e}", exc_info=True)
+                logger.error(f"Error clearing component {type(component).__name__} or its overlays: {e}", exc_info=True)
+        # Reset the GuiManager's own tracking of missing UUIDs
+        self.active_missing_uuids.clear()
 
 
     # ------------------------------------------------------------------
@@ -2916,6 +4171,62 @@ class GuiManager:
                 component.handle_missing_uuids(relevant_missing_uuids_for_comp)
             except Exception as e:
                  logger.error(f"Error notifying component {type(component).__name__} about missing UUIDs: {e}", exc_info=True)
+
+
+    def notify_missing_replay_data(self):
+        """
+        Checks which components are missing required data types from data_buffers
+        during replay mode and notifies them.
+        """
+        if state != "replay_active": # Only relevant in replay mode
+            # If not in replay, ensure all "CSV Not Loaded" overlays are cleared
+            for component in self.all_components:
+                try:
+                    component.handle_missing_replay_data(set())
+                except Exception as e:
+                    logger.error(f"Error clearing replay_data overlay for {type(component).__name__}: {e}")
+            return
+
+        logger.info("GuiManager: Checking for missing replay data for components...")
+        missing_globally = 0
+        for component in self.all_components:
+            required_types = component.get_required_data_types()
+            if not required_types:
+                component.handle_missing_replay_data(set()) # Ensure overlay is cleared if no types required
+                continue
+
+            missing_for_this_component = set()
+            for data_type in required_types:
+                # After CsvReplaySource.start() and compute_all_derived_data(),
+                # data_buffers should contain all available raw and derived types.
+                # So, just check if the required data_type (be it raw or derived)
+                # is present and has data in data_buffers.
+                if data_type not in self.data_buffers_ref or not self.data_buffers_ref[data_type]:
+                    missing_for_this_component.add(data_type)
+            
+            # Determine which required types ARE present for this component
+            loaded_for_this_component = required_types - missing_for_this_component
+
+            if missing_for_this_component:
+                # Still log a single warning if any data is missing for the component overall, but not per type unless debugging
+                logger.debug(f"Component {type(component).__name__} (title: {component.config.get('title', 'N/A')}) is still missing replay data for: {missing_for_this_component}")
+                missing_globally += len(missing_for_this_component)
+            
+            if loaded_for_this_component:
+                 logger.info(f"Component {type(component).__name__} (title: {component.config.get('title', 'N/A')}) has loaded replay data for: {loaded_for_this_component}")
+            
+            try:
+                # This call is still crucial for showing/hiding the "Data Not Loaded" overlay
+                component.handle_missing_replay_data(missing_for_this_component)
+            except Exception as e:
+                logger.error(f"Error notifying component {type(component).__name__} about missing replay data: {e}", exc_info=True)
+
+        if missing_globally == 0 and any(comp.get_required_data_types() for comp in self.all_components): # Check if any component actually requires data
+            logger.info("GuiManager: All components requiring data have their required data types loaded from CSVs.")
+        elif not any(comp.get_required_data_types() for comp in self.all_components):
+            logger.info("GuiManager: No components are configured to require data for replay.")
+        else:
+            logger.warning(f"GuiManager: Some components are still missing data for replay (total missing type instances: {missing_globally}).")
 
 # --- Bluetooth Protocol Handling ---
 class GuiSignalEmitter(QObject):
@@ -3028,228 +4339,6 @@ async def find_device(device_config_current: DeviceConfig) -> Optional[BleakClie
 
     if scan_cancelled: raise asyncio.CancelledError
     return target_device
-
-async def connection_task():
-    global client, last_received_time, state, device_config, stop_flag
-    found_char_configs: List[CharacteristicConfig] = []
-    while state == "scanning" and not stop_flag: 
-        target_device = None
-        found_char_configs = []
-        current_device_config = device_config
-        try:
-            target_device = await find_device(current_device_config)
-        except asyncio.CancelledError:
-            logger.info("connection_task: Scan was cancelled.")
-            break
-        except Exception as e:
-            logger.error(f"Error during scanning phase: {e}")
-            gui_emitter.emit_show_error("Scan Error", f"Scan failed: {e}")
-            await asyncio.sleep(3)
-            continue
-        
-        if stop_flag: break 
-
-        if not target_device:
-            if state == "scanning":
-                 logger.info(f"Device '{current_device_config.name}' not found, retrying scan in 3 seconds...")
-                 gui_emitter.emit_scan_throbber(f"Device '{current_device_config.name}' not found. Retrying...")
-                 await asyncio.sleep(3)
-                 continue
-            else:
-                 logger.info("Scan stopped while waiting for device.")
-                 break
-        gui_emitter.emit_connection_status(f"Found {current_device_config.name}. Connecting...")
-        client = None
-        connection_successful = False
-        for attempt in range(3):
-             if state != "scanning" or stop_flag: logger.info("Connection attempt aborted, state changed or stop_flag set."); break
-             try:
-                  logger.info(f"Connecting (attempt {attempt + 1})...")
-                  client = BleakClient(target_device, disconnected_callback=disconnected_callback)
-                  await client.connect(timeout=10.0)
-                  logger.info("Connected successfully")
-                  connection_successful = True
-                  gui_emitter.emit_state_change("connected")
-                  break
-             except Exception as e:
-                  logger.error(f"Connection attempt {attempt + 1} failed: {e}")
-                  if client:
-                      try: await client.disconnect()
-                      except Exception as disconnect_err: logger.warning(f"Error during disconnect after failed connection: {disconnect_err}")
-                  client = None
-                  if attempt < 2: await asyncio.sleep(2)
-        
-        if stop_flag: break 
-
-        if not connection_successful:
-             logger.error("Max connection attempts reached or connection aborted.")
-             gui_emitter.emit_missing_uuids(set())
-             if state == "scanning":
-                 logger.info("Retrying scan...")
-                 gui_emitter.emit_scan_throbber("Connection failed. Retrying scan...")
-                 await asyncio.sleep(1)
-                 continue
-             else:
-                 logger.info("Exiting connection task as state is no longer 'scanning'.")
-                 break
-        notification_errors = False
-        missing_uuids = set()
-        try:
-            logger.info(f"Checking characteristics for service {current_device_config.service_uuid}...")
-            if not client or not client.is_connected:
-                logger.error("Client not available or not connected before characteristic check.")
-                gui_emitter.emit_state_change("disconnecting")
-                notification_errors = True
-            else:
-                service = client.services.get_service(current_device_config.service_uuid)
-                if not service:
-                    logger.error(f"Service {current_device_config.service_uuid} not found on connected device.")
-                    gui_emitter.emit_show_error("Connection Error", f"Service UUID\n{current_device_config.service_uuid}\nnot found on device.")
-                    gui_emitter.emit_state_change("disconnecting")
-                    notification_errors = True
-                else:
-                    logger.info("Service found. Checking configured characteristics...")
-                    found_char_configs = []
-                    for char_config in current_device_config.characteristics:
-                        bleak_char = service.get_characteristic(char_config.uuid)
-                        if bleak_char:
-                            logger.info(f"Characteristic found: {char_config.uuid}")
-                            if "notify" in bleak_char.properties or "indicate" in bleak_char.properties:
-                                found_char_configs.append(char_config)
-                            else:
-                                logger.warning(f"Characteristic {char_config.uuid} found but does not support notify/indicate.")
-                                missing_uuids.add(char_config.uuid)
-                        else:
-                            logger.warning(f"Characteristic NOT FOUND: {char_config.uuid}")
-                            missing_uuids.add(char_config.uuid)
-                    gui_emitter.emit_missing_uuids(missing_uuids)
-                    if not found_char_configs:
-                        logger.error("No usable (found and notifiable) characteristics from config. Disconnecting.")
-                        gui_emitter.emit_show_error("Connection Error", "None of the configured characteristics\nwere found or support notifications.")
-                        gui_emitter.emit_state_change("disconnecting")
-                        notification_errors = True
-                    else:
-                        logger.info(f"Starting notifications for {len(found_char_configs)} found characteristics...")
-                        notify_tasks = []
-                        for char_config in found_char_configs:
-                            handler_with_char = partial(notification_handler, char_config)
-                            if client and client.is_connected:
-                                notify_tasks.append(client.start_notify(char_config.uuid, handler_with_char))
-                            else:
-                                logger.error(f"Client disconnected before starting notify for {char_config.uuid}")
-                                notification_errors = True; break 
-                        
-                        if notification_errors: 
-                            gui_emitter.emit_state_change("disconnecting")
-                        else:
-                            results = await asyncio.gather(*notify_tasks, return_exceptions=True)
-                            all_notifications_started = True
-                            for i, result in enumerate(results):
-                                if isinstance(result, Exception):
-                                    char_uuid = found_char_configs[i].uuid
-                                    logger.error(f"Failed to start notification for {char_uuid}: {result}")
-                                    all_notifications_started = False; notification_errors = True
-                                    missing_uuids.add(char_uuid)
-                            if not all_notifications_started:
-                                logger.error("Could not start all required notifications. Disconnecting.")
-                                gui_emitter.emit_missing_uuids(missing_uuids)
-                                gui_emitter.emit_state_change("disconnecting")
-                            else:
-                                logger.info("Notifications started successfully. Listening...")
-                                last_received_time = time.time()
-                                disconnected_event.clear()
-                                while state == "connected" and not stop_flag: 
-                                    try:
-                                        await asyncio.wait_for(disconnected_event.wait(), timeout=0.2) 
-                                        logger.info("Disconnected event received while listening.")
-                                        gui_emitter.emit_state_change("disconnecting")
-                                        break
-                                    except asyncio.TimeoutError:
-                                        current_time = time.time()
-                                        if current_time - last_received_time > current_device_config.data_timeout:
-                                            logger.warning(f"No data received for {current_time - last_received_time:.1f}s (timeout: {current_device_config.data_timeout}s). Assuming disconnect.")
-                                            gui_emitter.emit_state_change("disconnecting")
-                                            break
-                                        if client and not client.is_connected:
-                                            logger.warning("Bleak client reported disconnected during listening loop.")
-                                            disconnected_event.set() 
-                                            gui_emitter.emit_state_change("disconnecting")
-                                            break
-                                        continue
-                                    except asyncio.CancelledError:
-                                        logger.info("Listening loop cancelled.")
-                                        gui_emitter.emit_state_change("disconnecting"); raise
-                                    except Exception as e:
-                                        logger.error(f"Error during notification listening loop: {e}")
-                                        gui_emitter.emit_state_change("disconnecting"); notification_errors = True; break
-        except asyncio.CancelledError:
-             logger.info("Notification setup or listening task was cancelled.")
-             if state == "connected": gui_emitter.emit_state_change("disconnecting")
-        except Exception as e: 
-             logger.error(f"Error during characteristic check or notification handling: {e}")
-             gui_emitter.emit_state_change("disconnecting"); notification_errors = True
-        finally:
-            logger.info("Performing cleanup for connection task...")
-            local_client_ref = client 
-            client = None 
-
-            if local_client_ref:
-                is_conn_at_cleanup_start = False
-                try: is_conn_at_cleanup_start = local_client_ref.is_connected
-                except Exception as check_err: logger.warning(f"Error checking client connection status during cleanup: {check_err}")
-
-                if is_conn_at_cleanup_start:
-                    logger.info("Attempting to stop notifications and disconnect client...")
-                    stop_notify_tasks = []
-                    for char_config in found_char_configs: 
-                        try:
-                            if local_client_ref.is_connected:
-                                logger.debug(f"Preparing stop_notify for {char_config.uuid}")
-                                stop_notify_tasks.append(local_client_ref.stop_notify(char_config.uuid))
-                            else:
-                                logger.debug(f"Client disconnected before stop_notify for {char_config.uuid}, skipping.")
-                                break 
-                        except Exception as prep_err:
-                            logger.warning(f"Error preparing stop_notify for {char_config.uuid}: {prep_err}")
-                    
-                    if stop_notify_tasks:
-                        try:
-                            results = await asyncio.gather(*stop_notify_tasks, return_exceptions=True)
-                            logger.info(f"Notifications stop attempts completed for {len(stop_notify_tasks)} characteristics.")
-                            for i, result in enumerate(results):
-                                if isinstance(result, Exception):
-                                    logger.warning(f"Error stopping notification {found_char_configs[i].uuid if i < len(found_char_configs) else 'unknown_uuid'}: {result}")
-                        except Exception as gather_err:
-                            logger.error(f"Error during asyncio.gather for stop_notify: {gather_err}")
-
-                    
-                    try:
-                        if local_client_ref.is_connected:
-                            await asyncio.wait_for(local_client_ref.disconnect(), timeout=5.0)
-                            logger.info("Client disconnected.")
-                        else:
-                            logger.info("Client was already disconnected before explicit disconnect call in cleanup.")
-                    except asyncio.TimeoutError:
-                        logger.error("Timeout during client disconnect.")
-                    except Exception as e:
-                        logger.error(f"Error during client disconnect: {e}")
-                else:
-                    logger.info("Client object existed but was not connected at start of cleanup.")
-            else:
-                logger.info("No active client object to cleanup at start of finally block.")
-
-            if state in ["connected", "disconnecting"] or not connection_successful:
-                 gui_emitter.emit_missing_uuids(set())
-            if state in ["connected", "disconnecting"] and not stop_flag : 
-                 logger.info("Signalling state change to idle after cleanup.")
-                 gui_emitter.emit_state_change("idle")
-            
-            disconnected_event.clear()
-            found_char_configs = []
-        if state != "scanning" or stop_flag: 
-            logger.info(f"Exiting connection_task as state is '{state}' or stop_flag is set.")
-            break
-    logger.info("Connection task loop finished.")
 
 
 # --- PyQt6 Main Application Window ---
@@ -4534,6 +5623,8 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.central_widget)
         self.main_layout = QVBoxLayout(self.central_widget)
 
+        self.current_source: Optional[DataSource] = None
+
         # --- Top Button Bar---
         self.button_bar = QWidget()
         self.button_layout = QHBoxLayout(self.button_bar)
@@ -4548,11 +5639,23 @@ class MainWindow(QMainWindow):
         if initial_device_index != -1: self.device_combo.setCurrentIndex(initial_device_index)
         self.device_combo.currentTextChanged.connect(self.update_target_device)
         self.button_layout.addWidget(self.device_combo)
+
         self.scan_button = QPushButton("Start Scan"); self.scan_button.clicked.connect(self.toggle_scan); self.button_layout.addWidget(self.scan_button)
+        
+        self.replay_button = QPushButton("Replay CSV…") # Text will change in replay mode
+        self.replay_button.clicked.connect(self.handle_replay_action_button)
+        self.button_layout.addWidget(self.replay_button)
+
+        self.load_more_csvs_button = QPushButton("Load More CSVs")
+        self.load_more_csvs_button.clicked.connect(self.handle_load_more_csvs_action)
+        self.load_more_csvs_button.setVisible(False) # Initially hidden
+        self.button_layout.addWidget(self.load_more_csvs_button)
+
         self.pause_resume_button = QPushButton("Pause Plotting"); self.pause_resume_button.setEnabled(False); self.pause_resume_button.clicked.connect(self.toggle_pause_resume); self.button_layout.addWidget(self.pause_resume_button)
         self.capture_button = QPushButton("Start Capture"); self.capture_button.setEnabled(False); self.capture_button.clicked.connect(self.toggle_capture); self.button_layout.addWidget(self.capture_button)
         self.clear_button = QPushButton("Clear GUI"); self.clear_button.clicked.connect(self.clear_gui_action); self.button_layout.addWidget(self.clear_button)
         self.status_label = QLabel("On Standby"); self.status_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter); self.status_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred); self.button_layout.addWidget(self.status_label)
+        
         self.main_layout.addWidget(self.button_bar)
 
         # --- Tab Area (Managed by GuiManager) ---
@@ -4626,6 +5729,8 @@ class MainWindow(QMainWindow):
             current_relative = (datetime.datetime.now() - start_time).total_seconds()
             is_flowing = self.flowing_mode_check.isChecked()
             self.gui_manager.update_all_components(current_relative, is_flowing)
+            # REMOVED: The call to self.gui_manager.notify_missing_replay_data()
+            # It should only be called when data_buffers actually change during replay.
 
     def animate_scan_throbber(self):
         if state == "scanning":
@@ -4642,47 +5747,186 @@ class MainWindow(QMainWindow):
             device_config.update_name(selected_name)
             logger.info("Device config name updated.")
 
+
+    @qasync.asyncSlot()
+    async def handle_replay_action_button(self):
+        if self._shutting_down: return
+
+        if state == "idle":
+            await self.open_replay_dialog()
+        elif state == "replay_active":
+            await self.exit_replay_mode()
+        else:
+            logger.warning(f"Replay action button clicked in unexpected state: {state}")
+
+
+
+    @qasync.asyncSlot()
+    async def exit_replay_mode(self):
+        global plotting_paused, start_time, data_buffers, current_task, state # Moved global state here
+        logger.info("Exiting replay mode...")
+        
+        # If there was a CsvReplaySource task (though it should be done for bulk load),
+        # ensure it's handled. For bulk load, current_source might already be None.
+        if self.current_source and isinstance(self.current_source, CsvReplaySource):
+            logger.info("Stopping CsvReplaySource explicitly on exit replay (should be no-op if bulk load finished).")
+            await self.stop_current_source_and_wait() # This also clears current_task
+        elif current_task: # If a task exists but source is None
+            logger.warning("Found an orphaned current_task during exit_replay_mode. Attempting to cancel.")
+            await self.cancel_and_wait_task(current_task)
+            current_task = None
+
+        # --- FULL CLEANUP ---
+        logger.info("Performing full GUI and data clear after exiting replay mode.")
+        
+        # 1. Clear data buffers, reset session start_time, and other global data stores.
+        # clear_gui_action handles data_buffers, start_time, opt_cum_x/y, and GuiManager.clear_all_components
+        self.clear_gui_action(confirm=False) # This already does comprehensive data and GUI clearing
+        
+        # 2. Ensure GuiManager's active_missing_uuids is reset
+        if hasattr(self, 'gui_manager'):
+            self.gui_manager.notify_missing_uuids(set()) 
+        
+        # 3. Reset plotting state for IDLE mode
+        plotting_paused = True # Default for idle is paused
+        
+        # 4. Re-enable and reset flowing mode checkbox to its default (usually checked)
+        self.flowing_mode_check.setEnabled(True)
+        self.flowing_mode_check.setChecked(True) 
+        self.apply_interval()
+
+        # 5. Reset any replay-specific display attributes
+        if hasattr(self, 'df_filepath_for_display'):
+            del self.df_filepath_for_display
+
+        # 6. Transition to idle state. The handle_state_change("idle") will trigger
+        #    the necessary GuiManager calls to clear all overlays because clear_gui_action
+        #    calls GuiManager.clear_all_components which now robustly clears both overlay types.
+        self.handle_state_change("idle") 
+        
+        logger.info("Returned to idle state from replay mode. GUI and data fully reset.")
+
+
     def handle_state_change(self, new_state: str):
         global state, plotting_paused, start_time
-        logger.info(f"GUI received state change: {new_state}")
+        logger.info(f"GUI received state change: {new_state} (from {state})")
+        
         previous_state = state
         state = new_state
-        if new_state != "scanning" and self.scan_throbber_timer.isActive():
+
+        if state != "scanning" and self.scan_throbber_timer.isActive():
             self.scan_throbber_timer.stop()
-        is_idle = (new_state == "idle")
-        self.device_combo.setEnabled(is_idle)
-        self.scan_button.setEnabled(True)
-        if new_state == "idle":
+
+
+
+        # Default visibility and enablement (will be overridden by specific states)
+        self.scan_button.setVisible(True); self.scan_button.setEnabled(True)
+        self.device_label.setVisible(True) # Assuming this is a label next to combo
+        self.device_combo.setVisible(True); self.device_combo.setEnabled(True)
+        self.replay_button.setVisible(True); self.replay_button.setEnabled(True)
+        self.load_more_csvs_button.setVisible(False) # Hidden by default
+        self.pause_resume_button.setVisible(True); self.pause_resume_button.setEnabled(False)
+        self.capture_button.setVisible(True); self.capture_button.setEnabled(False)
+        self.clear_button.setVisible(True); self.clear_button.setEnabled(True)
+        self.flowing_mode_check.setEnabled(True) # Checkbox usually enabled
+
+        if state == "idle":
             self.scan_button.setText("Start Scan")
-            self.led_indicator.set_color("red"); self.status_label.setText("On Standby")
-            self.pause_resume_button.setEnabled(False); self.pause_resume_button.setText("Pause Plotting")
-            self.capture_button.setEnabled(False); self.capture_button.setText("Start Capture")
-            plotting_paused = True
-            if previous_state != "disconnecting": 
-                logger.info("State changed to idle. Automatically clearing GUI and state.")
+            self.replay_button.setText("Replay CSV…")
+            self.led_indicator.set_color("red")
+            self.status_label.setText("On Standby")
+            self.pause_resume_button.setText("Pause Plotting") # Should be "Pause"
+            self.pause_resume_button.setEnabled(False) # Can't pause/resume if not connected/replaying
+            plotting_paused = True 
+            
+            
+            # When transitioning to idle, explicitly clear all component overlays
+            if hasattr(self, 'gui_manager'):
+                logger.debug("Idle state: Ensuring all component overlays (UUID and Replay) are cleared via GuiManager.")
+                self.gui_manager.notify_missing_uuids(set()) # Clears UUID overlays
+                self.gui_manager.notify_missing_replay_data() # Clears Replay data overlays
+
+            if previous_state == "scanning": 
+                logger.info("State changed to idle from scanning (scan failed/cancelled). Automatically clearing GUI.")
                 self.clear_gui_action(confirm=False)
-            if self.is_capturing:
-                 logger.warning("Capture was active when state became idle (likely disconnect). Files were NOT generated automatically by clear.")
-        elif new_state == "scanning":
+            elif previous_state == "replay_active":
+                 logger.info("State changed to idle from replay_active. GUI and data were cleared by exit_replay_mode.")
+                 # plotting_paused is already True, GUI is clear. Flowing mode enabled by default.
+            
+            if self.is_capturing: # Should not happen if logic is correct
+                logger.warning("Capture was active when state became idle. Files NOT generated.")
+                self.is_capturing = False 
+            self.capture_button.setText("Start Capture")
+            self.capture_button.setEnabled(False) # Can only capture when connected
+
+        elif state == "scanning":
             self.scan_button.setText("Stop Scan")
-            self.led_indicator.set_color("orange"); self.throbber_index = 0
+            self.replay_button.setEnabled(False) # Cannot start replay during scan
+            self.device_combo.setEnabled(False)
+            self.led_indicator.set_color("orange")
+            self.throbber_index = 0
             if not self.scan_throbber_timer.isActive(): self.scan_throbber_timer.start()
+            plotting_paused = True # No plotting during scan phase
+            self.pause_resume_button.setText("Pause Plotting")
             self.pause_resume_button.setEnabled(False)
-            self.capture_button.setEnabled(False)
-        elif new_state == "connected":
+
+        elif state == "connected":
             self.scan_button.setText("Disconnect")
-            self.led_indicator.set_color("lightgreen"); self.status_label.setText(f"Connected to: {device_config.name}")
+            self.replay_button.setEnabled(False) 
+            self.device_combo.setEnabled(False)
+            self.led_indicator.set_color("lightgreen")
+            self.status_label.setText(f"Connected to: {device_config.name}")
+            
+            plotting_paused = False 
             if not self.is_capturing:
                 self.pause_resume_button.setEnabled(True)
             self.pause_resume_button.setText("Pause Plotting")
             self.capture_button.setEnabled(True)
-            plotting_paused = False
-        elif new_state == "disconnecting":
-            self.scan_button.setText("Disconnecting..."); self.scan_button.setEnabled(False)
-            self.led_indicator.set_color("red"); self.status_label.setText("Status: Disconnecting...")
-            self.pause_resume_button.setEnabled(False); self.pause_resume_button.setText("Pause Plotting")
-            self.capture_button.setEnabled(False)
+
+        elif state == "replay_active":
+            # Hide/disable standard live mode buttons
+            self.scan_button.setVisible(False)
+            self.device_label.setVisible(False)
+            self.device_combo.setVisible(False)
+            self.pause_resume_button.setVisible(False)
+            self.capture_button.setVisible(False)
+            self.clear_button.setVisible(False) # Clear is handled by Exit Replay
+
+            # Configure replay mode buttons
+            self.replay_button.setText("Exit Replay")
+            self.replay_button.setVisible(True)
+            self.replay_button.setEnabled(True) 
+            self.load_more_csvs_button.setVisible(True)
+            self.load_more_csvs_button.setEnabled(True)
+            
+            self.led_indicator.set_color("purple")
+            self.flowing_mode_check.setEnabled(False) # Flowing mode not used in replay
+            self.flowing_mode_check.setChecked(False) 
+            
+            # plotting_paused is set to True by _load_csvs_for_replay to enable sliders.
+            # The actual display of data is then driven by sliders.
+            # Status label is updated by _load_csvs_for_replay.
+            if not plotting_paused: # Should be true after loading
+                 logger.warning("Plotting was not paused after entering replay_active. Forcing pause for sliders.")
+                 plotting_paused = True
+            self.pause_resume_button.setText("Resume Plotting") # Reflects plotting_paused = True
+            
+            # Status label will be set by the loading function, e.g.:
+            # self.status_label.setText(f"Replay Ready. View: {os.path.basename(getattr(self, 'df_filepath_for_display', 'CSVs'))}. Click 'Exit Replay'.")
+
+
+        elif state == "disconnecting":
+            self.scan_button.setText("Disconnecting...")
+            self.scan_button.setEnabled(False)
+            self.replay_button.setEnabled(False)
+            self.device_combo.setEnabled(False)
+            self.led_indicator.set_color("orange") 
+            self.status_label.setText("Status: Disconnecting...")
             plotting_paused = True
+            self.pause_resume_button.setText("Pause Plotting")
+            self.pause_resume_button.setEnabled(False)
+
+
 
     def update_scan_status(self, text: str):
          if state == "scanning": self.status_label.setText(text)
@@ -4691,44 +5935,277 @@ class MainWindow(QMainWindow):
     def show_message_box(self, title: str, message: str):
         QMessageBox.warning(self, title, message)
 
+
+    async def _load_csvs_for_replay(self, file_paths: List[str], is_initial_load: bool):
+        global data_buffers, start_time, plotting_paused # plotting_paused handled by caller at the end
+
+        if is_initial_load:
+            logger.info("Initial CSV load: Clearing GUI and data buffers first.")
+            self.clear_gui_action(confirm=False) 
+
+        if not file_paths:
+            logger.warning("Replay: No file paths provided to _load_csvs_for_replay.")
+            if is_initial_load: # If initial load had no files, ensure we are idle.
+                 self.handle_state_change("idle")
+            return
+
+        successful_load_occurred = False
+        for path_idx, path in enumerate(file_paths):
+            logger.info(f"Replay: Processing file {path_idx+1}/{len(file_paths)}: {os.path.basename(path)}")
+            # --- Overwrite Logic: Clear relevant data_buffers entries before CsvReplaySource loads this file ---
+            try:
+                # Peek at headers to identify data types in the current CSV
+                temp_df_headers = pd.read_csv(path, nrows=0).columns.tolist()
+                
+                # Identify the actual time column name used in this CSV
+                exact_match_time_s = 'Time (s)'
+                actual_time_col_in_this_csv = None
+                if exact_match_time_s in temp_df_headers:
+                    actual_time_col_in_this_csv = exact_match_time_s
+                else:
+                    for col_header_peek in temp_df_headers:
+                        if col_header_peek.lower() == 'time (s)' or col_header_peek.lower() == 'master time (s)':
+                            actual_time_col_in_this_csv = col_header_peek
+                            break
+                
+                if not actual_time_col_in_this_csv:
+                    logger.warning(f"Skipping CSV {os.path.basename(path)} for overwrite-prep: No recognized time column in headers: {temp_df_headers}")
+                else:
+                    data_types_in_current_csv = [h for h in temp_df_headers if h != actual_time_col_in_this_csv]
+                    logger.debug(f"Data types provided by {os.path.basename(path)}: {data_types_in_current_csv}")
+                    for dt_to_overwrite in data_types_in_current_csv:
+                        # Normalize the data type key if it's a known variant from CsvReplaySource's renaming
+                        # (e.g. if CsvReplaySource renames 'Master Time (s)' for its own use, that's handled internally by it)
+                        # For data columns, the names are usually direct.
+                        if dt_to_overwrite in data_buffers and data_buffers[dt_to_overwrite]: # Check if buffer has data
+                            logger.info(f"Replay: Overwriting data for '{dt_to_overwrite}' using {os.path.basename(path)}.")
+                            data_buffers[dt_to_overwrite] = [] 
+            except Exception as e:
+                logger.error(f"Error peeking at headers for {os.path.basename(path)} to implement overwrite: {e}. Will attempt to load anyway.")
+
+            # --- Load Data using CsvReplaySource ---
+            try:
+                source = CsvReplaySource(path) 
+                self.df_filepath_for_display = path # Update display to show current/last processed file
+
+                await source.start() # This populates global data_buffers and calls compute_all_derived_data
+                logger.info(f"Successfully processed data from {os.path.basename(path)}")
+                successful_load_occurred = True # Mark that at least one file part loaded
+            except ValueError as ve: # Specifically catch ValueError from CsvReplaySource if time col is missing
+                logger.error(f"ValueError processing CSV {os.path.basename(path)}: {ve}")
+                self.show_message_box("Replay Error", f"Could not load CSV (time column issue?):\n{os.path.basename(path)}\n\nError: {ve}")
+                continue # Continue with next file in the batch
+            except Exception as e:
+                logger.error(f"Failed to process CSV {os.path.basename(path)}: {e}", exc_info=True)
+                self.show_message_box("Replay Error", f"Could not load or parse CSV:\n{os.path.basename(path)}\n\nError: {e}")
+                continue 
+
+        if not successful_load_occurred and file_paths:
+            logger.warning("Replay: No data was successfully loaded into buffers from any of the selected CSVs.")
+            if is_initial_load:
+                self.handle_state_change("idle") 
+            return
+
+        if is_initial_load and successful_load_occurred:
+            self.handle_state_change("replay_active")
+        
+
+        # Common post-load logic for both initial and "load more"
+        global plotting_paused # Ensure we're affecting the global
+        logger.info("CSV data batch processed. Setting plotting_paused = True for slider interaction.")
+
+
+
+        plotting_paused = True 
+        
+        # After all files in the batch are processed, first notify components about available data
+        # to update/clear overlays based on the final state of data_buffers.
+
+
+
+
+        # First, trigger GUI update for components to process the newly loaded data
+        # This allows them to set up sliders, plot data etc., based on data_buffers
+        logger.debug("_load_csvs_for_replay: Calling trigger_gui_update for components to process data.")
+        self.trigger_gui_update() 
+
+        # Process events to let component updates (like repaints, slider range changes) take effect
+        logger.debug("_load_csvs_for_replay: Processing events after component update.")
+        QApplication.processEvents() 
+
+        # Now, with data_buffers populated and components potentially initialized from it,
+        # notify about missing replay data to set overlay states correctly.
+        if hasattr(self, 'gui_manager'):
+            logger.debug("_load_csvs_for_replay: Calling notify_missing_replay_data to set overlays.")
+            self.gui_manager.notify_missing_replay_data()
+
+        # Process events again to ensure overlay visibility changes are rendered.
+        logger.debug("_load_csvs_for_replay: Processing events after overlay update.")
+        QApplication.processEvents() 
+
+
+        
+        
+        replay_file_path_display = getattr(self, 'df_filepath_for_display', 'Multiple CSVs')
+        self.status_label.setText(f"Replay Data Ready. View: {os.path.basename(replay_file_path_display)}. Click 'Exit Replay'.")
+        if state == "replay_active":
+            self.replay_button.setText("Exit Replay")
+            self.replay_button.setEnabled(True)
+            self.pause_resume_button.setText("Resume Plotting") # Reflects plotting_paused = True
+            self.load_more_csvs_button.setEnabled(True) # Re-enable after loading more
+
+
+    @qasync.asyncSlot()
+    async def handle_load_more_csvs_action(self):
+        if self._shutting_down or state != "replay_active":
+            logger.warning(f"Load More CSVs action attempted in invalid state: {state} or shutting down.")
+            return
+
+        paths, _ = QFileDialog.getOpenFileNames(self, "Select More CSVs to Load", "", "CSV files (*.csv)")
+        if not paths: 
+            logger.info("Load More CSVs: No files selected.")
+            return
+
+        original_status = self.status_label.text()
+        self.status_label.setText(f"Loading more CSVs...")
+        self.load_more_csvs_button.setEnabled(False)
+        self.replay_button.setEnabled(False) # Disable exit while loading more
+
+        await self._load_csvs_for_replay(paths, is_initial_load=False)
+        
+        # _load_csvs_for_replay now handles final status update and button re-enabling.
+        # self.load_more_csvs_button.setEnabled(True) # Done by _load_csvs_for_replay
+        self.replay_button.setEnabled(True) # Re-enable exit
+
+
+
+
+    @qasync.asyncSlot()
+    async def open_replay_dialog(self):
+        global state # current_task is not directly managed here anymore for replay
+        if self._shutting_down: return
+
+        if state != "idle":
+            self.show_message_box("Replay Error", f"Replay can only be started from 'Idle' state. Current state: {state}.")
+            logger.warning(f"Attempted to start replay from non-idle state: {state}")
+            return
+
+        paths, _ = QFileDialog.getOpenFileNames(self, "Select Replay CSV(s)", "", "CSV files (*.csv)")
+        if not paths:
+            logger.info("Replay: No CSV files selected for initial load.")
+            return 
+
+        # If somehow a source is active in idle state (should not happen), stop it.
+        # This check is mostly for BLE sources, replay source is managed differently now.
+        if self.current_source and not isinstance(self.current_source, CsvReplaySource): # Be more specific
+            logger.warning("Found an active non-CSV source while in idle state before replay. Stopping it.")
+            await self.stop_current_source_and_wait()
+        
+        
+        # Ensure any "Missing UUID" overlays are cleared before entering replay logic
+        if hasattr(self, 'gui_manager'):
+            self.gui_manager.notify_missing_uuids(set())
+
+        # Set a busy status before starting the potentially long load
+        self.status_label.setText("Loading initial CSV(s)...")
+        self.replay_button.setEnabled(False) # Disable button during load
+
+        await self._load_csvs_for_replay(paths, is_initial_load=True)
+        
+        # Re-enable replay button if not already handled by _load_csvs_for_replay or state change
+        if state == "idle": # If loading failed and returned to idle
+            self.replay_button.setEnabled(True)
+        elif state == "replay_active": # If successful
+            self.replay_button.setEnabled(True)
+
+
+        
+
+
+
+    async def stop_current_source_and_wait(self):
+        global current_task
+        source_to_stop = self.current_source
+        task_to_await = current_task
+
+        if source_to_stop:
+            logger.info(f"Stopping current source: {type(source_to_stop).__name__}")
+            self.current_source = None 
+            
+            
+            stop_task = asyncio.create_task(source_to_stop.stop())
+            
+            
+            if task_to_await and task_to_await is not asyncio.current_task() and not task_to_await.done():
+                try:
+                    
+                    
+                    await asyncio.wait_for(task_to_await, timeout=5.0) 
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout waiting for source task {type(source_to_stop).__name__} to complete after signalling stop. It might have been cancelled or stuck.")
+                    if not task_to_await.done(): task_to_await.cancel() 
+                except asyncio.CancelledError:
+                    logger.info(f"Source task {type(source_to_stop).__name__} was cancelled during stop sequence.")
+                except Exception as e:
+                    logger.error(f"Error awaiting source task {type(source_to_stop).__name__}: {e}")
+            
+            try:
+                await asyncio.wait_for(stop_task, timeout=5.0)
+                logger.info(f"Source {type(source_to_stop).__name__} stop() method completed.")
+            except asyncio.TimeoutError:
+                 logger.warning(f"Timeout waiting for {type(source_to_stop).__name__}.stop() to complete.")
+            except Exception as e:
+                 logger.error(f"Error during {type(source_to_stop).__name__}.stop(): {e}")
+
+
+        current_task = None 
+
+
     @qasync.asyncSlot()
     async def toggle_scan(self):
-        global current_task, state, data_buffers, start_time
+        global current_task, state, data_buffers, start_time, device_config
         if self._shutting_down: return
 
         if state == "idle":
             event_loop = asyncio.get_event_loop()
             if event_loop and event_loop.is_running():
-                logger.info("Clearing state before starting scan...")
-                self.clear_gui_action(confirm=False)
+                self.clear_gui_action(confirm=False) 
                 self.handle_state_change("scanning")
-                current_task = asyncio.create_task(connection_task())
+                
+                self.current_source = BleDataSource(device_config, gui_emitter)
+                current_task = asyncio.create_task(self.current_source.start())
+                current_task.add_done_callback(self._ble_source_done_callback)
             else:
                 logger.error("Asyncio loop not running!")
                 self.show_message_box("Error", "Asyncio loop is not running.")
-        elif state == "scanning":
-            if current_task and not current_task.done():
-                logger.info("Requesting scan cancellation...")
-                self.scan_button.setEnabled(False) 
-                await self.cancel_and_wait_task(current_task)
-                self.scan_button.setEnabled(True)
-                if state == "scanning": 
-                    self.handle_state_change("idle")
-            else:
-                logger.warning("Stop scan requested, but no task was running/done.")
+        
+        elif state == "scanning" or state == "connected":
+            logger.info(f"Stop/Disconnect requested from state: {state}. Stopping current source.")
+            await self.stop_current_source_and_wait()
+            if state != "idle": 
                 self.handle_state_change("idle")
+        
+
+
+    def _ble_source_done_callback(self, task_future: asyncio.Future):
+        global current_task, state
+        try:
+            task_future.result() 
+            logger.info("BleDataSource task finished (e.g. disconnected or completed scan phase without connecting).")
+        except asyncio.CancelledError:
+            logger.info("BleDataSource task was cancelled.")
+        except Exception as e:
+            logger.error(f"BleDataSource task finished with error: {e}")
+            self.show_message_box("BLE Error", f"Live connection failed or ended with error:\n{e}")
+        finally:
+            if self.current_source and isinstance(self.current_source, BleDataSource):
+                self.current_source = None 
+            
             current_task = None
-        elif state == "connected":
-            self.handle_state_change("disconnecting") 
-            if client and client.is_connected:
-                logger.info("Requesting disconnection via disconnected_event...")
-                disconnected_event.set() 
-            elif current_task and not current_task.done():
-                logger.info("Requesting disconnect via task cancellation...")
-                await self.cancel_and_wait_task(current_task) 
-            else:
-                logger.warning("Disconnect requested but no active connection/task found.")
-                self.handle_state_change("idle") 
+            
+            if state != "idle" and not self._shutting_down:
+                self.handle_state_change("idle")
+
 
     def toggle_pause_resume(self):
         global plotting_paused
@@ -4825,10 +6302,23 @@ class MainWindow(QMainWindow):
         self.capture_t0_absolute = None
         self.capture_timestamp = None
 
-    def generate_pdf_plots_from_buffer(self, pdf_dir: str, capture_start_relative_time: float):
+
+    def generate_pdf_plots_from_buffer(self, pdf_dir: str, capture_start_relative_time: float, specific_component_instance: Optional[BaseGuiComponent] = None, specific_end_relative_time: Optional[float] = None):
         global data_buffers
-        logger.info(f"Generating PDF plots (t=0 at capture start, t_offset={capture_start_relative_time:.3f}s). Dir: {pdf_dir}")
+        
+        if specific_component_instance and not isinstance(specific_component_instance, TimeSeriesPlotComponent):
+            logger.warning(f"PDF export called for specific non-TimeSeriesPlot component {type(specific_component_instance)}. This PDF export is for TimeSeriesPlots only.")
+            return
+
+        export_target_description = f"component '{specific_component_instance.config.get('title', type(specific_component_instance).__name__)}'" if specific_component_instance else "all applicable plots"
+        time_window_description = f"from {capture_start_relative_time:.3f}s"
+        if specific_end_relative_time is not None:
+            time_window_description += f" to {specific_end_relative_time:.3f}s"
+        
+        logger.info(f"Generating PDF for {export_target_description} ({time_window_description}). Dir: {pdf_dir}")
+
         if not data_buffers: logger.warning("Data buffer empty, skipping PDF generation."); return
+        
         try:
             plt.style.use('science')
             plt.rcParams.update({'text.usetex': False, 'figure.figsize': [5.5, 3.5], 'legend.fontsize': 9,
@@ -4836,53 +6326,84 @@ class MainWindow(QMainWindow):
         except Exception as style_err:
             logger.warning(f"Could not apply 'science' style: {style_err}. Using default.")
             plt.rcParams.update({'figure.figsize': [6.0, 4.0]})
+
         gen_success = False
-        for component in self.gui_manager.all_components:
+        components_to_process = [specific_component_instance] if specific_component_instance else self.gui_manager.all_components
+
+        for component in components_to_process:
             if not isinstance(component, TimeSeriesPlotComponent):
                 continue
+
             plot_config = component.config
-            plot_title = plot_config.get('title', 'UntitledPlot')
+            plot_title_base = plot_config.get('title', 'UntitledPlot')
             datasets = plot_config.get('datasets', [])
             if not datasets: continue
+
             required_uuids_for_plot = set()
             required_types = component.get_required_data_types()
             for dtype in required_types:
                 uuid = self.gui_manager.device_config_ref.get_uuid_for_data_type(dtype)
                 if uuid: required_uuids_for_plot.add(uuid)
+            
             missing_uuids_for_this_plot = required_uuids_for_plot.intersection(self.gui_manager.active_missing_uuids)
-            if missing_uuids_for_this_plot:
-                logger.warning(f"Skipping PDF for plot '{plot_title}' as it depends on missing UUID(s): {missing_uuids_for_this_plot}")
-                continue
+            if missing_uuids_for_this_plot and not (state == "replaying" or plotting_paused): # Allow export from replay/pause even if UUIDs were missing live
+                 logger.warning(f"Skipping PDF for plot '{plot_title_base}' as it depends on missing UUID(s): {missing_uuids_for_this_plot} and not in replay/paused export mode.")
+                 continue
+
             fig, ax = plt.subplots()
-            ax.set_title(plot_config.get('title', 'Plot'));
-            ax.set_xlabel(plot_config.get('xlabel', 'Time [s]'));
+            plot_title_suffix = f" ({capture_start_relative_time:.1f}s - {specific_end_relative_time:.1f}s)" if specific_end_relative_time is not None else ""
+            ax.set_title(plot_title_base + plot_title_suffix)
+            ax.set_xlabel(plot_config.get('xlabel', 'Time [s]'))
             ax.set_ylabel(plot_config.get('ylabel', 'Value'))
-            plot_created = False
-            for dataset in datasets:
-                data_type = dataset['data_type']
+            
+            plot_created_for_component = False
+            for dataset_conf in datasets:
+                data_type = dataset_conf['data_type']
                 if data_type in data_buffers and data_buffers[data_type]:
                     full_data = data_buffers[data_type]
-                    plot_data = [(item[0] - capture_start_relative_time, item[1])
-                                    for item in full_data if item[0] >= capture_start_relative_time]
-                    if plot_data:
+                    
+                    
+                    
+                    
+                    
+                    plot_data_filtered = [
+                        (item[0] - capture_start_relative_time, item[1]) 
+                        for item in full_data 
+                        if item[0] >= capture_start_relative_time and (specific_end_relative_time is None or item[0] <= specific_end_relative_time)
+                    ]
+
+                    if plot_data_filtered:
                         try:
-                            times_rel_capture = [p[0] for p in plot_data]
-                            values = [p[1] for p in plot_data]
-                            ax.plot(times_rel_capture, values, label=dataset.get('label', data_type), color=dataset.get('color', 'k'), linewidth=1.2)
-                            plot_created = True
-                        except Exception as plot_err: logger.error(f"Error plotting {data_type} for PDF '{plot_title}': {plot_err}")
-            if plot_created:
+                            times_rel_export_start = [p[0] for p in plot_data_filtered]
+                            values = [p[1] for p in plot_data_filtered]
+                            ax.plot(times_rel_export_start, values, label=dataset_conf.get('label', data_type), color=dataset_conf.get('color', 'k'), linewidth=1.2)
+                            plot_created_for_component = True
+                        except Exception as plot_err: logger.error(f"Error plotting {data_type} for PDF '{plot_title_base}': {plot_err}")
+            
+            if plot_created_for_component:
                 ax.legend(); ax.grid(True, linestyle='--', alpha=0.6); fig.tight_layout(pad=0.5)
                 safe_suffix = component.get_log_filename_suffix()
-                prefix = f"{self.capture_timestamp}_" if self.capture_timestamp else ""
+                prefix = f"{self.capture_timestamp}_" if self.capture_timestamp and not specific_component_instance else "" # No capture timestamp for slider export
                 pdf_filename = f"{prefix}{safe_suffix}.pdf"
                 pdf_filepath = os.path.join(pdf_dir, pdf_filename)
-                try: fig.savefig(pdf_filepath, bbox_inches='tight'); logger.info(f"Saved PDF: {pdf_filename}"); gen_success = True
-                except Exception as save_err: logger.error(f"Error saving PDF {pdf_filename}: {save_err}"); raise RuntimeError(f"Save PDF failed: {save_err}") from save_err
-            else: logger.info(f"Skipping PDF '{plot_title}' (no data in capture window).")
+                try: 
+                    fig.savefig(pdf_filepath, bbox_inches='tight')
+                    logger.info(f"Saved PDF: {pdf_filename}")
+                    gen_success = True
+                except Exception as save_err: 
+                    logger.error(f"Error saving PDF {pdf_filename}: {save_err}")
+                    # raise RuntimeError(f"Save PDF failed: {save_err}") from save_err # Don't raise, just log
+            else: logger.info(f"Skipping PDF '{plot_title_base}' (no data in specified time window).")
             plt.close(fig)
-        if gen_success: logger.info(f"PDF generation finished. Dir: {pdf_dir}")
-        else: logger.warning("PDF done, but no plots saved (no data / missing UUIDs / no plot components?).")
+        
+        if gen_success: logger.info(f"PDF generation finished for {export_target_description}. Dir: {pdf_dir}")
+        else: logger.warning(f"PDF generation done for {export_target_description}, but no plots were saved.")
+
+
+    def generate_pdf_plots_from_buffer_for_component(self, pdf_dir: str, component_to_export: BaseGuiComponent, capture_start_relative_time: float, capture_end_relative_time: float):
+        self.generate_pdf_plots_from_buffer(pdf_dir, capture_start_relative_time, specific_component_instance=component_to_export, specific_end_relative_time=capture_end_relative_time)
+
+
 
     def generate_csv_files_from_buffer(self, csv_dir: str, filter_start_rel_time: float, filter_end_rel_time: float, time_offset: float):
         global data_buffers
@@ -4990,6 +6511,13 @@ class MainWindow(QMainWindow):
 
             self.gui_manager.clear_all_components()
 
+
+            if self.current_source:
+                 logger.info(f"Clear GUI Action: Found active source {type(self.current_source).__name__}. It will be orphaned. Consider stopping it first if it's an ongoing task.")
+                 
+                 
+
+
     def apply_interval(self):
         global flowing_interval
         try:
@@ -5046,14 +6574,17 @@ class MainWindow(QMainWindow):
         else:
             logger.info("Async shutdown: No active BLE task or task already done.")
         
-        current_client_ref = client 
-        if current_client_ref and current_client_ref.is_connected:
-            logger.info("Async shutdown: Attempting to disconnect client explicitly...")
+
+
+        if self.current_source:
+            logger.info(f"Async shutdown: Stopping current source {type(self.current_source).__name__}...")
             try:
-                await current_client_ref.disconnect()
-                logger.info("Async shutdown: Client disconnected successfully.")
+                await self.current_source.stop()
+                logger.info(f"Async shutdown: Current source {type(self.current_source).__name__} stopped.")
             except Exception as e:
-                logger.error(f"Async shutdown: Error during explicit client disconnect: {e}")
+                logger.error(f"Async shutdown: Error stopping current source: {e}")
+            self.current_source = None
+
         
         logger.info("Async shutdown: Performing GUI cleanup...")
         self.plot_update_timer.stop()
