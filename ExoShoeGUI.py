@@ -1,5 +1,6 @@
 # <<< START OF FILE >>>
 import asyncio
+import qasync
 from bleak import BleakScanner, BleakClient, BleakError
 import logging
 from typing import Optional, Callable, Dict, List, Tuple, Set, Any, Type
@@ -18,7 +19,7 @@ import numpy as np # needed for pyqtgraph AND heatmap
 import re # For cleaning filenames
 import math # Needed for heatmap CoP
 
-# --- Matplotlib Imports (used ONLY for PGF export AND heatmap colormaps) ---
+# --- Matplotlib Imports (used ONLY for PDF export AND heatmap colormaps) ---
 import matplotlib # Use Agg backend to avoid GUI conflicts if possible
 matplotlib.use('Agg') # Set backend BEFORE importing pyplot
 import matplotlib.pyplot as plt
@@ -36,6 +37,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import (QColor, QPainter, QBrush, QPen, QPixmap, QImage, QPolygonF, QIntValidator, QDoubleValidator) # Added heatmap graphics items
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QMetaObject, QThread, QPointF # Added QPointF for heatmap
+
 
 # --- PyQtGraph Import ---
 import pyqtgraph as pg
@@ -57,7 +59,7 @@ data_logger = logging.getLogger("data_logger")
 data_logger.propagate = False # Don't send data logs to root logger's handlers by default
 data_console_handler = logging.StreamHandler() # Specific handler for console data logs
 data_console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-data_console_handler.setLevel(logging.INFO)
+data_console_handler.setLevel(logging.WARNING) # Set level higher to disable INFO logs by default
 data_logger.addHandler(data_console_handler)
 data_logger.setLevel(logging.DEBUG) # Logger level should be lowest level to capture
 
@@ -175,64 +177,168 @@ logger.info(f"Flex sensor angle conversion: Slope={FLEX_SLOPE_DEG_PER_VOLT:.2f} 
 # --- END: Flex Sensor Angle Conversion Parameters ---
 
 # --- Weight Estimation Factor ---
-VOLTAGE_TO_WEIGHT_FACTOR = 7.0  # Convert total summed voltage to weight units
+VOLTAGE_TO_WEIGHT_FACTOR = 25.0  # Convert total summed voltage to weight units
 
-INITIAL_PRESSURE_SENSITIVITY = 300.0 # Initial Sensitivity range (GLOBAL, BUT HANDLED BY HEATMAP COMPONENT NOW)
+INITIAL_PRESSURE_SENSITIVITY = 300.0 # Initial Sensitivity range (GLOBAL, HANDLED BY HEATMAP COMPONENT)
 
 # --- Data Handlers ---
 def handle_orientation_data(data: bytearray) -> dict:
     try:
-        if len(data) != 6: data_logger.error("Invalid data length for orientation"); return {}
-        x_int, y_int, z_int = struct.unpack('<hhh', data)
-        x, y, z = x_int / 100.0, y_int / 100.0, z_int / 100.0
+        text = data.decode("utf-8").strip()
+        parts = text.split(",")
+        if len(parts) != 3:
+            data_logger.error("Invalid orientation payload")
+            return {}
+        x, y, z = map(float, parts)
         data_logger.info(f"Orientation Data: x={x:.2f}, y={y:.2f}, z={z:.2f}")
-        return {'orientation_x': x, 'orientation_y': y, 'orientation_z': z}
-    except Exception as e: data_logger.error(f"Error parsing orientation data: {e}"); return {}
+        return {"orientation_x": x, "orientation_y": y, "orientation_z": z}
+    except Exception as e:
+        data_logger.error(f"Error parsing orientation data: {e}")
+        return {}
+
 
 def handle_gyro_data(data: bytearray) -> dict:
     try:
-        if len(data) != 6: data_logger.error("Invalid data length for gyro"); return {}
-        x_int, y_int, z_int = struct.unpack('<hhh', data)
-        x, y, z = x_int / 100.0, y_int / 100.0, z_int / 100.0
+        text = data.decode("utf-8").strip()
+        parts = text.split(",")
+        if len(parts) != 3:
+            data_logger.error("Invalid gyro payload")
+            return {}
+        x, y, z = map(float, parts)
         data_logger.info(f"Gyro Data: x={x:.2f}, y={y:.2f}, z={z:.2f}")
-        return {'gyro_x': x, 'gyro_y': y, 'gyro_z': z}
-    except Exception as e: data_logger.error(f"Error parsing gyro data: {e}"); return {}
+        return {"gyro_x": x, "gyro_y": y, "gyro_z": z}
+    except Exception as e:
+        data_logger.error(f"Error parsing gyro data: {e}")
+        return {}
+
 
 def handle_lin_accel_data(data: bytearray) -> dict:
     try:
-        if len(data) != 6: data_logger.error("Invalid data length for linear acceleration"); return {}
-        x_int, y_int, z_int = struct.unpack('<hhh', data)
-        x, y, z = x_int / 100.0, y_int / 100.0, z_int / 100.0
+        text = data.decode("utf-8").strip()
+        parts = text.split(",")
+        if len(parts) != 3:
+            data_logger.error("Invalid linear acceleration payload")
+            return {}
+        x, y, z = map(float, parts)
         data_logger.info(f"Linear Acceleration Data: x={x:.2f}, y={y:.2f}, z={z:.2f}")
-        return {'lin_accel_x': x, 'lin_accel_y': y, 'lin_accel_z': z}
-    except Exception as e: data_logger.error(f"Error parsing linear acceleration data: {e}"); return {}
+        return {"lin_accel_x": x, "lin_accel_y": y, "lin_accel_z": z}
+    except Exception as e:
+        data_logger.error(f"Error parsing linear acceleration data: {e}")
+        return {}
+
 
 def handle_mag_data(data: bytearray) -> dict:
     try:
-        if len(data) != 6: data_logger.error("Invalid data length for magnetometer"); return {}
-        x_int, y_int, z_int = struct.unpack('<hhh', data)
-        x, y, z = x_int / 100.0, y_int / 100.0, z_int / 100.0
+        text = data.decode("utf-8").strip()
+        parts = text.split(",")
+        if len(parts) != 3:
+            data_logger.error("Invalid magnetometer payload")
+            return {}
+        x, y, z = map(float, parts)
         data_logger.info(f"Magnetometer Data: x={x:.2f}, y={y:.2f}, z={z:.2f}")
-        return {'mag_x': x, 'mag_y': y, 'mag_z': z}
-    except Exception as e: data_logger.error(f"Error parsing magnetometer data: {e}"); return {}
+        return {"mag_x": x, "mag_y": y, "mag_z": z}
+    except Exception as e:
+        data_logger.error(f"Error parsing magnetometer data: {e}")
+        return {}
+
 
 def handle_accel_data(data: bytearray) -> dict:
     try:
-        if len(data) != 6: data_logger.error("Invalid data length for accelerometer"); return {}
-        x_int, y_int, z_int = struct.unpack('<hhh', data)
-        x, y, z = x_int / 100.0, y_int / 100.0, z_int / 100.0
+        text = data.decode("utf-8").strip()
+        parts = text.split(",")
+        if len(parts) != 3:
+            data_logger.error("Invalid accelerometer payload")
+            return {}
+        x, y, z = map(float, parts)
         data_logger.info(f"Accelerometer Data: x={x:.2f}, y={y:.2f}, z={z:.2f}")
-        return {'accel_x': x, 'accel_y': y, 'accel_z': z}
-    except Exception as e: data_logger.error(f"Error parsing accelerometer data: {e}"); return {}
+        return {"accel_x": x, "accel_y": y, "accel_z": z}
+    except Exception as e:
+        data_logger.error(f"Error parsing accelerometer data: {e}")
+        return {}
+
 
 def handle_gravity_data(data: bytearray) -> dict:
     try:
-        if len(data) != 6: data_logger.error("Invalid data length for gravity"); return {}
-        x_int, y_int, z_int = struct.unpack('<hhh', data)
-        x, y, z = x_int / 100.0, y_int / 100.0, z_int / 100.0
+        text = data.decode("utf-8").strip()
+        parts = text.split(",")
+        if len(parts) != 3:
+            data_logger.error("Invalid gravity payload")
+            return {}
+        x, y, z = map(float, parts)
         data_logger.info(f"Gravity Data: x={x:.2f}, y={y:.2f}, z={z:.2f}")
-        return {'gravity_x': x, 'gravity_y': y, 'gravity_z': z}
-    except Exception as e: data_logger.error(f"Error parsing gravity data: {e}"); return {}
+        return {"gravity_x": x, "gravity_y": y, "gravity_z": z}
+    except Exception as e:
+        data_logger.error(f"Error parsing gravity data: {e}")
+        return {}
+
+# ────────── optical_flow_handler.py ──────────
+
+# module‐level accumulators
+opt_cum_x = 0
+opt_cum_y = 0
+
+def handle_optical_xy_data(data: bytearray) -> dict:
+    global opt_cum_x, opt_cum_y
+    try:
+        text = data.decode("utf-8").strip()
+        dx_str, dy_str = text.split(",")
+        dx = int(dx_str)
+        dy = int(dy_str)
+
+        # update cumulative position
+        opt_cum_x += dx
+        opt_cum_y += dy
+
+        data_logger.info(
+            f"Optical flow: dx={dx}, dy={dy}, cum_x={opt_cum_x}, cum_y={opt_cum_y}"
+        )
+        return {
+            "opt_dx": dx,
+            "opt_dy": dy,
+            "opt_cum_x": opt_cum_x,
+            "opt_cum_y": opt_cum_y
+        }
+    except Exception as e:
+        data_logger.error(f"Error parsing optical-flow data: {e}")
+        return {}
+
+# tof_handler.py
+
+def handle_tof_data(data: bytearray) -> dict:
+    try:
+        text = data.decode("utf-8").strip()
+        dist_str, bright_str = text.split(",")
+        distance_mm = int(dist_str)
+        brightness_kcps = int(bright_str)
+
+        data_logger.info(
+            f"ToF: distance={distance_mm} mm, brightness={brightness_kcps} kcps/spad"
+        )
+        return {
+            "tof_distance_mm": distance_mm,
+            "tof_brightness_kcps": brightness_kcps
+        }
+    except Exception as e:
+        data_logger.error(f"Error parsing ToF data: {e}")
+        return {}
+
+# joystick_angle_handler.py
+
+def handle_ankle_angle_data(data: bytearray) -> dict:
+    try:
+        text = data.decode("utf-8").strip()
+        ax_str, ay_str = text.split(",")
+        ankle_xz = float(ax_str)
+        ankle_yz = float(ay_str)
+        data_logger.info(f"Ankle angles: XZ={ankle_xz:.2f}°, YZ={ankle_yz:.2f}°")
+        return {
+            "ankle_xz": ankle_xz,
+            "ankle_yz": ankle_yz
+        }
+    except Exception as e:
+        data_logger.error(f"Error parsing ankle‑angle data: {e}")
+        return {}
+
 
 def handle_insole_data(data: bytearray) -> dict:
     """
@@ -334,13 +440,60 @@ def handle_insole_data(data: bytearray) -> dict:
     data_logger.info(f"Insole Parsed: { {k: f'{v:.1f}' for k, v in output_dict.items()} }")
     return output_dict
 
+def handle_adc_data(data: bytearray) -> Dict[str, Any]:
+    try:
+        text = data.decode("utf-8", errors="ignore").strip()
+        # parse phase diff (rad) and raw magnitude
+        match = re.search(r"dphi:\s*(-?[\d.]+),\s*Mag:\s*(-?[\d.]+)", text)
+        if not match:
+            data_logger.warning(f"Could not parse ADC data format: {text}")
+            return {}
+
+        phi_diff_rad = float(match.group(1))
+        raw_mag = float(match.group(2))
+
+        # conversion constants
+        A = 1.15
+        COEFF = 87449.71
+        PHASE_OFFSET_DEG = 66.58
+        PHASE_OFFSET_RAD = PHASE_OFFSET_DEG * math.pi / 180.0
+
+        # compute impedance magnitude (Ω)
+        mag_Z_ohm = (COEFF * A**2) / (2.0 * raw_mag)
+        # correct phase
+        phase_Z = phi_diff_rad - PHASE_OFFSET_RAD
+
+        # real & imag parts in ohms
+        real_ohm = mag_Z_ohm * math.cos(phase_Z)
+        imag_ohm = mag_Z_ohm * math.sin(phase_Z)
+
+        # convert to kΩ
+        real_kohm = real_ohm / 1000.0
+        imag_kohm = imag_ohm / 1000.0
+
+        data_logger.info(
+            f"Impedance: |Z|={mag_Z_ohm:.2f} Ω, θ={phase_Z:.3f} rad → "
+            f"Re={real_kohm:.3f} kΩ, Im={imag_kohm:.3f} kΩ"
+        )
+
+        return {
+            "impedance_magnitude_ohm": mag_Z_ohm,
+            "impedance_phase_rad": phase_Z * 180.0 / math.pi,  # Convert to degrees
+            "real_part_kohm": real_kohm,
+            "imag_part_kohm": imag_kohm,
+        }
+
+    except (ValueError, ZeroDivisionError) as e:
+        data_logger.error(f"Error processing ADC data '{text}': {e}")
+        return {}
+
 # --- Device Configuration (Initial Device Name still set here) ---
 # This object's 'name' attribute will be updated by the dropdown menu
 device_config = DeviceConfig(
     name="Nano33IoT", # Initial default name
-    service_uuid="19B10000-E8F2-537E-4F6C-D104768A1214", # Assuming same service UUID for now
+    service_uuid="19B10000-E8F2-537E-4F6C-D104768A1214",
     characteristics=[
-        # IMU Characteristics
+        # BLE Characteristics
         CharacteristicConfig(uuid="19B10001-E8F2-537E-4F6C-D104768A1214", handler=handle_orientation_data,
                              produces_data_types=['orientation_x', 'orientation_y', 'orientation_z']),
         CharacteristicConfig(uuid="19B10003-E8F2-537E-4F6C-D104768A1214", handler=handle_gyro_data,
@@ -356,6 +509,26 @@ device_config = DeviceConfig(
         # Insole Characteristic
         CharacteristicConfig(uuid="19B10002-E8F2-537E-4F6C-D104768A1214", handler=handle_insole_data,
                              produces_data_types=HEATMAP_KEYS + ['estimated_weight', 'flex_angle']), # Produces FSR pressures + weight + angle
+        CharacteristicConfig(
+            uuid="19B10009-E8F2-537E-4F6C-D104768A1214",
+            handler=handle_adc_data,
+            produces_data_types=['impedance_magnitude_ohm', 'impedance_phase_rad', 'real_part_kohm', 'imag_part_kohm']
+        ),
+        CharacteristicConfig(
+            uuid="19B10012-E8F2-537E-4F6C-D104768A1214",
+            handler=handle_optical_xy_data,
+            produces_data_types=['opt_dx', 'opt_dy', 'opt_cum_x', 'opt_cum_y']
+        ),
+        CharacteristicConfig(
+            uuid="19B10014-E8F2-537E-4F6C-D104768A1214",
+            handler=handle_tof_data,
+            produces_data_types=['tof_distance_mm', 'tof_brightness_kcps']
+        ),
+        CharacteristicConfig(
+            uuid="19B10016-E8F2-537E-4F6C-D104768A1214",
+            handler=handle_ankle_angle_data,
+            produces_data_types=['ankle_xz', 'ankle_yz']
+        ),
     ],
     find_timeout=5.0,
     data_timeout=1.0
@@ -713,6 +886,25 @@ class PressureHeatmapComponent(BaseGuiComponent):
 
         self._required_data_types = set(HEATMAP_KEYS) # Internal store
 
+        # --- START: Add Size Configuration Reading ---
+        # Get desired width/height from config, defaulting to None if not specified
+        component_width = self.config.get('component_width', None)
+        component_height = self.config.get('component_height', None)
+
+        # Apply size constraints to the component itself, layout will handle the rest
+        if component_height is not None: self.setFixedHeight(component_height)
+        if component_width is not None: self.setFixedWidth(component_width)
+        # If only one dimension is set, allow expansion in the other
+        if component_height is not None and component_width is None:
+            self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        elif component_width is not None and component_height is None:
+            self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        elif component_width is None and component_height is None:
+             self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        else: # Both fixed
+             self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        # --- END: Add Size Configuration Reading ---
+
         # --- Load Configurable Parameters ---
         self.image_path = self.config.get('image_path', self.DEFAULT_INSOLE_IMAGE_PATH)
         self.grid_resolution = max(1, self.config.get('grid_resolution', self.DEFAULT_GRID_RESOLUTION))
@@ -796,20 +988,22 @@ class PressureHeatmapComponent(BaseGuiComponent):
         self.cop_trail: deque[QPointF] = deque(maxlen=self.COP_TRAIL_MAX_LEN)
 
         # --- GUI Layout Setup ---
-        self.main_layout = QHBoxLayout(self) # Main layout horizontal
-        self.left_panel = QWidget() # Panel for image
-        self.left_layout = QVBoxLayout(self.left_panel)
-        self.left_layout.setContentsMargins(0,0,0,0)
+        self.main_layout = QVBoxLayout(self) # Main layout VERTICAL
+        self.main_layout.setContentsMargins(5, 5, 5, 5) # Add some margins
 
+        # --- Image Label (Top) ---
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image_label.setMinimumSize(150, 250) # Min size for heatmap display
+        # Let the image expand, it will be constrained by component size or window size
         self.image_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.left_layout.addWidget(self.image_label)
+        self.main_layout.addWidget(self.image_label) # Add image label first
 
-        self.right_panel = QWidget() # Panel for controls
-        self.controls_layout = QVBoxLayout(self.right_panel)
-        self.right_panel.setMaximumWidth(300) # Limit control panel width
+        # --- Controls Widget (Bottom) ---
+        self.controls_widget = QWidget()
+        # Use a QVBoxLayout for the controls within the control widget
+        self.controls_layout = QVBoxLayout(self.controls_widget)
+        self.controls_layout.setContentsMargins(0, 5, 0, 0) # Add some top margin for separation
 
         # --- Sensitivity Control ---
         sensitivity_layout = QHBoxLayout()
@@ -894,12 +1088,11 @@ class PressureHeatmapComponent(BaseGuiComponent):
         self.save_button.clicked.connect(self.save_current_view)
         self.controls_layout.addWidget(self.save_button)
 
-        self.controls_layout.addStretch(1) # Push controls up
+        # Set size policy for the controls widget (expand horizontally, take minimum vertical space)
+        self.controls_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        self.main_layout.addWidget(self.controls_widget) # Add controls widget below the image
 
-        # --- Add panels to main layout ---
-        self.main_layout.addWidget(self.left_panel, stretch=3) # Give image more space
-        self.main_layout.addWidget(self.right_panel, stretch=1)
-        self.setLayout(self.main_layout)
+        self.setLayout(self.main_layout) # Set the main layout for the component
 
         # Initial display update if precomputation succeeded
         if self.heatmap_qimage:
@@ -927,8 +1120,8 @@ class PressureHeatmapComponent(BaseGuiComponent):
         # Use base class overlay for the message
         super().handle_missing_uuids(missing_uuids_for_component)
         # Disable/Enable controls
-        if hasattr(self, 'right_panel'): # Check if panel exists (init might fail)
-             self.right_panel.setEnabled(not is_missing) # Disable entire control panel
+        if hasattr(self, 'controls_widget'): # Check if controls widget exists (init might fail)
+             self.controls_widget.setEnabled(not is_missing) # Disable entire control panel
         if is_missing:
              self.clear_component() # Also clear heatmap visually
 
@@ -1062,7 +1255,7 @@ class PressureHeatmapComponent(BaseGuiComponent):
 
     # --- Pressure Calculation Methods (Internal) ---
     def _calculate_pressure_fast(self) -> np.ndarray:
-        # This function now uses self.pressure_values which are *already rescaled* in update_component
+        # This function uses self.pressure_values which are *already rescaled* in update_component
         # It also uses self.precomputed_gaussian_factors which are updated when sigma changes
         if self.num_valid_grid_points == 0 or self.precomputed_gaussian_factors is None or self.precomputed_gaussian_factors.size == 0:
              # logger.debug("Skipping calculate_pressure_fast: No grid points or factors.")
@@ -1353,7 +1546,7 @@ class PressureHeatmapComponent(BaseGuiComponent):
         # Update range slider's maximum and its validator
         self.pressure_range_slider.blockSignals(True)
         current_slider_min_range, _ = self.pressure_range_slider.value() # Keep current min window val
-        self.pressure_range_slider.setRange(0, value_int) # Max range is now sensitivity
+        self.pressure_range_slider.setRange(0, value_int) # Max range is sensitivity
         # Try to preserve window, clamping if necessary
         new_max_window = min(self.current_pressure_max, self.current_pressure_sensitivity)
         new_min_window = min(self.current_pressure_min, new_max_window)
@@ -1424,8 +1617,6 @@ class PressureHeatmapComponent(BaseGuiComponent):
                  logger.debug("Heatmap: Gaussian factors recomputed.")
             else:
                  logger.warning("Heatmap: Gaussian factor recomputation resulted in empty factors. Check grid/mask.")
-                 # Keep old factors or set to None? Setting to None might be safer to prevent errors.
-                 # self.precomputed_gaussian_factors = None # Or keep old ones? Let's keep old for now.
         except Exception as e:
              logger.error(f"Heatmap: Failed to recompute gaussian factors: {e}")
              # Optionally invalidate factors on error, e.g., self.precomputed_gaussian_factors = None
@@ -1505,9 +1696,13 @@ class PressureHeatmapComponent(BaseGuiComponent):
              self.cmap_combobox.setCurrentText(self.current_cmap_name)
              self.cmap_combobox.blockSignals(False)
 
+
 # --- SingleValueDisplayComponent ---
 class SingleValueDisplayComponent(BaseGuiComponent):
-    def __init__(self, config: Dict[str, Any], data_buffers_ref: Dict[str, List[Tuple[float, float]]], device_config_ref: DeviceConfig, parent: Optional[QWidget] = None):
+    def __init__(self, config: Dict[str, Any],
+                 data_buffers_ref: Dict[str, List[Tuple[float, float]]],
+                 device_config_ref: DeviceConfig,
+                 parent: Optional[QWidget] = None):
         super().__init__(config, data_buffers_ref, device_config_ref, parent)
         self.data_type_to_monitor = self.config.get("data_type")
         self.display_label = self.config.get("label", self.data_type_to_monitor)
@@ -1515,22 +1710,23 @@ class SingleValueDisplayComponent(BaseGuiComponent):
         self.units = self.config.get("units", "")
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)
-        self.title_label = QLabel(f"{self.display_label}:")
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.title_label = QLabel(f"{self.display_label}: ")
+        self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.value_label = QLabel("--")
-        self.value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter) # Align value right
-        self.value_label.setMinimumWidth(60) # Give value space
+        self.value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         layout.addWidget(self.title_label)
-        layout.addStretch(1) # Push value label to the right
         layout.addWidget(self.value_label)
-        # layout.addStretch(1) # Push labels to the left
 
         self.setLayout(layout)
 
-        # Fix height, allow width expansion
         self.setFixedHeight(30)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
 
     def update_component(self, current_relative_time: float, is_flowing: bool):
         if plotting_paused: self.value_label.setText("(Paused)"); return
@@ -1626,10 +1822,14 @@ tab_configs = [
                 'row': 0, 'col': 0, 'rowspan': 2, # Heatmap takes more vertical space
                 'config': { # Configuration for the heatmap
                     'title': 'Insole Pressure Heatmap', # Used for log filename
+                    'component_width': 450,
+                    'component_height': 700,
                     # Optional: override defaults like initial_sensitivity, image_path etc.
-                    # 'initial_sensitivity': 500, # Example override
-                    # 'initial_gaussian_sigma': 150, # Example override
+                     'initial_sensitivity': 500, # Example override
+                     'initial_gaussian_sigma': 110, # Example override
                     # 'initial_colormap': 'turbo',
+                    # ... other config options, check component class for details
+                    'grid_resolution': 12, # in pixels, default is 10
                     'enable_logging': True # Log the 11 FSR pressure values (keys from HEATMAP_KEYS)
                 }
             },
@@ -1637,18 +1837,10 @@ tab_configs = [
                 'row': 0, 'col': 1, # Plot for estimated weight
                 'config': {
                     'title': 'Estimated Weight vs Time', 'xlabel': 'Time [s]', 'ylabel': 'Estimated Weight [kg]', # Adjusted units
-                    'plot_height': 250, # Adjust height as needed
+                    'plot_height': 450, # Adjust height as needed
+                    'plot_width': 650, # Adjust width as needed
                     'datasets': [{'data_type': 'estimated_weight', 'label': 'Weight', 'color': 'b'}],
                     'enable_logging': True # Log estimated weight
-                }
-            },
-            {   'component_class': TimeSeriesPlotComponent,
-                'row': 1, 'col': 1, # Plot for flex angle
-                'config': {
-                    'title': 'Flex Sensor Angle vs Time', 'xlabel': 'Time [s]', 'ylabel': 'Angle [°]',
-                    'plot_height': 250, # Adjust height as needed
-                    'datasets': [{'data_type': 'flex_angle', 'label': 'Flex Angle', 'color': 'r'}],
-                    'enable_logging': True # Log flex angle
                 }
             },
         ]
@@ -1707,6 +1899,7 @@ tab_configs = [
                 'row': 0, 'col': 0,
                 'config': {
                     'title': 'Linear Acceleration vs Time','xlabel': 'Time [s]','ylabel': 'm/s²',
+                    'plot_height': 300,
                     # No size constraints -> uses default Expanding policy
                     'datasets': [{'data_type': 'lin_accel_x', 'label': 'X', 'color': 'r'},
                                  {'data_type': 'lin_accel_y', 'label': 'Y', 'color': 'g'},
@@ -1718,7 +1911,7 @@ tab_configs = [
                 'row': 1, 'col': 0,
                 'config': {
                     'title': 'Raw Acceleration vs Time','xlabel': 'Time [s]','ylabel': 'm/s²',
-                    'plot_height': 280, # Height constraint
+                    'plot_height': 300, # Height constraint
                     'datasets': [{'data_type': 'accel_x', 'label': 'X', 'color': 'r'},
                                  {'data_type': 'accel_y', 'label': 'Y', 'color': 'g'},
                                  {'data_type': 'accel_z', 'label': 'Z', 'color': 'b'}]
@@ -1726,10 +1919,10 @@ tab_configs = [
                 }
             },
             {   'component_class': TimeSeriesPlotComponent,
-                'row': 1, 'col': 1,
+                'row': 0, 'col': 1,
                 'config': {
                      'title': 'Gravity vs Time','xlabel': 'Time [s]','ylabel': 'm/s²',
-                     'plot_width': 400, # Width constraint
+                     'plot_height': 300,
                      'datasets': [{'data_type': 'gravity_x', 'label': 'X', 'color': 'r'},
                                   {'data_type': 'gravity_y', 'label': 'Y', 'color': 'g'},
                                   {'data_type': 'gravity_z', 'label': 'Z', 'color': 'b'}],
@@ -1742,7 +1935,7 @@ tab_configs = [
         'tab_title': 'Other Sensors',
         'layout': [
              {  'component_class': TimeSeriesPlotComponent,
-                 'row': 0, 'col': 0,
+                 'row': 1, 'col': 1,
                  'config': {
                      'title': 'Magnetic Field vs Time','xlabel': 'Time [s]','ylabel': 'µT',
                      'plot_height': 350, 'plot_width': 600, # Both constraints
@@ -1760,9 +1953,133 @@ tab_configs = [
                     'format': '{:.1f}', 'units': 'µT',
                     'enable_logging': True # Log this specific value as well
                 }
+            },
+                {  'component_class': TimeSeriesPlotComponent,
+                'row': 0, 'col': 0,
+                'config': {
+                    'title': 'Impedance Magnitude vs Time','xlabel': 'Time [s]','ylabel': 'Impedance Magnitude',
+                    'plot_height': 350, 'plot_width': 600,
+                    'datasets': [{'data_type': 'impedance_magnitude_ohm', 'label': 'Magnitude','color': 'r'},],
+                    'enable_logging': True
+                }
+            },
+                {  'component_class': TimeSeriesPlotComponent,
+                'row': 0, 'col': 1,
+                'config': {
+                    'title': 'Impdance Phase in Degrees vs Time','xlabel': 'Time [s]','ylabel': 'Impdance Phase [°]]',
+                    'plot_height': 350, 'plot_width': 600,
+                    'datasets': [{'data_type': 'impedance_phase_rad', 'label': 'Phase', 'color': 'r'},],
+                    'enable_logging': True
+                }
+            },
+
+        ]
+    },
+    {
+        'tab_title': 'Optical Flow',
+        'layout': [
+            {
+                'component_class': TimeSeriesPlotComponent,
+                'row': 0, 'col': 0,
+                'config': {
+                    'title': 'Optical Flow Δ vs Time',
+                    'xlabel': 'Time [s]',
+                    'ylabel': 'Pixel Δ',
+                    'plot_height': 350,
+                    'plot_width': 600,
+                    'datasets': [
+                        {'data_type': 'opt_dx',    'label': 'ΔX',    'color': 'r'},
+                        {'data_type': 'opt_dy',    'label': 'ΔY',    'color': 'g'}
+                    ],
+                    'enable_logging': True
+                }
+            },
+            {
+                'component_class': TimeSeriesPlotComponent,
+                'row': 0, 'col': 1,
+                'config': {
+                    'title': 'Cumulative Optical Flow vs Time',
+                    'xlabel': 'Time [s]',
+                    'ylabel': 'Pixels',
+                    'plot_height': 350,
+                    'plot_width': 600,
+                    'datasets': [
+                        {'data_type': 'opt_cum_x', 'label': 'Cum X', 'color': 'r'},
+                        {'data_type': 'opt_cum_y', 'label': 'Cum Y', 'color': 'g'}
+                    ],
+                    'enable_logging': True
+                }
+            }
+        ]
+    },
+    {
+        'tab_title': 'ToF Sensor',
+        'layout': [
+            {
+                'component_class': TimeSeriesPlotComponent,
+                'row': 0, 'col': 0,
+                'config': {
+                    'title': 'Distance vs Time',
+                    'xlabel': 'Time [s]',
+                    'ylabel': 'Distance [mm]',
+                    'plot_height': 350,
+                    'plot_width': 350,
+                    'datasets': [
+                        {'data_type': 'tof_distance_mm', 'label': 'Distance', 'color': 'b'}
+                    ],
+                    'enable_logging': True
+                }
+            },
+            {
+                'component_class': TimeSeriesPlotComponent,
+                'row': 0, 'col': 1,
+                'config': {
+                    'title': 'Darkness vs Time',
+                    'xlabel': 'Time [s]',
+                    'ylabel': 'Darkness [kcps/spad]',
+                    'plot_height': 350,
+                    'plot_width': 350,
+                    'datasets': [
+                        {'data_type': 'tof_brightness_kcps', 'label': 'Darkness', 'color': 'k'}
+                    ],
+                    'enable_logging': True
+                }
+            }
+        ]
+    },
+    {
+        'tab_title': 'Ankle Angles',
+        'layout': [
+            {   'component_class': TimeSeriesPlotComponent,
+                'row': 0, 'col': 0,
+                'config': {
+                    'title': 'Ankle XZ vs Time',
+                    'xlabel': 'Time [s]',
+                    'ylabel': 'Angle [°]',
+                    'plot_height': 300, 'plot_width': 450,
+                    'datasets': [
+                        {'data_type': 'ankle_xz', 'label': 'XZ', 'color': 'r'}
+                    ],
+                    'enable_logging': True
+                }
+            },
+            {   'component_class': TimeSeriesPlotComponent,
+                'row': 0, 'col': 1,
+                'config': {
+                    'title': 'Ankle YZ vs Time',
+                    'xlabel': 'Time [s]',
+                    'ylabel': 'Angle [°]',
+                    'plot_height': 300, 'plot_width': 450,
+                    'datasets': [
+                        {'data_type': 'ankle_yz', 'label': 'YZ', 'color': 'g'}
+                    ],
+                    'enable_logging': True
+                }
             }
         ]
     }
+
+
 ]
 
 #####################################################################################################################
@@ -2276,7 +2593,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Modular BLE Data GUI") # Updated title
-        self.setGeometry(100, 100, 1200, 850)
+        self.setGeometry(100, 100, 1400, 950)
 
         # --- Capture State ---
         self.is_capturing = False
@@ -2321,11 +2638,11 @@ class MainWindow(QMainWindow):
         self.bottom_bar = QWidget()
         self.bottom_layout = QHBoxLayout(self.bottom_bar)
         self.bottom_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
-        self.flowing_mode_check = QCheckBox("Flowing Mode"); self.flowing_mode_check.setChecked(False); self.bottom_layout.addWidget(self.flowing_mode_check)
+        self.flowing_mode_check = QCheckBox("Flowing Mode"); self.flowing_mode_check.setChecked(True); self.bottom_layout.addWidget(self.flowing_mode_check)
         self.interval_label = QLabel("Interval (s):"); self.bottom_layout.addWidget(self.interval_label)
         self.interval_entry = QLineEdit(str(flowing_interval)); self.interval_entry.setFixedWidth(50); self.bottom_layout.addWidget(self.interval_entry)
         self.apply_interval_button = QPushButton("Apply Interval"); self.apply_interval_button.clicked.connect(self.apply_interval); self.bottom_layout.addWidget(self.apply_interval_button)
-        self.data_log_check = QCheckBox("Log Raw Data to Console"); self.data_log_check.setChecked(True); self.data_log_check.stateChanged.connect(self.toggle_data_log); self.bottom_layout.addWidget(self.data_log_check)
+        self.data_log_check = QCheckBox("Log Raw Data to Console"); self.data_log_check.setChecked(False); self.data_log_check.stateChanged.connect(self.toggle_data_log); self.bottom_layout.addWidget(self.data_log_check)
         self.bottom_layout.addStretch(1)
         self.main_layout.addWidget(self.bottom_bar)
 
@@ -2582,7 +2899,7 @@ class MainWindow(QMainWindow):
             self.capture_button.setEnabled(state == "connected")
             return
 
-        logger.info("Stopping capture, generating PGF & CSV.")
+        logger.info("Stopping capture, generating PDF & CSV.")
         output_dir = self.capture_output_base_dir
         start_rel_time = self.capture_start_relative_time
         # Calculate end relative to the session's absolute start_time
@@ -2605,17 +2922,17 @@ class MainWindow(QMainWindow):
         # --- File Generation Logic ---
         if output_dir and start_rel_time is not None: # End time calculated above
             if not data_buffers:
-                 logger.warning("No data captured during the active period. Skipping PGF/CSV generation.")
+                 logger.warning("No data captured during the active period. Skipping PDF/CSV generation.")
                  # Reset vars even if generation skipped
                  self.capture_output_base_dir = None; self.capture_start_relative_time = None
                  self.capture_t0_absolute = None; self.capture_timestamp = None
                  return # Skip generation
 
-            pgf_subdir = os.path.join(output_dir, "pgf_plots")
+            pdf_subdir = os.path.join(output_dir, "pdf_plots")
             csv_subdir = os.path.join(output_dir, "csv_files")
-            try: os.makedirs(pgf_subdir, exist_ok=True); os.makedirs(csv_subdir, exist_ok=True)
+            try: os.makedirs(pdf_subdir, exist_ok=True); os.makedirs(csv_subdir, exist_ok=True)
             except Exception as e:
-                logger.error(f"Failed to create PGF/CSV subdirs: {e}")
+                logger.error(f"Failed to create PDF/CSV subdirs: {e}")
                 self.show_message_box("File Gen Error", f"Could not create output subdirs:\n{e}")
                 # Reset vars on failure
                 self.capture_output_base_dir = None; self.capture_start_relative_time = None
@@ -2625,8 +2942,8 @@ class MainWindow(QMainWindow):
             gen_errors = []
             try:
                 # Pass necessary info: output dir, start rel time (for filtering/offset)
-                self.generate_pgf_plots_from_buffer(pgf_subdir, start_rel_time)
-            except Exception as e: logger.error(f"PGF generation failed: {e}", exc_info=True); gen_errors.append(f"PGF: {e}")
+                self.generate_pdf_plots_from_buffer(pdf_subdir, start_rel_time)
+            except Exception as e: logger.error(f"PDF generation failed: {e}", exc_info=True); gen_errors.append(f"PDF: {e}")
             try:
                 # Pass necessary info: output dir, start/end rel time (for filtering), start rel time (for offset)
                 self.generate_csv_files_from_buffer(csv_subdir, start_rel_time, capture_end_relative_time, start_rel_time)
@@ -2649,12 +2966,12 @@ class MainWindow(QMainWindow):
         self.capture_timestamp = None
 
 
-    # --- PGF Generation (Uses GuiManager components, checks UUIDs) ---
-    def generate_pgf_plots_from_buffer(self, pgf_dir: str, capture_start_relative_time: float):
+    # --- PDF Generation (Uses GuiManager components, checks UUIDs) ---
+    def generate_pdf_plots_from_buffer(self, pdf_dir: str, capture_start_relative_time: float):
         global data_buffers # Uses data_buffers
 
-        logger.info(f"Generating PGF plots (t=0 at capture start, t_offset={capture_start_relative_time:.3f}s). Dir: {pgf_dir}")
-        if not data_buffers: logger.warning("Data buffer empty, skipping PGF generation."); return
+        logger.info(f"Generating PDF plots (t=0 at capture start, t_offset={capture_start_relative_time:.3f}s). Dir: {pdf_dir}")
+        if not data_buffers: logger.warning("Data buffer empty, skipping PDF generation."); return
 
         try:
             plt.style.use('science')
@@ -2667,7 +2984,7 @@ class MainWindow(QMainWindow):
         gen_success = False
         # Iterate through components managed by GuiManager
         for component in self.gui_manager.all_components:
-            # Only generate PGF for TimeSeriesPlotComponent instances
+            # Only generate PDF for TimeSeriesPlotComponent instances
             if not isinstance(component, TimeSeriesPlotComponent):
                 continue
 
@@ -2687,7 +3004,7 @@ class MainWindow(QMainWindow):
             missing_uuids_for_this_plot = required_uuids_for_plot.intersection(self.gui_manager.active_missing_uuids)
 
             if missing_uuids_for_this_plot:
-                logger.warning(f"Skipping PGF for plot '{plot_title}' as it depends on missing UUID(s): {missing_uuids_for_this_plot}")
+                logger.warning(f"Skipping PDF for plot '{plot_title}' as it depends on missing UUID(s): {missing_uuids_for_this_plot}")
                 continue # Skip this plot
 
             # --- Plotting logic (using component's config) ---
@@ -2709,7 +3026,7 @@ class MainWindow(QMainWindow):
                             values = [p[1] for p in plot_data]
                             ax.plot(times_rel_capture, values, label=dataset.get('label', data_type), color=dataset.get('color', 'k'), linewidth=1.2)
                             plot_created = True
-                        except Exception as plot_err: logger.error(f"Error plotting {data_type} for PGF '{plot_title}': {plot_err}")
+                        except Exception as plot_err: logger.error(f"Error plotting {data_type} for PDF '{plot_title}': {plot_err}")
 
             if plot_created:
                 ax.legend(); ax.grid(True, linestyle='--', alpha=0.6); fig.tight_layout(pad=0.5)
@@ -2717,15 +3034,15 @@ class MainWindow(QMainWindow):
                 safe_suffix = component.get_log_filename_suffix() # This is already cleaned
                 prefix = f"{self.capture_timestamp}_" if self.capture_timestamp else ""
                 # Adjust filename to use the suffix from component
-                pgf_filename = f"{prefix}{safe_suffix}.pgf"
-                pgf_filepath = os.path.join(pgf_dir, pgf_filename)
-                try: fig.savefig(pgf_filepath, bbox_inches='tight'); logger.info(f"Saved PGF: {pgf_filename}"); gen_success = True
-                except Exception as save_err: logger.error(f"Error saving PGF {pgf_filename}: {save_err}"); raise RuntimeError(f"Save PGF failed: {save_err}") from save_err
-            else: logger.info(f"Skipping PGF '{plot_title}' (no data in capture window).")
+                pdf_filename = f"{prefix}{safe_suffix}.pdf"
+                pdf_filepath = os.path.join(pdf_dir, pdf_filename)
+                try: fig.savefig(pdf_filepath, bbox_inches='tight'); logger.info(f"Saved PDF: {pdf_filename}"); gen_success = True
+                except Exception as save_err: logger.error(f"Error saving PDF {pdf_filename}: {save_err}"); raise RuntimeError(f"Save PDF failed: {save_err}") from save_err
+            else: logger.info(f"Skipping PDF '{plot_title}' (no data in capture window).")
             plt.close(fig) # Close the figure to release memory
 
-        if gen_success: logger.info(f"PGF generation finished. Dir: {pgf_dir}")
-        else: logger.warning("PGF done, but no plots saved (no data / missing UUIDs / no plot components?).")
+        if gen_success: logger.info(f"PDF generation finished. Dir: {pdf_dir}")
+        else: logger.warning("PDF done, but no plots saved (no data / missing UUIDs / no plot components?).")
 
 
     # --- CSV Generation (NEW logic for any loggable component) ---
