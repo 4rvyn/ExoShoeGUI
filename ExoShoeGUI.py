@@ -144,8 +144,7 @@ ADC_MAX_VOLTAGE = 3.3           # Maximal voltage expected from ADC
 # --- Define the keys specifically for the heatmap sensors ---
 HEATMAP_KEYS = ["A0C0", "A1C0", "A2C0", "A0C1", "A1C1", "A2C1", "A0C2", "A1C2", "A2C2", "A1C3", "A2C3"]
 NUM_HEATMAP_SENSORS = len(HEATMAP_KEYS)
-# --- Define the key for the flex sensor ---
-FLEX_SENSOR_KEY = "A0C3"
+
 
 # --- This gain list remains ONLY for the FSR sensors used in the heatmap ---
 DEFAULT_SENSOR_GAINS = np.array([ # Order corresponds to HEATMAP_KEYS.
@@ -160,21 +159,8 @@ DEFAULT_SENSOR_GAINS = np.array([ # Order corresponds to HEATMAP_KEYS.
     1.0, # Gain for Sensor 8 (A2C2)
     2.0, # Gain for Sensor 9 (A1C3)
     1.0  # Gain for Sensor 10 (A2C3)
-], dtype=np.float32)
+], dtype=np.float32) # (A0C3 is ommited, broken flex sensor)
 
-# --- START: Flex Sensor Angle Conversion Parameters ---
-FLEX_REF_VOLTAGE = 2.415  # Voltage corresponding to 0 degrees
-FLEX_REF_ANGLE = 0.0       # Angle at the reference voltage
-FLEX_VOLTS_PER_90_DEG = -0.1 # Voltage change for a 90 degree increase
-# Calculate slope and intercept for y = mx + c (Angle = slope * Voltage + intercept)
-if abs(FLEX_VOLTS_PER_90_DEG) < 1e-9:
-    logger.warning("FLEX_VOLTS_PER_90_DEG is near zero. Angle conversion disabled (slope set to 0).")
-    FLEX_SLOPE_DEG_PER_VOLT = 0.0
-else:
-    FLEX_SLOPE_DEG_PER_VOLT = 90.0 / FLEX_VOLTS_PER_90_DEG # Degrees per Volt
-FLEX_INTERCEPT_DEG = FLEX_REF_ANGLE - (FLEX_SLOPE_DEG_PER_VOLT * FLEX_REF_VOLTAGE)
-logger.info(f"Flex sensor angle conversion: Slope={FLEX_SLOPE_DEG_PER_VOLT:.2f} deg/V, Intercept={FLEX_INTERCEPT_DEG:.2f} deg")
-# --- END: Flex Sensor Angle Conversion Parameters ---
 
 # --- Weight Estimation Factor ---
 VOLTAGE_TO_WEIGHT_FACTOR = 25.0  # Convert total summed voltage to weight units
@@ -345,7 +331,7 @@ def handle_insole_data(data: bytearray) -> dict:
     Parses the incoming insole data string (bytearray) from BLE.
     Extracts voltage values, applies gains, calculates individual pressures (FSR)
     using INITIAL_PRESSURE_SENSITIVITY, calculates summed gained voltage (FSRs),
-    estimated weight (from sum), and flex angle (from flex sensor voltage).
+    estimated weight (from sum).
 
     Args:
         data: The raw bytearray received via BLE.
@@ -354,7 +340,6 @@ def handle_insole_data(data: bytearray) -> dict:
         A dictionary containing keys for:
         - Each FSR sensor ('A0C0'...'A2C3') with its pressure value (relative to initial sensitivity).
         - 'estimated_weight' with the calculated weight value.
-        - 'flex_angle' with the calculated angle value in degrees.
         Returns an empty dictionary if parsing or critical calculation fails.
     """
     try:
@@ -365,7 +350,6 @@ def handle_insole_data(data: bytearray) -> dict:
 
     output_dict: Dict[str, float] = {}
     summed_gained_voltage = 0.0             # Accumulator for gained voltages (heatmap only)
-    flex_voltage: Optional[float] = None    # Storage for the flex sensor RAW voltage
     # *** Uses INITIAL_PRESSURE_SENSITIVITY for the data stored in the buffer ***
     pressure_sensitivity = INITIAL_PRESSURE_SENSITIVITY
 
@@ -388,12 +372,8 @@ def handle_insole_data(data: bytearray) -> dict:
                 # data_logger.warning(f"Could not parse voltage value for key '{key}': '{value_str}'. Skipping.")
                 continue
 
-            # --- Check if it's the Flex Sensor ---
-            if key == FLEX_SENSOR_KEY:
-                flex_voltage = voltage # Store the raw voltage
-
             # --- Check if it's one of the Heatmap Sensors ---
-            elif key in HEATMAP_KEYS:
+            if key in HEATMAP_KEYS:
                 try:
                     sensor_index = HEATMAP_KEYS.index(key)
                     gain = DEFAULT_SENSOR_GAINS[sensor_index]
@@ -411,7 +391,7 @@ def handle_insole_data(data: bytearray) -> dict:
                 output_dict[key] = max(0.0, pressure) # Ensure pressure is non-negative, store FSR pressure
 
             # --- Else: Key is unrecognized ---
-            # else: data_logger.debug(f"Skipping unrecognized key: '{key}'")
+            else: data_logger.debug(f"Skipping unrecognized key: '{key}'")
 
     except ValueError as e:
         data_logger.warning(f"ValueError parsing part '{part}': {e} in string: {data_string}")
@@ -425,12 +405,6 @@ def handle_insole_data(data: bytearray) -> dict:
     # Weight Estimation
     output_dict['estimated_weight'] = summed_gained_voltage * VOLTAGE_TO_WEIGHT_FACTOR
 
-    # Flex Angle Calculation
-    if flex_voltage is None:
-        # data_logger.debug(f"Flex sensor key '{FLEX_SENSOR_KEY}' not found in current packet. Calculating angle from default voltage 0.0.")
-        flex_voltage = 0.0 # Use default voltage if not found
-    flex_angle = FLEX_SLOPE_DEG_PER_VOLT * flex_voltage + FLEX_INTERCEPT_DEG
-    output_dict['flex_angle'] = flex_angle
 
     # Check if all heatmap keys were populated (can be zero if voltage was zero/unparseable)
     for key in HEATMAP_KEYS:
@@ -508,7 +482,7 @@ device_config = DeviceConfig(
                              produces_data_types=['gravity_x', 'gravity_y', 'gravity_z']),
         # Insole Characteristic
         CharacteristicConfig(uuid="19B10002-E8F2-537E-4F6C-D104768A1214", handler=handle_insole_data,
-                             produces_data_types=HEATMAP_KEYS + ['estimated_weight', 'flex_angle']), # Produces FSR pressures + weight + angle
+                             produces_data_types=HEATMAP_KEYS + ['estimated_weight']), # Produces FSR pressures + weight + angle
         CharacteristicConfig(
             uuid="19B10009-E8F2-537E-4F6C-D104768A1214",
             handler=handle_adc_data,
@@ -3097,7 +3071,7 @@ if __name__ == "__main__":
     main_window.show()
     exit_code = 0 
     try:
-        logger.info("Starting qasync event loop (integrates Qt and asyncio)...")
+        logger.info("Starting qasync event loop...")
         with qasync_loop:
             qasync_loop.run_forever()
         exit_code = 0 
