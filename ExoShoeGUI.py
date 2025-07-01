@@ -291,42 +291,81 @@ class BleDataSource(DataSource):
             logger.error(f"BleDataSource: Error during setup/listen: {e}")
             if state == "connected": self._gui_emitter.emit_state_change("disconnecting")
         finally:
-            logger.info("BleDataSource: Performing cleanup...")
-            local_client_ref = self._client
-            self._client = None
+            logger.info("BleDataSource: Start method entering finally block for cleanup.")
+            local_client_ref = self._client  # Capture the client instance used by this start() call
+            self._client = None  # Indicate this BleDataSource instance no longer manages this client internally
+
+            active_chars_to_clean = list(self._active_char_configs) # Make a copy for safe iteration if needed
+            self._active_char_configs = [] # Clear instance's list early
 
             if local_client_ref:
-                is_conn_at_cleanup = False
-                try: is_conn_at_cleanup = local_client_ref.is_connected
-                except: pass
+                client_was_connected_at_cleanup_start = False
+                try:
+                    if hasattr(local_client_ref, 'is_connected') and callable(local_client_ref.is_connected):
+                        client_was_connected_at_cleanup_start = local_client_ref.is_connected
+                    else:
+                        logger.warning("BleDataSource: local_client_ref is not a valid BleakClient object in finally.")
+                except BleakError as be: 
+                    logger.warning(f"BleDataSource: BleakError when checking local_client_ref.is_connected in finally: {be}")
+                except Exception as e: 
+                    logger.warning(f"BleDataSource: Unexpected error checking local_client_ref.is_connected in finally: {e}")
 
-                if is_conn_at_cleanup:
-                    logger.info("BleDataSource: Stopping notifications and disconnecting client...")
+                if client_was_connected_at_cleanup_start:
+                    logger.info("BleDataSource: Client was connected at start of finally. Stopping notifications...")
                     stop_notify_tasks_final = []
-                    for char_conf_final in self._active_char_configs:
+                    for char_conf in active_chars_to_clean:
                         try:
-                            if local_client_ref.is_connected:
-                                stop_notify_tasks_final.append(local_client_ref.stop_notify(char_conf_final.uuid))
+                            if local_client_ref.is_connected: # Check before each attempt
+                                stop_notify_tasks_final.append(local_client_ref.stop_notify(char_conf.uuid))
+                            else:
+                                logger.warning(f"BleDataSource: Client disconnected before stop_notify for {char_conf.uuid} could be added to tasks.")
+                                break 
                         except Exception as e:
-                            logger.warning(f"BleDataSource: Error preparing stop_notify for {char_conf_final.uuid}: {e}")
+                            logger.warning(f"BleDataSource: Error preparing stop_notify for {char_conf.uuid} in finally: {e}")
+                    
                     if stop_notify_tasks_final:
-                        try: await asyncio.gather(*stop_notify_tasks_final, return_exceptions=True)
-                        except Exception: pass
+                        logger.info(f"BleDataSource: Attempting to stop {len(stop_notify_tasks_final)} notifications...")
+                        stop_results = await asyncio.gather(*stop_notify_tasks_final, return_exceptions=True)
+                        for i, res in enumerate(stop_results):
+                            if isinstance(res, Exception):
+                                char_uuid_err = active_chars_to_clean[i].uuid if i < len(active_chars_to_clean) else "unknown_uuid"
+                                logger.warning(f"BleDataSource: Error during stop_notify for {char_uuid_err}: {res}")
+                        logger.info("BleDataSource: Finished attempting to stop notifications.")
+                    else:
+                        logger.info("BleDataSource: No notifications to stop or client was already disconnected.")
+
+                    logger.info("BleDataSource: Attempting to disconnect client in finally block...")
                     try:
-                        if local_client_ref.is_connected:
-                             await asyncio.wait_for(local_client_ref.disconnect(), timeout=5.0)
-                        logger.info("BleDataSource: Client disconnected.")
+                        if local_client_ref.is_connected: # Final check
+                            # Give more time for a clean disconnect. The GUI is already hidden.
+                            await asyncio.wait_for(local_client_ref.disconnect(), timeout=5.0)
+                            logger.info("BleDataSource: Client disconnected successfully via local_client_ref in finally block.")
+                        else:
+                            logger.info("BleDataSource: Client was already disconnected before final disconnect call in finally block.")
+                    except asyncio.TimeoutError:
+                        # This will now only trigger if disconnect takes longer than 5.0s
+                        logger.warning(f"BleDataSource: Timeout ({5.0}s) disconnecting client. Proceeding with shutdown.")
+                    except BleakError as be:
+                        logger.error(f"BleDataSource: BleakError during client disconnect in finally: {be}")
                     except Exception as e:
-                        logger.error(f"BleDataSource: Error during client disconnect: {e}")
-            
-            self._active_char_configs = []
+                        logger.error(f"BleDataSource: Generic error during client disconnect in finally: {e}")
+                else:
+                    logger.info("BleDataSource: local_client_ref existed but was not connected (or invalid) at start of finally block.")
+            else:
+                logger.info("BleDataSource: local_client_ref was None at start of finally block.")
+
             disconnected_event.clear()
             
-            if not self._stop_requested:
+            # If the start() method is ending NOT because _stop_requested was true 
+            # (e.g. connection lost, scan failed and not retrying within start itself),
+            # ensure GUI state is updated to idle.
+            # If _stop_requested is true, the _ble_source_done_callback will typically handle the final idle state.
+            if not self._stop_requested and state != "idle":
+                logger.info("BleDataSource: Stop not externally requested, but start() is ending. Emitting idle state.")
                 self._gui_emitter.emit_state_change("idle")
             
-            stop_flag = original_stop_flag_val
-            logger.info("BleDataSource: Start method finished.")
+            stop_flag = original_stop_flag_val # Restore global stop_flag for other potential uses
+            logger.info("BleDataSource: Start method's finally block completed.")
 
     async def stop(self):
         logger.info("BleDataSource: Stop requested.")
@@ -339,19 +378,8 @@ class BleDataSource(DataSource):
             disconnected_event.set()
         else:
             logger.info("BleDataSource: Client not connected or None, stop will primarily affect scan/connect phases.")
-        
-        
-        if self._client and self._client.is_connected:
-            try:
-                await asyncio.wait_for(self._client.disconnect(), timeout=2.0)
-                logger.info("BleDataSource: Client disconnected successfully in stop().")
-            except asyncio.TimeoutError:
-                logger.warning("BleDataSource: Timeout disconnecting client in stop().")
-            except Exception as e:
-                logger.error(f"BleDataSource: Error disconnecting client in stop(): {e}")
-        self._client = None
 
-
+        logger.info("BleDataSource.stop() has signaled the active data source task to terminate and clean up.")
 
 
 class CsvReplaySource(DataSource):
@@ -4127,18 +4155,55 @@ class GuiManager:
             except Exception as e:
                 logger.error(f"Error updating component {type(component).__name__}: {e}", exc_info=True)
 
-    def clear_all_components(self):
-        logger.info("GuiManager clearing all connected components and their overlays...")
+    def clear_components(self, clear_only_connected_data: bool):
+        if clear_only_connected_data:
+            logger.info("GuiManager clearing data for connected components only (preserving overlays for unconnected)...")
+        else:
+            logger.info("GuiManager clearing all components fully (including overlays)...")
+
         for component in self.all_components:
             try:
-                component.clear_component()
-                # Explicitly tell each component to remove any active overlays, regardless of current missing sets
-                component.handle_missing_uuids(set()) 
-                component.handle_missing_replay_data(set()) 
+                if clear_only_connected_data:
+                    # Determine if this component is "fully connected"
+                    # A component is fully connected if none of its required data types
+                    # map to UUIDs that are currently in self.active_missing_uuids.
+                    is_this_component_fully_connected = True
+                    if not component.get_required_data_types(): # Component requires no data, so it's "connected"
+                        pass
+                    else:
+                        for dtype in component.get_required_data_types():
+                            # _missing_uuids_for_dtype returns the set of *actually missing* UUIDs for this dtype
+                            if self._missing_uuids_for_dtype(dtype): # If any required dtype is missing UUIDs
+                                is_this_component_fully_connected = False
+                                break
+                    
+                    if is_this_component_fully_connected:
+                        logger.debug(f"Clearing connected component: {type(component).__name__} (Title: {component.config.get('title', 'N/A')})")
+                        component.clear_component()
+                        # Ensure its overlays are cleared as it's considered connected
+                        component.handle_missing_uuids(set())
+                        component.handle_missing_replay_data(set())
+                    else:
+                        # For unconnected components, do not call clear_component().
+                        # Their data in data_buffers is cleared globally.
+                        # Their "missing UUID" overlay (already set by notify_missing_uuids) should remain.
+                        # We might want to clear any replay-specific overlay if it exists.
+                        logger.debug(f"Skipping clear for unconnected component (preserving UUID overlay): {type(component).__name__} (Title: {component.config.get('title', 'N/A')})")
+                        component.handle_missing_replay_data(set()) # Clear replay overlay even if UUID overlay stays
+                else:
+                    # Clear all components fully (behavior when disconnected/idle)
+                    logger.debug(f"Fully clearing component: {type(component).__name__} (Title: {component.config.get('title', 'N/A')})")
+                    component.clear_component()
+                    component.handle_missing_uuids(set())
+                    component.handle_missing_replay_data(set())
             except Exception as e:
-                logger.error(f"Error clearing component {type(component).__name__} or its overlays: {e}", exc_info=True)
-        # Reset the GuiManager's own tracking of missing UUIDs
-        self.active_missing_uuids.clear()
+                logger.error(f"Error during component clear ({'connected_only' if clear_only_connected_data else 'all'}): {type(component).__name__} - {e}", exc_info=True)
+
+        if not clear_only_connected_data:
+            # Only clear the GuiManager's active_missing_uuids set if we are doing a full clear (e.g., on disconnect)
+            logger.debug("Full clear: Resetting GuiManager.active_missing_uuids.")
+            self.active_missing_uuids.clear()
+        # If clear_only_connected_data is True, self.active_missing_uuids should persist.
 
 
     # ------------------------------------------------------------------
@@ -5833,9 +5898,14 @@ class MainWindow(QMainWindow):
         if state == "idle":
             self.scan_button.setText("Start Scan")
             self.replay_button.setText("Replay CSV…")
-            self.led_indicator.set_color("red")
-            self.status_label.setText("On Standby")
-            self.pause_resume_button.setText("Pause Plotting") # Should be "Pause"
+
+            if not self._shutting_down: # Only set these if not quitting
+                self.led_indicator.set_color("red")
+                self.status_label.setText("On Standby")
+            # else: if _shutting_down, LED is gray and status is "Shutting down..." from closeEvent
+
+            self.pause_resume_button.setText("Pause Plotting")
+
             self.pause_resume_button.setEnabled(False) # Can't pause/resume if not connected/replaying
             plotting_paused = True 
             
@@ -5920,8 +5990,12 @@ class MainWindow(QMainWindow):
             self.scan_button.setEnabled(False)
             self.replay_button.setEnabled(False)
             self.device_combo.setEnabled(False)
-            self.led_indicator.set_color("orange") 
-            self.status_label.setText("Status: Disconnecting...")
+            
+            if not self._shutting_down: # Only set orange LED and specific status if it's a manual disconnect
+                self.led_indicator.set_color("orange")
+                self.status_label.setText("Status: Disconnecting...")
+            # else: if _shutting_down, LED is already gray and status is "Shutting down..." from closeEvent, so don't change them.
+
             plotting_paused = True
             self.pause_resume_button.setText("Pause Plotting")
             self.pause_resume_button.setEnabled(False)
@@ -6120,91 +6194,115 @@ class MainWindow(QMainWindow):
 
 
         
+    def _initiate_source_termination(self):
+        """
+        Initiates the termination of the current data source and its associated task.
+        This method is non-blocking. Cleanup and final state changes are handled
+        by the task's done_callback (_ble_source_done_callback).
+        """
+        global current_task # Keep track of the global current_task
 
+        source_to_terminate = self.current_source
+        task_to_cancel = current_task # Use the global current_task
 
+        if source_to_terminate and isinstance(source_to_terminate, BleDataSource):
+            logger.info(f"Initiating termination for source: {type(source_to_terminate).__name__}")
+            # Call the source's stop() method - this should be quick (setting flags)
+            # We run it as a fire-and-forget task because BleDataSource.stop() is async
+            asyncio.create_task(source_to_terminate.stop())
+            # Note: self.current_source will be set to None by _ble_source_done_callback
+        else:
+            logger.debug("_initiate_source_termination: No current BleDataSource to stop.")
 
-    async def stop_current_source_and_wait(self):
-        global current_task
-        source_to_stop = self.current_source
-        task_to_await = current_task
-
-        if source_to_stop:
-            logger.info(f"Stopping current source: {type(source_to_stop).__name__}")
-            self.current_source = None 
-            
-            
-            stop_task = asyncio.create_task(source_to_stop.stop())
-            
-            
-            if task_to_await and task_to_await is not asyncio.current_task() and not task_to_await.done():
-                try:
-                    
-                    
-                    await asyncio.wait_for(task_to_await, timeout=5.0) 
-                except asyncio.TimeoutError:
-                    logger.warning(f"Timeout waiting for source task {type(source_to_stop).__name__} to complete after signalling stop. It might have been cancelled or stuck.")
-                    if not task_to_await.done(): task_to_await.cancel() 
-                except asyncio.CancelledError:
-                    logger.info(f"Source task {type(source_to_stop).__name__} was cancelled during stop sequence.")
-                except Exception as e:
-                    logger.error(f"Error awaiting source task {type(source_to_stop).__name__}: {e}")
-            
-            try:
-                await asyncio.wait_for(stop_task, timeout=5.0)
-                logger.info(f"Source {type(source_to_stop).__name__} stop() method completed.")
-            except asyncio.TimeoutError:
-                 logger.warning(f"Timeout waiting for {type(source_to_stop).__name__}.stop() to complete.")
-            except Exception as e:
-                 logger.error(f"Error during {type(source_to_stop).__name__}.stop(): {e}")
-
-
-        current_task = None 
+        if task_to_cancel and not task_to_cancel.done():
+            task_name = task_to_cancel.get_name() if hasattr(task_to_cancel, 'get_name') else "UnnamedTask"
+            logger.info(f"Requesting cancellation of BleDataSource task: {task_name}")
+            task_to_cancel.cancel()
+            # Note: global current_task will be set to None by _ble_source_done_callback
+        elif task_to_cancel and task_to_cancel.done():
+            task_name = task_to_cancel.get_name() if hasattr(task_to_cancel, 'get_name') else "UnnamedTask"
+            logger.debug(f"BleDataSource task {task_name} was already done when termination initiated.")
+        else:
+            logger.debug("_initiate_source_termination: No active task to cancel or task already None.")
 
 
     @qasync.asyncSlot()
-    async def toggle_scan(self):
-        global current_task, state, data_buffers, start_time, device_config
+    async def toggle_scan(self): # Keep async if start logic involves await, otherwise can be sync
+        global current_task, state, data_buffers, start_time, device_config # current_task is global
         if self._shutting_down: return
 
         if state == "idle":
             event_loop = asyncio.get_event_loop()
             if event_loop and event_loop.is_running():
-                self.clear_gui_action(confirm=False) 
-                self.handle_state_change("scanning")
-                
+                self.clear_gui_action(confirm=False)
+                self.handle_state_change("scanning") # GUI updates to "Scanning..."
+
                 self.current_source = BleDataSource(device_config, gui_emitter)
+                # current_task is global and will be set here
                 current_task = asyncio.create_task(self.current_source.start())
+                current_task.set_name(f"BleDataSourceTask_{id(current_task)}") 
                 current_task.add_done_callback(self._ble_source_done_callback)
+                logger.info(f"BleDataSource task {current_task.get_name()} created and started.")
             else:
                 logger.error("Asyncio loop not running!")
                 self.show_message_box("Error", "Asyncio loop is not running.")
         
-        elif state == "scanning" or state == "connected":
-            logger.info(f"Stop/Disconnect requested from state: {state}. Stopping current source.")
-            await self.stop_current_source_and_wait()
-            if state != "idle": 
-                self.handle_state_change("idle")
+        elif state == "scanning":
+            logger.info(f"Stop Scan requested from state: {state}.")
+            self._initiate_source_termination()
+            # Immediately update GUI. The _ble_source_done_callback will handle
+            # the final cleanup of self.current_source and global current_task.
+            self.handle_state_change("idle")
+
+        elif state == "connected":
+            logger.info(f"Disconnect requested from state: {state}.")
+            # Immediately update GUI to "Disconnecting...".
+            # The _ble_source_done_callback will eventually transition to "idle".
+            self.handle_state_change("disconnecting")
+            self._initiate_source_termination()
         
 
 
     def _ble_source_done_callback(self, task_future: asyncio.Future):
-        global current_task, state
+        global current_task, state 
+        task_name = task_future.get_name() if hasattr(task_future, 'get_name') else "UnknownTask"
         try:
             task_future.result() 
-            logger.info("BleDataSource task finished (e.g. disconnected or completed scan phase without connecting).")
+            logger.info(f"BleDataSource task '{task_name}' finished normally (e.g. disconnected or scan phase ended).")
         except asyncio.CancelledError:
-            logger.info("BleDataSource task was cancelled.")
+            logger.info(f"BleDataSource task '{task_name}' was cancelled.")
         except Exception as e:
-            logger.error(f"BleDataSource task finished with error: {e}")
-            self.show_message_box("BLE Error", f"Live connection failed or ended with error:\n{e}")
+            logger.error(f"BleDataSource task '{task_name}' finished with error: {e}", exc_info=False) # exc_info=False for brevity unless debugging
+            if not self._shutting_down : 
+                 self.show_message_box("BLE Error", f"Live connection task '{task_name}' ended with error:\n{e}")
         finally:
-            if self.current_source and isinstance(self.current_source, BleDataSource):
-                self.current_source = None 
+            logger.info(f"Executing done_callback finally block for task '{task_name}'.")
             
-            current_task = None
-            
+            # Clear references if this callback is for the task currently known globally
+            if current_task is task_future:
+                logger.debug(f"Clearing global current_task in done_callback for task '{task_name}'.")
+                current_task = None
+                # Also clear self.current_source if it corresponds to this task's source
+                if self.current_source and isinstance(self.current_source, BleDataSource): # Simple check
+                    logger.debug(f"Clearing self.current_source in done_callback for task '{task_name}'.")
+                    self.current_source = None
+            else:
+                other_task_name = current_task.get_name() if current_task and hasattr(current_task, 'get_name') else str(current_task)
+                logger.warning(f"Done_callback for task '{task_name}', but global current_task is '{other_task_name}'. This might indicate rapid task cycling or a logic issue.")
+                # If the completed task's source is still referenced, clear it.
+                # This is harder to do safely without more context tracking.
+                # For now, if current_task is different, we assume another task is primary.
+
+            # Final state transition to idle if not already there and not shutting down
+            # This ensures the GUI reflects the end of BLE activity.
             if state != "idle" and not self._shutting_down:
+                logger.info(f"Task '{task_name}' done. Current state is '{state}', transitioning to 'idle'.")
                 self.handle_state_change("idle")
+            elif state == "idle" and not self._shutting_down:
+                logger.info(f"Task '{task_name}' done. State is already 'idle'. Ensuring GUI consistency.")
+                self.handle_state_change("idle") # Re-assert to fix button states if needed
+            elif self._shutting_down:
+                 logger.info(f"Task '{task_name}' done during application shutdown. No further state changes from callback.")
 
 
     def toggle_pause_resume(self):
@@ -6509,7 +6607,16 @@ class MainWindow(QMainWindow):
             opt_cum_y = 0
             logger.info(f"Optical‐flow accumulators reset → opt_cum_x={opt_cum_x}, opt_cum_y={opt_cum_y}")
 
-            self.gui_manager.clear_all_components()
+            # Determine clear mode based on current state
+            # Live BLE states: "connected", "scanning", "disconnecting"
+            is_live_ble_state = state in ["connected", "scanning", "disconnecting"]
+            
+            if is_live_ble_state:
+                logger.info("Clear GUI called in live BLE state. Clearing connected components, preserving UUID overlays for unconnected.")
+                self.gui_manager.clear_components(clear_only_connected_data=True)
+            else: # Idle, replay_active, or other non-live states
+                logger.info("Clear GUI called in non-live state. Clearing all components fully.")
+                self.gui_manager.clear_components(clear_only_connected_data=False)
 
 
             if self.current_source:
@@ -6552,41 +6659,91 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         global stop_flag
         if self._shutting_down:
+            logger.debug("closeEvent: Already shutting down, accepting event.")
             event.accept()
             return
 
-        logger.info("Close event triggered. Initiating asynchronous shutdown.")
-        self._shutting_down = True
-        stop_flag = True 
-        event.ignore()  
-        asyncio.create_task(self.async_shutdown_operations())
+        reply = QMessageBox.question(self, 'Confirm Quit',
+                                     "Are you sure you want to quit?",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                     QMessageBox.StandardButton.No)
+
+
+
+        if reply == QMessageBox.StandardButton.Yes:
+            logger.info("User confirmed quit. Initiating shutdown sequence.")
+            self._shutting_down = True # Set this flag IMPORTANTLY before calling handle_state_change
+            stop_flag = True         # Signal all async loops to stop
+
+            # --- Immediate GUI Feedback: Transition to Idle state, then override status ---
+            self.handle_state_change("idle") # Let GUI elements go to their idle state
+            
+            # NOW, specifically set the shutdown message and disable relevant buttons for quitting
+            self.status_label.setText("Shutting down...") # Override status set by idle
+            self.scan_button.setText("Quitting...")     # scan_button text will be "Start Scan" from idle, override
+            self.scan_button.setEnabled(False)          # idle state enables it, so disable again
+            self.replay_button.setEnabled(False)        # idle state enables it, so disable again
+            self.device_combo.setEnabled(False)         # idle state enables it, so disable again
+
+            # Clear button might be enabled by idle, ensure it's off during pure shutdown
+            self.clear_button.setEnabled(False)
+            self.led_indicator.set_color("gray") # Explicitly set LED to gray for shutdown visual
+
+            QApplication.processEvents() # Force GUI update with the "Shutting down..." overrides
+
+            # --- Start Background Shutdown Operations ---
+            event.ignore()  # We will handle the actual app quit in async_shutdown_operations
+            asyncio.create_task(self.async_shutdown_operations())
+        else:
+            logger.info("User cancelled quit.")
+            event.ignore() # Do not close the window
+
 
     async def async_shutdown_operations(self):
-        global current_task, client
+        global current_task # 'client' is not global, it's managed by BleDataSource
         logger.info("Async shutdown: Starting...")
-        if current_task and not current_task.done():
-            logger.info("Async shutdown: Requesting cancellation of active BLE task...")
-            if not current_task.cancelled():
-                await self.cancel_and_wait_task(current_task)
-                logger.info("Async shutdown: BLE task cancellation completed.")
-            else:
-                logger.info("Async shutdown: BLE task was already cancelled.")
-        else:
-            logger.info("Async shutdown: No active BLE task or task already done.")
-        
 
-
+        # 1. Signal the current source to stop (sets _stop_requested in BleDataSource)
         if self.current_source:
-            logger.info(f"Async shutdown: Stopping current source {type(self.current_source).__name__}...")
+            logger.info(f"Async shutdown: Signalling current source {type(self.current_source).__name__} to stop...")
             try:
+                # BleDataSource.stop() is async, so await it.
+                # This call should be quick as it mostly sets flags.
                 await self.current_source.stop()
-                logger.info(f"Async shutdown: Current source {type(self.current_source).__name__} stopped.")
+                logger.info(f"Async shutdown: Current source {type(self.current_source).__name__} stop signal sent.")
             except Exception as e:
-                logger.error(f"Async shutdown: Error stopping current source: {e}")
-            self.current_source = None
+                logger.error(f"Async shutdown: Error signalling current source to stop: {e}")
+            # self.current_source will be fully cleared by the task's done_callback or later if task is None
 
+        # 2. Cancel and await the main BLE task (if any)
+        # Its 'finally' block in BleDataSource.start() will now execute with _stop_requested=True
+        if current_task and not current_task.done():
+            logger.info("Async shutdown: Requesting cancellation and awaiting active BLE task...")
+            if not current_task.cancelled(): # Check if not already cancelled
+                await self.cancel_and_wait_task(current_task)
+                logger.info("Async shutdown: Active BLE task cancellation and wait completed.")
+            else:
+                logger.info("Async shutdown: Active BLE task was already cancelled prior to awaiting.")
+        elif current_task and current_task.done():
+            logger.info("Async shutdown: Active BLE task was already done.")
+        else:
+            logger.info("Async shutdown: No active BLE task to cancel or await.")
+        
+        # 3. Ensure self.current_source is None if its task is handled or was never there.
+        # The _ble_source_done_callback should set self.current_source to None if it handled the task.
+        # This is a fallback if current_task was None/done but self.current_source somehow persisted.
+        if self.current_source:
+            logger.warning(f"Async shutdown: self.current_source ({type(self.current_source).__name__}) still exists after task handling. Forcing clear.")
+            self.current_source = None
         
         logger.info("Async shutdown: Performing GUI cleanup...")
+
+        # Hide the main window now that BLE operations are complete or timed out.
+        logger.info("Async shutdown: Hiding main window.")
+        if self.isVisible(): # Check if it's not already hidden for some reason
+            self.hide()
+        QApplication.processEvents() # Allow hide event to process
+
         self.plot_update_timer.stop()
         self.scan_throbber_timer.stop()
         if self.log_handler:
