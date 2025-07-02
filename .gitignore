@@ -6,3 +6,5 @@ logs/
 captured_pressure_maps/
 IMU_Snapshots/
 nyquist_snapshots/
+
+.venv/

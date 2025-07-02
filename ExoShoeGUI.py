@@ -15,9 +15,9 @@
 #     - PDF export of plots
 #     - Customizable device profiles, data handlers, GUI layouts
 ################################################################################
-# Dependencies:
+# Dependencies: (Top level only, see requirements.txt for full list)
 #   pip install qasync bleak pandas numpy matplotlib scienceplots \
-#               PyQt6 pyqtgraph superqt numpy-stl
+#               PyQt6 pyqtgraph superqt numpy-stl PyOpenGL
 ################################################################################
 # License (MIT):
 #   Copyright (c) 2025 Arvin Parvizinia
