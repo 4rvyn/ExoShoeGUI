@@ -16,9 +16,9 @@ However, I believe the underlying architecture and extensive customizability mak
 
 - **Real-time Visualization:** Multi-tab interface with various plotting components:
   - Time-series plots for sensor data streams.
-  - Interactive pressure/heatmaps with Center of Pressure (CoP) tracking.
+  - Interactive pressure/heatmaps with fading Center of Pressure (CoP) tracking.
   - Live 3D IMU orientation visualizer (supports custom STL models).
-  - Nyquist plots for impedance analysis.
+  - Live Impedance plot for impedance analysis with fading trail.
 - **Data Logging:** Capture live sensor data to timestamped CSV files, organized by session.
 - **Data Replay:** Load and analyze previous CSV captures with time-scrubbing controls for detailed inspection.
 - **Data Export:** Export plots from live or replayed sessions to high-quality PDF files.
@@ -26,6 +26,7 @@ However, I believe the underlying architecture and extensive customizability mak
   - Define new BLE device profiles.
   - Implement custom data parsers for any sensor.
   - Create derived data streams (sensor fusion).
+  - Design new custom Components
   - Design custom GUI layouts.
 
 ## Screenshots
@@ -46,9 +47,9 @@ However, I believe the underlying architecture and extensive customizability mak
 
 2.  **Install dependencies:**
     ```bash
-    pip install qasync bleak pandas numpy matplotlib scienceplots PyQt6 pyqtgraph superqt numpy-stl
+    pip install qasync bleak pandas numpy matplotlib scienceplots PyQt6 pyqtgraph superqt numpy-stl PyOpenGL
     ```
-    *Note: `numpy-stl` is required for loading STL models in the 3D IMU visualizer.*
+    *Note: For full compatibility, use the provided `requirements.txt`.*
 
 ## Usage
 
@@ -60,9 +61,9 @@ python ExoShoeGUI.py
 
 ### Demonstration & Replay
 
-To allow users to explore the GUI's features without needing the physical thesis hardware, sample log files are included in the `sample_logs/` directory.
+To allow users to explore the GUI's features without needing my physical thesis hardware, a set of random sample log files are included in the `sample_logs/` directory.
 
-Use the **`Replay CSV...`** button in the GUI to load one or more of these files. The application's visualization components will populate with the sample data, enabling you to test the replay and export functionalities.
+Use the **`Replay CSV...`** button in the GUI to load one or more of these CSV files. The application's visualization components will populate with the sample data, enabling you to test the replay and export functionalities.
 
 ## Adapting for Your Own BLE Device
 
@@ -83,6 +84,9 @@ Follow these essential steps:
     - Locate the `tab_configs` list at the end of the customizable section.
     - Modify the layouts to display your new data. You will need to change the `data_type` strings within the component `config` dictionaries to match the keys your new data handlers produce.
     - Remove or replace components that are specific to the thesis project (e.g., the insole pressure map, impedance plots) with components relevant to your data.
+4.  **Further Possibilities - Creating New GUI Components**
+    - The modular architecture allows you to create entirely new visualization components beyond the ones provided. This is powerful for unique sensors or custom data representations. To do so, you create a Python class that inherits from `BaseGuiComponent`.
+
 
 The built-in **`Help`** window provides a more detailed, step-by-step guide for each of these customization tasks. After making these changes, the application will be tailored to your custom hardware.
 
