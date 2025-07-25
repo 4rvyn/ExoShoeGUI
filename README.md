@@ -1,96 +1,50 @@
-# BLE Sensor Data Acquisition GUI
+# BLE Sensor Data Acquisition GUI (PyQt6)
 
-A modular and customizable PyQt6-based graphical interface for acquiring, visualizing, and logging data from Bluetooth Low Energy (BLE) sensors in real-time.
+This PyQt 6 application captures, visualizes, and logs Bluetooth Low Energy (BLE) sensor data in real time. I built it during my Bachelor’s thesis at RWTH Aachen University (October 2024 – May 2025) to drive a multisensory exoskeleton shoe that combines pressure, inertial, impedance, time‑of‑flight, and optical‑flow readings. Although the default configuration matches that prototype, you can redirect the software to any BLE device by adjusting a few clearly marked sections in the main script.
 
-![Main Demo GIF](<INSERT_DEMO_GIF_PATH_HERE.gif>)
 
-### About This Project
+## Main features
 
-This application was developed between November 2024 and May 2025 as a component of my Bachelor's Thesis, titled **"Development and Testing of a multisensory Shoe for an Exoskeleton"** at RWTH Aachen University.
+While the program is running it streams each BLE characteristic through a user‑defined parser, plots the results live, and writes every sample to a timestamped CSV file. The interface includes time‑series charts, an interactive pressure heatmap with a fading centre‑of‑pressure trace, a 3‑D IMU orientation viewer that can load a custom STL model, and an impedance plot that leaves a trailing history. At the end of a session you can export any visible plot as a publication‑quality PDF.
 
-The primary goal of this GUI was to provide a robust, real-time interface for acquiring, processing, and visualizing the fused data streams from the custom-built shoe, which includes pressure, inertia, ground impedance, time-of-flight, and optical flow sensors. As such, the default configuration of this script—including all BLE Service/Characteristic UUIDs, data parsing functions, and GUI layouts—is tailored specifically to the hardware and objectives of this thesis project.
+A built‑in replay engine lets you scrub through recorded CSV files and feed them back into the same visual components, so live and offline analysis use identical code paths. You may add new components, derived data streams, or entire tabs without touching the core event loop.
 
-However, I believe the underlying architecture and extensive customizability make this a valuable tool for a wide range of BLE sensor monitoring applications. While this script was developed for a specific purpose and may still have some issues, I am offering it to anyone who finds it useful and encourage you to build upon it. The seamless integration of live plotting and data replay, in particular, is an invaluable asset for any project involving BLE sensor data.
 
-## Features
+## Quick start
 
-- **Real-time Visualization:** Multi-tab interface with various plotting components:
-  - Time-series plots for sensor data streams.
-  - Interactive pressure/heatmaps with fading Center of Pressure (CoP) tracking.
-  - Live 3D IMU orientation visualizer (supports custom STL models).
-  - Live Impedance plot for impedance analysis with fading trail.
-- **Data Logging:** Capture live sensor data to timestamped CSV files, organized by session.
-- **Data Replay:** Load and analyze previous CSV captures with time-scrubbing controls for detailed inspection.
-- **Data Export:** Export plots from live or replayed sessions to high-quality PDF files.
-- **Highly Customizable:** Configure the application by editing the Python script to:
-  - Define new BLE device profiles.
-  - Implement custom data parsers for any sensor.
-  - Create derived data streams (sensor fusion).
-  - Design new custom Components
-  - Design custom GUI layouts.
-
-## Screenshots
-
-<p align="center">
-  <img src="<INSERT_HEATMAP_IMAGE_PATH_HERE.png>" alt="Heatmap View" width="45%">
-  &nbsp; &nbsp;
-  <img src="<INSERT_3D_IMU_IMAGE_PATH_HERE.png>" alt="3D IMU View" width="45%">
-</p>
-
-## Installation
-
-1.  **Clone the repository:**
-    ```bash
-    git clone https://github.com/4rvyn/ExoShoeGUI
-    cd ExoShoeGUI
-    ```
-
-2.  **Install dependencies:**
-    ```bash
-    pip install qasync bleak pandas numpy matplotlib scienceplots PyQt6 pyqtgraph superqt numpy-stl PyOpenGL
-    ```
-    *Note: For full compatibility, use the provided `requirements.txt`.*
-
-## Usage
-
-Run the main script from your terminal:
+To get started, clone the repository, install the required packages, and launch the GUI:
 
 ```bash
+git clone https://github.com/4rvyn/ExoShoeGUI
+pip install -r requirements.txt
 python ExoShoeGUI.py
 ```
 
-### Demonstration & Replay
-
-To allow users to explore the GUI's features without needing my physical thesis hardware, a set of random sample log files are included in the `sample_logs/` directory.
-
-Use the **`Replay CSV...`** button in the GUI to load one or more of these CSV files. The application's visualization components will populate with the sample data, enabling you to test the replay and export functionalities.
-
-## Adapting for Your Own BLE Device
-
-**Important Note:** The default configuration of this script is tailored *specifically* to the multisensory exoskeleton shoe developed for the author's thesis. To use this application with your own BLE device, you **must** modify the "customizable section" in the main Python script.
-
-Follow these essential steps:
-
-1.  **Define Your Data Handlers:**
-    - In the script, locate the section `# 1. --- Data Handlers ... ---`.
-    - Write new Python functions to parse the `bytearray` data from your sensor's specific BLE characteristics. Each handler must return a dictionary of data types and their values (e.g., `{'temperature': 25.5, 'humidity': 45.1}`).
-
-2.  **Modify the `DeviceConfig` Object:**
-    - Locate the `device_config = DeviceConfig(...)` definition.
-    - Change the `name` and `service_uuid` to match your BLE device.
-    - **Crucially, update the `characteristics` list.** Remove the existing `CharacteristicConfig` objects and add new ones for your device. Each new entry must link your characteristic's `uuid` to the corresponding data `handler` function you wrote in Step 1.
-
-3.  **Reconfigure the GUI Layout:**
-    - Locate the `tab_configs` list at the end of the customizable section.
-    - Modify the layouts to display your new data. You will need to change the `data_type` strings within the component `config` dictionaries to match the keys your new data handlers produce.
-    - Remove or replace components that are specific to the thesis project (e.g., the insole pressure map, impedance plots) with components relevant to your data.
-4.  **Further Possibilities - Creating New GUI Components**
-    - The modular architecture allows you to create entirely new visualization components beyond the ones provided. This is powerful for unique sensors or custom data representations. To do so, you create a Python class that inherits from `BaseGuiComponent`.
+> Dependencies: qasync, bleak, pandas, numpy, matplotlib, scienceplots, PyQt6, pyqtgraph, superqt, numpy-stl, PyOpenGL.
 
 
-The built-in **`Help`** window provides a more detailed, step-by-step guide for each of these customization tasks. After making these changes, the application will be tailored to your custom hardware.
+## Try it without hardware
+
+Open the app and click the **[Replay CSV…]**-button. The Sample logs in `log_samples/` let you explore the interface, replay controls, and export features without any BLE device connected.
+
+
+## Adapt it to your BLE device
+
+You’ll change three things:
+
+1. **Data handlers** — parse your characteristic `bytearray` → return a dict of `{data_type: value}`.
+2. **DeviceConfig** — set your device name, service UUID, and characteristic UUID ↔ handler mappings.
+3. **Layout** — update `tab_configs` to display the data types your handlers produce (or add new components).
+
+The built‑in **Help** window walks through this. A detailed, step‑by‑step guide and sample logs live in the [`log_samples/`](log_samples/) directory.
+
+
+## Screenshots
+
+![Heatmap View](INSERT_HEATMAP_IMAGE_PATH_HERE.png)
+![3D IMU View](INSERT_3D_IMU_IMAGE_PATH_HERE.png)
+
 
 ## License
 
-This project is licensed under the MIT License.  
-See the [LICENSE](LICENSE) file for full details.
+This project is licensed under the MIT [License](LICENSE).
