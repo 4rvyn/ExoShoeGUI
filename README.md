@@ -27,7 +27,7 @@ pip install -r requirements.txt
 python ExoShoeGUI.py
 ```
 
-> Dependencies: qasync, bleak, pandas, numpy, matplotlib, scienceplots, PyQt6, pyqtgraph, superqt, numpy-stl, PyOpenGL.
+> Dependencies: qasync, bleak, pandas, numpy, matplotlib, scienceplots, PyQt6, pyqtgraph, superqt, numpy-stl, PyOpenGL, markdown.
 
 
 ## Try it without hardware
@@ -43,7 +43,7 @@ You’ll change three things:
 2. **DeviceConfig** — set your device name, service UUID, and characteristic UUID ↔ handler mappings.
 3. **Layout** — update `tab_configs` to display the data types your handlers produce (or add new components).
 
-The built‑in **Help** window walks through this. A detailed, step‑by‑step guide and sample logs live in the [`log_samples/`](log_samples/) directory.
+The built‑in **Help** window walks through this in a detailed, step‑by‑step guide.
 
 
 ## License
