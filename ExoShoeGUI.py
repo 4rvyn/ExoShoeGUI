@@ -15,25 +15,12 @@
 #     - PDF export of plots
 #     - Customizable device profiles, data handlers, GUI layouts
 ################################################################################
-# Dependencies: (Top level only, see requirements.txt for full list)
+# Dependencies: (Top level only)
 #   pip install qasync bleak pandas numpy matplotlib scienceplots \
 #               PyQt6 pyqtgraph superqt numpy-stl PyOpenGL markdown
 ################################################################################
 # License (MIT):
 #   Copyright (c) 2025 Arvin Parvizinia
-#
-# Permission is granted to use, copy, modify, merge, publish, distribute,
-# sublicense, and/or sell copies of the Software, subject to the following:
-#
-# The above copyright notice and this permission notice shall be included
-# in all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
-# THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
-# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM THE SOFTWARE OR
-# ITS USE.
 ################################################################################
 
 import asyncio
@@ -43,26 +30,26 @@ import logging
 from typing import Optional, Callable, Dict, List, Tuple, Set, Any, Type
 import time
 from functools import partial
-from collections import deque # for sensor fusion and potential future optimization if lists grow huge
+from collections import deque 
 import threading
 import sys
 import datetime
-import csv # Added for CSV writing
+import csv
 import os
 import pandas as pd # Easier CSV data handling (merging/resampling)
 import struct
 import bisect
-import numpy as np # needed for pyqtgraph AND heatmap
+import numpy as np 
 import re # For cleaning filenames
 import math # Needed for heatmap CoP
 from pathlib import Path # For easier path manipulation in PDF export
 
 
 # --- Matplotlib Imports (used ONLY for PDF export AND heatmap colormaps) ---
-import matplotlib # Use Agg backend to avoid GUI conflicts if possible
+import matplotlib # Use Agg backend to avoid GUI conflicts
 matplotlib.use('Agg') # Set backend BEFORE importing pyplot
 import matplotlib.pyplot as plt
-import scienceplots # Make sure it's installed: pip install scienceplots for formatting
+import scienceplots 
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 
@@ -86,12 +73,14 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QMetaObject, QThread, 
 import pyqtgraph as pg
 import pyqtgraph.opengl as gl
 
+from superqt.sliders import QRangeSlider
 
-# --- SuperQT Import for RangeSlider ---
-from superqt.sliders import QRangeSlider # Needed for heatmap pressure range
-
-# for Impedance Plotter snapshot
+# for Impedance Plotter snapshot, so BLE isnt blocked:
 from concurrent.futures import ThreadPoolExecutor
+
+# TODO: The main "Export" button can also block the event loop during file generation.
+# This should be moved to a thread pool to prevent BLE connection timeouts,
+# similar to how the Nyquist plot snapshot is handled.
 
 from help_window import HelpWindow 
 
@@ -142,6 +131,7 @@ class DataSource(ABC):
     @abstractmethod
     async def stop(self):
         pass
+
 
 class BleDataSource(DataSource):
     def __init__(self, device_config_ref: 'DeviceConfig', gui_emitter_ref: 'GuiSignalEmitter'):
@@ -516,7 +506,6 @@ class CsvReplaySource(DataSource):
                 loop.call_soon_threadsafe(self._finished_event.set)
             else:
                 self._finished_event.set()
-
 
 
 # --- Global variables ---

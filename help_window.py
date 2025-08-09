@@ -87,7 +87,7 @@ class HelpWindow(QDialog):
         self.main_layout = QVBoxLayout(self)
         self.tab_widget = QTabWidget()
         self.main_layout.addWidget(self.tab_widget)
-        
+        logging.info("Initializing Help Window...")
         self._setup_gui_tab()
         self._setup_code_tab()
         
